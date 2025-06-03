@@ -98,10 +98,6 @@ def analyze_benchmark(benchmark: benchmarklib.Benchmark,
                    args: argparse.Namespace) -> bool:
   """Analyzes the benchmark using the function analyzer."""
 
-  logger.info("Loaded benchmark (%d/%d) for function: %s",
-                benchmarks.index(benchmark) + 1, len(benchmarks),
-                benchmark.function_name)
-
   # Initialize the function analyzer
   analyzer = function_analyzer.FunctionAnalyzer(trial=1,
                                                          llm=model,
@@ -163,8 +159,11 @@ if __name__ == "__main__":
   success_count = 0
 
   if args.num_pools == 1:
-    for test_benchmark in benchmarks:
-      if analyze_benchmark(test_benchmark, model, args):
+    for benchmark in benchmarks:
+      logger.info("Loaded benchmark (%d/%d) for function: %s",
+                benchmarks.index(benchmark) + 1, len(benchmarks),
+                benchmark.function_name)
+      if analyze_benchmark(benchmark, model, args):
         success_count += 1
   else:
 
@@ -174,15 +173,21 @@ if __name__ == "__main__":
     with multiprocessing.Pool(args.num_pools, maxtasksperchild=1) as pool:
 
       analyzer_results = {}
-      for test_benchmark in benchmarks:
+      for benchmark in benchmarks:
         # Pass a new analyzer instance to each process to avoid sharing state
+        logger.info("Submitted benchmark (%d/%d) for function: %s to the pool.",
+                benchmarks.index(benchmark) + 1, len(benchmarks),
+                benchmark.function_name)
         result = pool.apply_async(
           analyze_benchmark,
-          args=(test_benchmark, model, args)
+          args=(benchmark, model, args)
         )
-        analyzer_results[test_benchmark.id] = result
+        analyzer_results[benchmark.id] = result
 
       pool.close()
+
+      # Wait for all processes to complete
+      pool.join()
 
       # Wait for all results to complete and count successes
       for benchmark_id, result in analyzer_results.items():
@@ -191,7 +196,5 @@ if __name__ == "__main__":
             success_count += 1
         except Exception as e:
           logger.error(f"Error during analysis for benchmark %s: %s", benchmark_id, e)
-
-      pool.join()
 
   print(f"{success_count} out of {len(benchmarks)} analyses completed successfully.")
