@@ -29,7 +29,7 @@ import results as resultslib
 from agent import base_agent
 from experiment import benchmark as benchmarklib
 from llm_toolkit import models, prompt_builder, prompts
-from tool import base_tool, fuzz_introspector_tool
+from tool import base_tool, fuzz_introspector_tool, container_tool
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,8 @@ class FunctionAnalyzer(base_agent.BaseAgent):
         instruction=builder.build_context_retriever_instruction().get(),
         tools=[
             introspector_tool.function_source_with_signature,
-            introspector_tool.function_source_with_name
+            introspector_tool.function_source_with_name,
+            self.search_project_container
         ],
         generate_content_config=types.GenerateContentConfig(temperature=0.0,),
         output_key="FUNCTION_SOURCE",
@@ -173,6 +174,10 @@ class FunctionAnalyzer(base_agent.BaseAgent):
       result_history: list[resultslib.Result]) -> resultslib.PreWritingResult:
     """Execute the agent with the given results."""
 
+    # Initialize ProjectContainerTool in case it is needed
+    self.inspect_tool = container_tool.ProjectContainerTool(self.benchmark, name='inspect')
+    self.inspect_tool.compile(extra_commands=' && rm -rf /out/* > /dev/null')
+
     # Call the agent asynchronously and return the result
     prompt = self._initial_prompt(result_history)
     query = prompt.gettext()
@@ -184,6 +189,9 @@ class FunctionAnalyzer(base_agent.BaseAgent):
     if result and result.result_available:
       # Save the result to the history
       result_history.append(result)
+
+    # Terminate the inspect tool
+    self.inspect_tool.terminate()
 
     return result
 
@@ -199,3 +207,26 @@ class FunctionAnalyzer(base_agent.BaseAgent):
     prompt = builder.build_prompt()
 
     return prompt
+
+  def search_project_container(self, request: str) -> str:
+    """
+    This function uses the ProjectContainerTool to process bash commands and perform local code search.
+    Args:
+      request (str): The ProjectContainerTool request string to be processed. Should be formatted using the <reason> and <bash> tags.
+    Returns:
+      str: The response from the ProjectContainerTool, formatted using the <bash>, <stdout> and <stderr> tags.
+    """
+
+
+    prompt = prompt_builder.DefaultTemplateBuilder(self.llm, None).build([])
+
+    if request:
+      prompt = self._container_handle_bash_commands(request, self.inspect_tool,
+                                                    prompt)
+
+    # Finally check invalid request.
+    if not request or not prompt.get():
+      prompt = self._container_handle_invalid_tool_usage(
+          self.inspect_tool, 0, request, prompt)
+
+    return prompt.get()

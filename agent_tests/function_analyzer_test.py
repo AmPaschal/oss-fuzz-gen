@@ -19,6 +19,7 @@ import multiprocessing
 import os
 from typing import List
 
+import results
 import run_all_experiments
 from agent import function_analyzer
 from experiment import benchmark as benchmarklib
@@ -111,7 +112,9 @@ def analyze_benchmark(benchmark: benchmarklib.Benchmark,
 
   # Run the function analyzer
   try:
-    result = analyzer.execute([])
+    result = analyzer.execute(result_history=[
+      results.Result(benchmark=benchmark, trial=1, work_dirs=args.work_dirs)
+  ])
   except Exception as e:
     logger.error("Error during analysis for benchmark %s: %s", benchmark.function_name, e)
     return False
@@ -170,19 +173,19 @@ if __name__ == "__main__":
     logger.info("Running analysis in parallel with %d processes.", args.num_pools)
     with multiprocessing.Pool(args.num_pools, maxtasksperchild=1) as pool:
 
-      results = {}
+      analyzer_results = {}
       for test_benchmark in benchmarks:
         # Pass a new analyzer instance to each process to avoid sharing state
         result = pool.apply_async(
           analyze_benchmark,
           args=(test_benchmark, model, args)
         )
-        results[test_benchmark.id] = result
+        analyzer_results[test_benchmark.id] = result
 
       pool.close()
 
       # Wait for all results to complete and count successes
-      for benchmark_id, result in results.items():
+      for benchmark_id, result in analyzer_results.items():
         try:
           if result.get():
             success_count += 1
