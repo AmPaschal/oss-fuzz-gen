@@ -69,21 +69,6 @@ class FunctionAnalyzer(base_agent.BaseAgent):
     introspector_tool = fuzz_introspector_tool.FuzzIntrospectorTool(
         benchmark, self.name)
 
-    context_retriever = agents.LlmAgent(
-        name="ContextRetrieverAgent",
-        model=self.vertex_ai_model,
-        description="""Retrieves the implementation of a function
-                      and its children from Fuzz Introspector.""",
-        instruction=builder.build_context_retriever_instruction().get(),
-        tools=[
-            introspector_tool.function_source_with_signature,
-            introspector_tool.function_source_with_name,
-            self.search_project_container
-        ],
-        generate_content_config=types.GenerateContentConfig(temperature=0.0,),
-        output_key="FUNCTION_SOURCE",
-    )
-
     # Create the agent using the ADK library
     function_analyzer = agents.LlmAgent(
         name="FunctionAnalyzer",
@@ -93,7 +78,8 @@ class FunctionAnalyzer(base_agent.BaseAgent):
         instruction="""You are a security engineer tasked with analyzing a function
         and extracting its input requirements, necessary for it to execute correctly.""",
         tools=[
-            introspector_tool.function_source_with_name
+            introspector_tool.function_source_with_name,
+            self.search_project_container
         ],
     )
 
@@ -205,6 +191,8 @@ class FunctionAnalyzer(base_agent.BaseAgent):
         self.llm, self.benchmark)
 
     prompt = builder.build_prompt()
+
+    prompt.append(self.inspect_tool.tutorial())
 
     return prompt
 
