@@ -256,10 +256,11 @@ def parse_args() -> argparse.Namespace:
                       type=int,
                       default=100,
                       help='Max trial round for agents.')
-  parser.add_argument('-rp',
-                      '--rel-path',
-                      default='',
-                      help='Relative path for fetching function analyzer results.')
+  parser.add_argument(
+      '-rp',
+      '--rel-path',
+      default='',
+      help='Relative path for fetching function analyzer results.')
 
   args = parser.parse_args()
   if args.num_samples:

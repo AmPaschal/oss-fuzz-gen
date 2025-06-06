@@ -29,7 +29,7 @@ import results as resultslib
 from agent import base_agent
 from experiment import benchmark as benchmarklib
 from llm_toolkit import models, prompt_builder, prompts
-from tool import base_tool, fuzz_introspector_tool, container_tool
+from tool import base_tool, container_tool, fuzz_introspector_tool
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,8 @@ class FunctionAnalyzer(base_agent.BaseAgent):
         model=self.vertex_ai_model,
         description="""Extracts a function's requirements
                         from its source implementation.""",
-        instruction="""You are a security engineer tasked with analyzing a function
+        instruction=
+        """You are a security engineer tasked with analyzing a function
         and extracting its input requirements, necessary for it to execute correctly.""",
         tools=[
             introspector_tool.function_source_with_name,
@@ -156,7 +157,8 @@ class FunctionAnalyzer(base_agent.BaseAgent):
     """Execute the agent with the given results."""
 
     # Initialize ProjectContainerTool in case it is needed
-    self.inspect_tool = container_tool.ProjectContainerTool(self.benchmark, name='inspect')
+    self.inspect_tool = container_tool.ProjectContainerTool(self.benchmark,
+                                                            name='inspect')
     self.inspect_tool.compile(extra_commands=' && rm -rf /out/* > /dev/null')
 
     # Call the agent asynchronously and return the result
@@ -204,7 +206,6 @@ class FunctionAnalyzer(base_agent.BaseAgent):
     Returns:
       str: The response from the ProjectContainerTool, formatted using the <bash>, <stdout> and <stderr> tags.
     """
-
 
     prompt = prompt_builder.DefaultTemplateBuilder(self.llm, None).build([])
 
