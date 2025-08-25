@@ -267,7 +267,7 @@ def _fuzzing_pipeline(benchmark: Benchmark, model: models.LLM,
   elif args.agent:
 
     writer_agents = []
-    if 'gemini' in args.model or 'vertex' in args.model:
+    if args.model.supports_adk_agents:
       writer_agents.append(
           FunctionAnalyzer(trial=trial,
                            llm=model,
@@ -277,10 +277,7 @@ def _fuzzing_pipeline(benchmark: Benchmark, model: models.LLM,
         Prototyper(trial=trial, llm=model, args=args),
         Enhancer(trial=trial, llm=model, args=args)
     ]
-    p = pipeline.Pipeline(args=args,
-                          trial=trial,
-                          writing_stage_agents=writer_agents,
-                          analysis_stage_agents=[
+    analysis_agents = [
                               SemanticAnalyzer(trial=trial,
                                                llm=model,
                                                args=args),
@@ -288,11 +285,19 @@ def _fuzzing_pipeline(benchmark: Benchmark, model: models.LLM,
                                                llm=model,
                                                args=args),
                               CrashAnalyzer(trial=trial, llm=model, args=args),
-                              ContextAnalyzer(trial=trial,
-                                              llm=model,
-                                              args=args,
-                                              benchmark=benchmark),
-                          ])
+                          ]
+    if args.model.supports_adk_agents:
+      analysis_agents.append(
+
+        ContextAnalyzer(trial=trial,
+                        llm=model,
+                        args=args,
+                        benchmark=benchmark),
+      )
+    p = pipeline.Pipeline(args=args,
+                          trial=trial,
+                          writing_stage_agents=writer_agents,
+                          analysis_stage_agents=analysis_agents)
   else:
     writer_agents = []
     if 'gemini' in args.model or 'vertex' in args.model:
