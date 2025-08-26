@@ -120,7 +120,8 @@ class ContextAnalyzer(base_agent.ADKBaseAgent):
         run_result=last_result.run_result,
         crash_result=last_result.crash_result,
         crash_context_result=context_result,
-        chat_history={})
+        chat_history={self.name: '\n'.join(self.chat_history)},
+        )
 
     return analysis_result
 

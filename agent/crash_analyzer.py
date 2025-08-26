@@ -263,5 +263,5 @@ class CrashAnalyzer(BaseAgent):
         author=self,
         run_result=last_result,
         crash_result=crash_result,
-        chat_history={self.name: crash_result.to_dict()})
+        chat_history={self.name: '\n'.join(self.chat_history)})
     return analysis_result

@@ -123,7 +123,6 @@ class CoverageAnalyzer(BaseAgent):
     cur_round = 1
     coverage_result = CoverageResult()
     prompt = self._initial_prompt(result_history)
-
     try:
       client = self.llm.get_chat_client(model=self.llm.get_model())
       while prompt and cur_round < self.max_round:
@@ -145,5 +144,5 @@ class CoverageAnalyzer(BaseAgent):
         author=self,
         run_result=last_result,
         coverage_result=coverage_result,
-        chat_history={self.name: coverage_result.to_dict()})
+        chat_history={self.name: '\n'.join(self.chat_history)})
     return analysis_result

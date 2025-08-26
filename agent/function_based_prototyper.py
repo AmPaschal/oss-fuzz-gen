@@ -428,8 +428,7 @@ class FunctionToolPrototyper(BaseAgent):
     build_result = BuildResult(benchmark=benchmark,
                                trial=last_result.trial,
                                work_dirs=last_result.work_dirs,
-                               author=self,
-                               chat_history={self.name: ''})
+                               author=self,)
     # If we have an analysis result, we should start a new prompt sequence
     # that refines the target.
     if isinstance(last_result, AnalysisResult):
@@ -518,4 +517,5 @@ class FunctionToolPrototyper(BaseAgent):
       self.inspect_tool.terminate()
 
     logger.info('Finished done', trial=self.trial)
+    build_result.chat_history = {self.name: '\n'.join(self.chat_history)}
     return build_result

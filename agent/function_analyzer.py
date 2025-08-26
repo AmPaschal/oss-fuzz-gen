@@ -111,7 +111,6 @@ class FunctionAnalyzer(base_agent.ADKBaseAgent):
 
     # Call the agent asynchronously and return the result
     prompt = self._initial_prompt(result_history)
-
     while self.round < self.max_round:
       final_response = self.chat_llm(self.round,
                                      client=None,
@@ -133,6 +132,7 @@ class FunctionAnalyzer(base_agent.ADKBaseAgent):
           template_builder.build(), template_builder.get_response_format())
 
     self.inspect_tool.terminate()
+    result.chat_history = {self.name: '\n'.join(self.chat_history)}
     return result
 
   def _initial_prompt(

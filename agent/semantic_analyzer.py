@@ -67,7 +67,7 @@ class SemanticAnalyzer(BaseAgent):
         author=self,
         run_result=last_result,
         semantic_result=semantic_result,
-        chat_history={self.name: semantic_result.to_dict()})
+        chat_history={self.name: '\n'.join(self.chat_history)})
     return analysis_result
 
   def _parse_libfuzzer_logs(self,

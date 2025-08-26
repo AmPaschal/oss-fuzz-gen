@@ -53,7 +53,7 @@ class BaseAgent(ABC):
     self.tools: list[BaseTool] = tools or []
     self.args = args
     self.name: str = name or self.__class__.__name__
-    self.chat_history: str = ''  # Communication history between LLM and tool.
+    self.chat_history: list = []  # Communication history between LLM and tool.
     self.max_round = self.args.max_round
 
   def __repr__(self) -> str:
@@ -89,16 +89,13 @@ class BaseAgent(ABC):
   def chat_llm(self, cur_round: int, client: Any, prompt: Prompt,
                trial: int) -> str:
     """Chat with LLM."""
-    logger.info('<CHAT PROMPT:ROUND %02d>%s</CHAT PROMPT:ROUND %02d>',
-                cur_round,
-                prompt.gettext(),
-                cur_round,
-                trial=trial)
+    llm_prompt = f'<CHAT PROMPT:ROUND {cur_round:02d}>{prompt.gettext()}</CHAT PROMPT:ROUND {cur_round:02d}>'
+    logger.info(llm_prompt, trial=trial)
+    self.chat_history.append(llm_prompt)
     response = self.llm.chat_llm(client=client, prompt=prompt)
-    logger.info('<CHAT RESPONSE:ROUND %02d>%s</CHAT RESPONSE:ROUND %02d>',
-                cur_round,
-                response,
-                cur_round,
+    llm_response = f'<CHAT RESPONSE:ROUND {cur_round:02d}>{response}</CHAT RESPONSE:ROUND {cur_round:02d}>'
+    self.chat_history.append(llm_response)
+    logger.info(llm_response,
                 trial=trial)
     return response
 
@@ -338,6 +335,7 @@ class ADKBaseAgent(BaseAgent):
     super().__init__(trial, llm, args, tools, name)
 
     self.benchmark = benchmark
+    self.chat_history = []
 
     # For now, ADKBaseAgents only support the Vertex AI Models.
     if not isinstance(llm, VertexAIModel):
@@ -426,20 +424,17 @@ class ADKBaseAgent(BaseAgent):
     return self.llm.with_retry_on_error(lambda: asyncio.run(_call()),
                                         [errors.ClientError])
 
-  def log_llm_prompt(self, promt: str) -> None:
+  def log_llm_prompt(self, prompt: str) -> None:
     self.round += 1
-    logger.info('<CHAT PROMPT:ROUND %02d>%s</CHAT PROMPT:ROUND %02d>',
-                self.round,
-                promt,
-                self.round,
-                trial=self.trial)
+    llm_prompt = f'<CHAT PROMPT:ROUND {self.round:02d}>{prompt}</CHAT PROMPT:ROUND {self.round:02d}>'
+    logger.info(llm_prompt, trial=self.trial)
+    self.chat_history.append(llm_prompt)
 
   def log_llm_response(self, response: str) -> None:
-    logger.info('<CHAT RESPONSE:ROUND %02d>%s</CHAT RESPONSE:ROUND %02d>',
-                self.round,
-                response,
-                self.round,
+    llm_response = f'<CHAT RESPONSE:ROUND {self.round:02d}>{response}</CHAT RESPONSE:ROUND {self.round:02d}>'
+    logger.info(llm_response,
                 trial=self.trial)
+    self.chat_history.append(llm_response)
 
   def end_llm_chat(self, tool_context: ToolContext) -> None:
     """Ends the LLM chat session."""
