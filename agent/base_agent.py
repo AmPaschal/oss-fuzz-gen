@@ -95,8 +95,7 @@ class BaseAgent(ABC):
     response = self.llm.chat_llm(client=client, prompt=prompt)
     llm_response = f'<CHAT RESPONSE:ROUND {cur_round:02d}>{response}</CHAT RESPONSE:ROUND {cur_round:02d}>'
     self.chat_history.append(llm_response)
-    logger.info(llm_response,
-                trial=trial)
+    logger.info(llm_response, trial=trial)
     return response
 
   def ask_llm(self, cur_round: int, prompt: Prompt, trial: int) -> str:
@@ -432,8 +431,7 @@ class ADKBaseAgent(BaseAgent):
 
   def log_llm_response(self, response: str) -> None:
     llm_response = f'<CHAT RESPONSE:ROUND {self.round:02d}>{response}</CHAT RESPONSE:ROUND {self.round:02d}>'
-    logger.info(llm_response,
-                trial=self.trial)
+    logger.info(llm_response, trial=self.trial)
     self.chat_history.append(llm_response)
 
   def end_llm_chat(self, tool_context: ToolContext) -> None:

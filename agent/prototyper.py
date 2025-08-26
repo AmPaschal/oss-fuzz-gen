@@ -436,10 +436,12 @@ class Prototyper(BaseAgent):
     self.inspect_tool = ProjectContainerTool(benchmark, name='inspect')
     self.inspect_tool.compile(extra_commands=' && rm -rf /out/* > /dev/null')
     cur_round = 1
-    build_result = BuildResult(benchmark=benchmark,
-                               trial=last_result.trial,
-                               work_dirs=last_result.work_dirs,
-                               author=self,)
+    build_result = BuildResult(
+        benchmark=benchmark,
+        trial=last_result.trial,
+        work_dirs=last_result.work_dirs,
+        author=self,
+    )
     prompt = self._initial_prompt(result_history)
     try:
       client = self.llm.get_chat_client(model=self.llm.get_model())
@@ -456,8 +458,6 @@ class Prototyper(BaseAgent):
       logger.debug('Stopping and removing the inspect container %s',
                    self.inspect_tool.container_id,
                    trial=last_result.trial)
-      build_result.chat_history = {
-          self.name: '\n'.join(self.chat_history)
-      }
+      build_result.chat_history = {self.name: '\n'.join(self.chat_history)}
       self.inspect_tool.terminate()
     return build_result

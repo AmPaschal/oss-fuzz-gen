@@ -425,10 +425,12 @@ class FunctionToolPrototyper(BaseAgent):
     self.benchmark = benchmark
     self.inspect_tool = ProjectContainerTool(benchmark, name='inspect')
     self.inspect_tool.compile(extra_commands=' && rm -rf /out/* > /dev/null')
-    build_result = BuildResult(benchmark=benchmark,
-                               trial=last_result.trial,
-                               work_dirs=last_result.work_dirs,
-                               author=self,)
+    build_result = BuildResult(
+        benchmark=benchmark,
+        trial=last_result.trial,
+        work_dirs=last_result.work_dirs,
+        author=self,
+    )
     # If we have an analysis result, we should start a new prompt sequence
     # that refines the target.
     if isinstance(last_result, AnalysisResult):
