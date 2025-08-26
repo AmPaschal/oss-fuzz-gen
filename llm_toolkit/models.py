@@ -63,6 +63,8 @@ class LLM:
 
   _max_attempts = 5  # Maximum number of attempts to get prediction response
 
+  supports_adk_agents: bool = False # True if this LLM can be used with ADK agents
+
   def __init__(
       self,
       ai_binary: str,
@@ -235,6 +237,8 @@ class GPT(LLM):
   """OpenAI's GPT model encapsulator."""
 
   name = 'gpt-3.5-turbo'
+  litellm_name = f'openai/{name}'
+  supports_adk_agents = True
 
   def get_model(self) -> Any:
     """Returns the underlying model instance."""
@@ -448,6 +452,7 @@ class ChatGPT(GPT):
   """OpenAI's GPT model with chat session."""
 
   name = 'chatgpt-3.5-turbo'
+  supports_adk_agents = False
 
   def __init__(
       self,
@@ -725,6 +730,7 @@ class VertexAIModel(GoogleModel):
 
   _vertex_ai_model = ''
   _max_output_tokens = 2048
+  supports_adk_agents = True
 
   def cloud_setup(self):
     """Sets Vertex AI cloud location."""

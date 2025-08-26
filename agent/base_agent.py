@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 import requests
 from google.adk import agents, runners, sessions
+from google.adk.models.lite_llm import LiteLlm  # For multi-model support
 from google.adk.tools import ToolContext
 from google.genai import errors, types
 
@@ -33,7 +34,7 @@ import logger
 import utils
 from data_prep import introspector
 from experiment import benchmark as benchmarklib
-from llm_toolkit.models import LLM, VertexAIModel
+from llm_toolkit.models import GPT, LLM, VertexAIModel
 from llm_toolkit.prompts import Prompt
 from results import Result
 from tool.base_tool import BaseTool
@@ -337,13 +338,17 @@ class ADKBaseAgent(BaseAgent):
     self.chat_history = []
 
     # For now, ADKBaseAgents only support the Vertex AI Models.
-    if not isinstance(llm, VertexAIModel):
-      raise ValueError(f'{self.name} only supports Vertex AI models.')
+    if isinstance(llm, VertexAIModel):
+      model = llm._vertex_ai_model
+    elif isinstance(llm, GPT):
+      model = LiteLlm(model=llm.litellm_name)
+    else:
+      raise ValueError(f'ADK Agents does not support this model yet')      
 
     # Create the agent using the ADK library
     adk_agent = agents.LlmAgent(
         name=self.name,
-        model=llm._vertex_ai_model,
+        model=model,
         description=description,
         instruction=instruction,
         tools=tools or [],

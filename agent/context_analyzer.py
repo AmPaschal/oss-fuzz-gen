@@ -43,8 +43,8 @@ class ContextAnalyzer(base_agent.ADKBaseAgent):
                name: str = ''):
 
     builder = prompt_builder.ContextAnalyzerTemplateBuilder(llm, benchmark)
-    description = builder.get_description().get()
-    instruction = builder.get_instruction().get()
+    description = builder.get_description().gettext()
+    instruction = builder.get_instruction().gettext()
     tools = [
         self.get_function_implementation, self.search_project_files,
         self.report_final_result
