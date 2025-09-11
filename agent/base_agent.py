@@ -24,11 +24,13 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+import openai
 import requests
 from google.adk import agents, runners, sessions
 from google.adk.models.lite_llm import LiteLlm  # For multi-model support
 from google.adk.tools import ToolContext
 from google.genai import errors, types
+from google.api_core.exceptions import GoogleAPICallError
 
 import logger
 import utils
@@ -73,7 +75,7 @@ class BaseAgent(ABC):
     logger.info(
         '<CHAT WITH TOOLS PROMPT:ROUND %02d>%s</CHAT PROMPT:ROUND %02d>',
         trial,
-        prompt.get() if prompt else '',
+        prompt.gettext() if prompt else '',
         trial,
         trial=trial)
     response = self.llm.chat_llm_with_tools(client=client,
@@ -393,13 +395,13 @@ class ADKBaseAgent(BaseAgent):
 
     self.round = cur_round
 
-    self.log_llm_prompt(prompt.get())
+    self.log_llm_prompt(prompt.gettext())
 
     async def _call():
       user_id = self.benchmark.id
       session_id = f'session_{self.trial}'
       content = types.Content(role='user',
-                              parts=[types.Part(text=prompt.get())])
+                              parts=[types.Part(text=prompt.gettext())])
 
       final_response = None
 
@@ -426,7 +428,7 @@ class ADKBaseAgent(BaseAgent):
       return final_response
 
     return self.llm.with_retry_on_error(lambda: asyncio.run(_call()),
-                                        [errors.ClientError])
+                                        [errors.ClientError, GoogleAPICallError, ValueError, openai.OpenAIError, openai.RateLimitError])
 
   def log_llm_prompt(self, prompt: str) -> None:
     self.round += 1

@@ -119,6 +119,12 @@ def parse_args() -> argparse.Namespace:
                       '--introspector-endpoint',
                       type=str,
                       default=introspector.DEFAULT_INTROSPECTOR_ENDPOINT)
+  
+  parser.add_argument('-l',
+                      '--model',
+                      default=models.DefaultModel.name,
+                      help=('Models available: '
+                            f'{", ".join(models.LLM.all_llm_names())}.'))
 
   parser.add_argument('-c',
                       '--cloud-experiment-name',
@@ -224,9 +230,12 @@ def write_result(args: argparse.Namespace, trial: int,
 
 if __name__ == '__main__':
 
-  model = models.LLM.setup(ai_binary='', name='vertex_ai_gemini-2-5-pro-chat')
-
   args = parse_args()
+
+  model = models.LLM.setup(
+        ai_binary='',
+        name=args.model,
+    )
 
   introspector.set_introspector_endpoints(args.introspector_endpoint)
 
