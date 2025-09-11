@@ -73,7 +73,7 @@ class CrashAnalyzer(BaseAgent):
       previous_prompt: Optional[Prompt] = None) -> str:
     """Formats a prompt based on gdb execution result."""
     if previous_prompt:
-      previous_prompt_text = previous_prompt.get()
+      previous_prompt_text = previous_prompt.gettext()
     else:
       previous_prompt_text = ''
 

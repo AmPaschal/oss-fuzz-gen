@@ -47,9 +47,9 @@ class FunctionAnalyzer(base_agent.ADKBaseAgent):
 
     builder = prompt_builder.FunctionAnalyzerTemplateBuilder(llm, benchmark)
 
-    description = builder.get_description().get()
+    description = builder.get_description().gettext()
 
-    instruction = builder.get_instruction().get()
+    instruction = builder.get_instruction().gettext()
 
     tools = [
         self.get_function_implementation, self.search_project_files,
@@ -171,11 +171,11 @@ class FunctionAnalyzer(base_agent.ADKBaseAgent):
                                                     prompt)
 
     # Finally check invalid request.
-    if not request or not prompt.get():
+    if not request or not prompt.gettext():
       prompt = self._container_handle_invalid_tool_usage([self.inspect_tool], 0,
                                                          request, prompt)
 
-    tool_response = prompt.get()
+    tool_response = prompt.gettext()
 
     self.log_llm_prompt(tool_response)
 

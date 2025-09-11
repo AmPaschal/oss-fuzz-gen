@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # Model hyper-parameters.
 MAX_TOKENS: int = 2000
 NUM_SAMPLES: int = 1
-TEMPERATURE: float = 0.4
+TEMPERATURE: float = 1
 
 
 class LLM:
@@ -237,9 +237,12 @@ class GPT(LLM):
   """OpenAI's GPT model encapsulator."""
 
   name = 'gpt-3.5-turbo'
-  litellm_name = f'openai/{name}'
   supports_adk_agents = True
 
+  @property
+  def litellm_name(self):
+    return f'openai/{self.name}'
+  
   def get_model(self) -> Any:
     """Returns the underlying model instance."""
     # Placeholder: No suitable implementation/usage yet.
@@ -426,6 +429,13 @@ class GPT4o(GPT):
   name = 'gpt-4o'
   MAX_INPUT_TOKEN = 128000
   _gpt_ai_model = 'gpt-4o'
+
+class GPT5(GPT):
+  """OpenAI's GPT-5 model."""
+
+  name = 'gpt-5'
+  MAX_INPUT_TOKEN = 256000
+  _gpt_ai_model = 'gpt-5'
 
 
 class ChatGPT4oLatest(GPT):

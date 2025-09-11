@@ -267,7 +267,7 @@ def _fuzzing_pipeline(benchmark: Benchmark, model: models.LLM,
   elif args.agent:
 
     writer_agents = []
-    if args.model.supports_adk_agents:
+    if model.supports_adk_agents:
       writer_agents.append(
           FunctionAnalyzer(trial=trial,
                            llm=model,
@@ -286,7 +286,7 @@ def _fuzzing_pipeline(benchmark: Benchmark, model: models.LLM,
                                                args=args),
                               CrashAnalyzer(trial=trial, llm=model, args=args),
                           ]
-    if args.model.supports_adk_agents:
+    if model.supports_adk_agents:
       analysis_agents.append(
 
         ContextAnalyzer(trial=trial,
