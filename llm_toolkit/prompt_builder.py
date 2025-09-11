@@ -1018,19 +1018,19 @@ class ContextAnalyzerTemplateBuilder(DefaultTemplateBuilder):
   def __init__(self,
                model: models.LLM,
                benchmark: Optional[Benchmark] = None,
-               template_dir: str = DEFAULT_TEMPLATE_DIR,
+               template_dir: str = AGENT_TEMPLATE_DIR,
                initial: Any = None):
     super().__init__(model, benchmark, template_dir, initial)
 
     # Load templates.
     self.context_analyzer_instruction_file = self._find_template(
-        AGENT_TEMPLATE_DIR, 'context-analyzer-instruction.txt')
+        template_dir, 'context-analyzer-instruction.txt')
     self.context_analyzer_description_file = self._find_template(
-        AGENT_TEMPLATE_DIR, 'context-analyzer-description.txt')
+        template_dir, 'context-analyzer-description.txt')
     self.context_analyzer_prompt_template_file = self._find_template(
-        AGENT_TEMPLATE_DIR, 'context-analyzer-priming.txt')
+        template_dir, 'context-analyzer-priming.txt')
     self.context_analyzer_response_file = self._find_template(
-        DEFAULT_TEMPLATE_DIR, 'context-analyzer-response.txt')
+        template_dir, 'context-analyzer-response.txt')
 
   def get_instruction(self) -> prompts.Prompt:
     """Constructs a prompt using the templates in |self| and saves it."""

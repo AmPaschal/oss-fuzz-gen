@@ -29,7 +29,7 @@ from agent_tests import (base_agent_test, context_analyzer_test,
 from data_prep import introspector
 from experiment import benchmark as benchmarklib
 from experiment import workdir
-from llm_toolkit import models
+from llm_toolkit import models, prompt_builder
 from results import AnalysisResult, BuildResult, CrashResult, Result, RunResult
 from stage import base_stage, execution_stage
 
@@ -106,7 +106,15 @@ def parse_args() -> argparse.Namespace:
                       type=int,
                       default=100,
                       help='Max trial round for agents.')
-
+  parser.add_argument('-l',
+                      '--model',
+                      default=models.DefaultModel.name,
+                      help=('Models available: '
+                            f'{", ".join(models.LLM.all_llm_names())}.'))
+  parser.add_argument('-td',
+                    '--template-directory',
+                    type=str,
+                    default=prompt_builder.AGENT_TEMPLATE_DIR)
   parser.add_argument('-e',
                       '--introspector-endpoint',
                       type=str,
