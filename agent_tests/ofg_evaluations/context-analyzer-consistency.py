@@ -1,0 +1,102 @@
+import subprocess
+import json
+import argparse
+import re
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+
+# Regex to extract feasibility blocks
+CHAT_BLOCK_RE = re.compile(
+    r"<CHAT RESPONSE:ROUND \d+>.*?<feasible>\s*(True|False)\s*</feasible>.*?</CHAT RESPONSE:ROUND \d+>",
+    re.DOTALL,
+)
+
+def run_command(yaml_path, func, prompt_file, model, repeat, output_dir):
+    """Run the given command multiple times and capture output files."""
+    results = []
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    for i in range(repeat):
+        out_file = Path(output_dir) / f"run_{i+1}.log"
+        cmd = [
+            "python3", "-m", "agent_tests.agent_test",
+            "-y", yaml_path,
+            "-f", func,
+            "-p", "ContextAnalyzer",
+            "-pf", prompt_file,
+            "-l", model,
+        ]
+        with open(out_file, "w") as f:
+            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+        results.append(str(out_file))
+    return results
+
+def parse_feasibility(log_file):
+    """Extract feasibility values from a log file."""
+    with open(log_file, "r") as f:
+        content = f.read()
+    return CHAT_BLOCK_RE.findall(content)
+
+def process_case(idx, test, model, repeat, output_root):
+    """Run one test case and return feasibility analysis."""
+    yaml_path = test["-y"]
+    func = test["-f"]
+    prompt_file = test["-pf"]
+    prompt_file_name = Path(prompt_file).name
+    case_out_dir = Path(output_root) / f"case_{idx}_{prompt_file_name}"
+    print(f"[Case {idx}] Running: {yaml_path}, {func}, {prompt_file}")
+
+    log_files = run_command(yaml_path, func, prompt_file, model, repeat, case_out_dir)
+
+    all_feasibles = []
+    for lf in log_files:
+        all_feasibles.extend(parse_feasibility(lf))
+
+    if not all_feasibles:
+        return idx, None, "⚠️ No feasibility results found"
+
+    consistent = len(set(all_feasibles)) == 1
+    if consistent:
+        return idx, all_feasibles, f"✅ Consistent: {all_feasibles[0]}"
+    else:
+        return idx, all_feasibles, "❌ Inconsistent results"
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch runner for agent_tests.")
+    parser.add_argument("input_json", help="Path to JSON file containing test cases")
+    parser.add_argument("-r", "--repeat", type=int, default=3, help="Number of times to repeat each test")
+    parser.add_argument("-o", "--output", help="Directory to store logs (default: timestamped)")
+    parser.add_argument("-l", "--model", default="gpt-5", help="Model name (default gpt-5)")
+    parser.add_argument("-j", "--jobs", type=int, default=2, help="Number of parallel jobs")
+    args = parser.parse_args()
+
+    # If no output dir provided, create one with timestamp
+    if args.output:
+        output_root = Path(args.output)
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_root = Path(f"results_catest_{timestamp}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    with open(args.input_json, "r") as f:
+        tests = json.load(f)
+
+    futures = []
+    with ProcessPoolExecutor(max_workers=args.jobs) as executor:
+        for idx, test in enumerate(tests, start=1):
+            futures.append(
+                executor.submit(process_case, idx, test, args.model, args.repeat, output_root)
+            )
+
+        for future in as_completed(futures):
+            idx, all_feasibles, status = future.result()
+            if all_feasibles is None:
+                print(f"[Case {idx}] {status}")
+            else:
+                print(f"[Case {idx}] feasibility results: {all_feasibles}")
+                print(f"[Case {idx}] {status}")
+
+if __name__ == "__main__":
+    main()
