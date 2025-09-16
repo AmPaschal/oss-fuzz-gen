@@ -1,0 +1,151 @@
+<description>
+The gnutls_record_recv_packet function is used to receive a single TLS/DTLS record layer packet from a peer. It is intended to be used after a successful handshake. The function will block until a packet is available or a timeout occurs, depending on the transport settings. It populates a gnutls_packet_t structure with the received data. The caller is then responsible for processing this packet (e.g., retrieving its content with gnutls_packet_get) and then de-initializing it with gnutls_packet_deinit.
+</description>
+<requirements>
+<requirement>
+The first argument, session, must be a valid gnutls_session_t object that has been initialized by gnutls_init. This is because the function operates on an active GnuTLS session.
+</requirement>
+<requirement>
+The gnutls_handshake() function must be called and completed successfully on the session before calling this function. This is to ensure the TLS session is established and in a state where application data can be exchanged.
+</requirement>
+<requirement>
+The session object must have valid transport functions set via gnutls_transport_set_push_function and gnutls_transport_set_pull_function. These functions are necessary for receiving the actual data from the underlying communication channel.
+</requirement>
+<requirement>
+The session must not be in an error or invalid state (e.g., session->internals.invalid_connection should not be set). This is checked internally by check_session_status, and a failure will prevent the function from proceeding.
+</requirement>
+<requirement>
+The second argument, packet, must not be a NULL pointer. The function checks for this and will return an error, preventing a crash.
+</requirement>
+<requirement>
+After a packet is successfully received (return value > 0), gnutls_packet_deinit() must be called on the packet object. This is to free the memory allocated for the packet by the GnuTLS library and prevent memory leaks.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+ssize_t gnutls_record_recv_packet(gnutls_session_t, gnutls_packet_t *)
+</function_signature>
+<project_name>
+gnutls
+</project_name>
+
+Fuzz target source:
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
+#include <gnutls/crypto.h>
+
+#include "fuzzer.h"
+
+/* A structure to hold the fuzzer's input data */
+typedef struct {
+  const uint8_t *data;
+  size_t size;
+} fuzz_context_t;
+
+/* A deterministic random function for reproducibility */
+int __attribute__((visibility("protected")))
+gnutls_rnd(gnutls_rnd_level_t level, void *data, size_t len) {
+  memset(data, 0xff, len);
+  if (len > 0) {
+    memset(data, 0x0, 1);
+  }
+  return 0;
+}
+
+/*
+ * A transport pull function that reads from the fuzzer's input buffer.
+ * GnuTLS will call this to get data for the handshake and for records.
+ */
+static ssize_t fuzz_pull(gnutls_transport_ptr_t ptr, void *buffer,
+                         size_t len) {
+  fuzz_context_t *ctx = (fuzz_context_t *)ptr;
+  if (ctx->size == 0) {
+    return 0; /* End of data */
+  }
+
+  size_t to_copy = (len < ctx->size) ? len : ctx->size;
+  memcpy(buffer, ctx->data, to_copy);
+  ctx->data += to_copy;
+  ctx->size -= to_copy;
+  return to_copy;
+}
+
+/*
+ * A transport push function. We don't need to send data anywhere,
+ * so this is a no-op that simulates success.
+ */
+static ssize_t fuzz_push(gnutls_transport_ptr_t ptr, const void *buffer,
+                         size_t len) {
+  (void)ptr;
+  (void)buffer;
+  return len;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  gnutls_session_t session;
+  gnutls_certificate_credentials_t xcred;
+  fuzz_context_t fuzz_context;
+  int ret;
+
+  /* Initialize the fuzz context with the input data */
+  fuzz_context.data = data;
+  fuzz_context.size = size;
+
+  ret = gnutls_init(&session, GNUTLS_CLIENT);
+  assert(ret >= 0);
+
+  /* Set up dummy credentials, required for the handshake */
+  ret = gnutls_certificate_allocate_credentials(&xcred);
+  assert(ret >= 0);
+  ret = gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, xcred);
+  assert(ret >= 0);
+
+  /* Set a default priority string */
+  ret = gnutls_priority_set_direct(session, "NORMAL", NULL);
+  assert(ret >= 0);
+
+  /* Set up the custom transport functions */
+  gnutls_transport_set_ptr(session, &fuzz_context);
+  gnutls_transport_set_push_function(session, fuzz_push);
+  gnutls_transport_set_pull_function(session, fuzz_pull);
+
+  /* Perform the handshake. This will consume some of the fuzzer input. */
+  do {
+    ret = gnutls_handshake(session);
+  } while (ret < 0 && gnutls_error_is_fatal(ret) == 0);
+
+  /*
+   * If the handshake was successful, proceed to fuzz gnutls_record_recv_packet.
+   * If it failed, we still fuzzed the handshake logic, which is also valuable.
+   */
+  if (ret >= 0) {
+    for (;;) {
+      gnutls_packet_t packet;
+      ssize_t result = gnutls_record_recv_packet(session, &packet);
+
+      if (result > 0) {
+        /* Successfully received a packet, de-initialize it as required */
+        gnutls_packet_deinit(packet);
+      } else {
+        /*
+         * An error occurred or the pull function returned 0 (EOF).
+         * Stop trying to receive more packets.
+         */
+        break;
+      }
+    }
+  }
+
+  /* Cleanup */
+  gnutls_deinit(session);
+  gnutls_certificate_free_credentials(xcred);
+  return 0;
+}
+

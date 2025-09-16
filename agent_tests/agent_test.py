@@ -106,11 +106,6 @@ def parse_args() -> argparse.Namespace:
                       type=int,
                       default=100,
                       help='Max trial round for agents.')
-  parser.add_argument('-l',
-                      '--model',
-                      default=models.DefaultModel.name,
-                      help=('Models available: '
-                            f'{", ".join(models.LLM.all_llm_names())}.'))
   parser.add_argument('-td',
                     '--template-directory',
                     type=str,
@@ -246,7 +241,7 @@ if __name__ == '__main__':
 
   test_benchmark = [
       benchmark for benchmark in benchmarks
-      if benchmark.function_name == args.function_name
+      if getattr(benchmark, 'function_name', '').lower() == args.function_name.lower()
   ]
 
   if not test_benchmark:

@@ -6,6 +6,8 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
+import tiktoken
+
 # Regex to extract feasibility blocks
 CHAT_BLOCK_RE = re.compile(
     r"<CHAT RESPONSE:ROUND \d+>.*?<feasible>\s*(True|False)\s*</feasible>.*?</CHAT RESPONSE:ROUND \d+>",
@@ -32,7 +34,7 @@ def run_command(yaml_path, func, prompt_file, model, output_dir):
         ]
         with open(out_file, "w") as f:
             subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
-        results.append(str(out_file))
+        results.append((prompt_dir, str(out_file)))
     return results
 
 def parse_feasibility(log_file):
@@ -41,6 +43,43 @@ def parse_feasibility(log_file):
         content = f.read()
     return CHAT_BLOCK_RE.findall(content)
 
+def extract_final_response_metrics(log_file_path):
+    # Read the log file
+    with open(log_file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Regex to capture all response blocks
+    pattern = re.compile(
+        r"<CHAT RESPONSE:ROUND (\d+)>(.*?)</CHAT RESPONSE:ROUND \1>",
+        re.DOTALL
+    )
+
+    # Find all matches and select the last one
+    matches = pattern.findall(content)
+    if not matches:
+        raise ValueError("No valid <CHAT RESPONSE:ROUND> blocks found in log file.")
+    
+    round_number, final_response = matches[-1]
+
+    # Extract <feasible> content
+    feasible_match = re.search(r"<feasible>(.*?)</feasible>", final_response, re.DOTALL)
+    feasible = feasible_match.group(1).strip() if feasible_match else "Unknown"
+
+    # Token count using cl100k_base tokenizer
+    enc = tiktoken.get_encoding("cl100k_base")
+    response_tokens = len(enc.encode(final_response))
+
+    # Validate other required tags exist
+    for tag in ["analysis", "source_code_evidence", "recommendations"]:
+        if not re.search(rf"<{tag}>(.*?)</{tag}>", final_response, re.DOTALL):
+            raise ValueError(f"Missing required tag <{tag}> in final response.")
+
+    return {
+        "feasible": feasible,
+        "round_number": round_number,
+        "response_tokens": response_tokens
+    }
+
 def process_case(idx, test, model, output_root):
     """Run one test case and return feasibility analysis."""
     yaml_path = test["-y"]
@@ -48,22 +87,22 @@ def process_case(idx, test, model, output_root):
     prompt_file = test["-pf"]
     prompt_file_name = Path(prompt_file).name
     case_out_dir = Path(output_root) / f"case_{idx}_{prompt_file_name}"
-    print(f"[Case {idx}] Running: {yaml_path}, {func}, {prompt_file}")
+    print(f"[Case {idx}] Running: {func}, {prompt_file}\n\n")
 
     log_files = run_command(yaml_path, func, prompt_file, model, case_out_dir)
 
-    all_feasibles = []
-    for lf in log_files:
-        all_feasibles.extend(parse_feasibility(lf))
+    print(f"[Case {idx}] {prompt_file} results:")
+    for prompt_dir, log_file in log_files:
+        try:
+            metrics = extract_final_response_metrics(log_file)
+            # Print metrics in a well formatted way
+            print(f"Using prompt version: {prompt_dir}")
+            print(f"Feasible: {metrics['feasible']}")
+            print(f"Round to conclusion: {metrics['round_number']}")
+            print(f"Response tokens: {metrics['response_tokens']}\n")
+        except Exception as e:
+            print(f"[Case {idx}] Error processing {log_file}: {e}")
 
-    if not all_feasibles:
-        return idx, None, "⚠️ No feasibility results found"
-
-    consistent = len(set(all_feasibles)) == 1
-    if consistent:
-        return idx, all_feasibles, f"✅ Consistent: {all_feasibles[0]}"
-    else:
-        return idx, all_feasibles, "❌ Inconsistent results"
 
 def main():
     parser = argparse.ArgumentParser(description="Batch runner for agent_tests.")
@@ -93,12 +132,8 @@ def main():
             )
 
         for future in as_completed(futures):
-            idx, all_feasibles, status = future.result()
-            if all_feasibles is None:
-                print(f"[Case {idx}] {status}")
-            else:
-                print(f"[Case {idx}] feasibility results: {all_feasibles}")
-                print(f"[Case {idx}] {status}")
+            # process_case does not return anything, just ensure completion
+            future.result()
 
 if __name__ == "__main__":
     main()
