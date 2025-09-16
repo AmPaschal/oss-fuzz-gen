@@ -1,0 +1,552 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project hdf5.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/hdf5/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include "hdf5.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#ifdef H5_HAVE_PARALLEL
+#include <mpi.h>
+#endif
+
+// Consume a value of a given type from the fuzzer data
+#define CONSUME_DATA(type, data, size, default_val)     \
+({                                                  \
+type val = default_val;                         \
+if (sizeof(type) <= size) {                     \
+memcpy(&val, data, sizeof(type));           \
+data += sizeof(type);                       \
+size -= sizeof(type);                       \
+}                                               \
+val;                                            \
+})
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 30) {
+return 0;
+}
+
+#ifdef H5_HAVE_PARALLEL
+int mpi_initialized = 0;
+MPI_Initialized(&mpi_initialized);
+if (!mpi_initialized) {
+MPI_Init(NULL, NULL);
+}
+#endif
+
+char filename[256];
+sprintf(filename, "/tmp/libfuzzer.%d.h5", getpid());
+char source_filename[256];
+sprintf(source_filename, "/tmp/libfuzzer.%d.source.h5", getpid());
+
+hid_t fid = H5I_INVALID_HID;
+hid_t sid = H5I_INVALID_HID;
+hid_t did = H5I_INVALID_HID;
+hid_t dcpl = H5I_INVALID_HID;
+hid_t dxpl = H5I_INVALID_HID;
+hid_t fapl = H5I_INVALID_HID;
+hid_t mem_sid = H5I_INVALID_HID;
+
+/* A list of native datatypes to choose from for exercising type conversion */
+hid_t native_types[] = {
+H5T_NATIVE_CHAR, H5T_NATIVE_SCHAR, H5T_NATIVE_UCHAR,
+H5T_NATIVE_SHORT, H5T_NATIVE_USHORT, H5T_NATIVE_INT, H5T_NATIVE_UINT,
+H5T_NATIVE_LONG, H5T_NATIVE_ULONG, H5T_NATIVE_LLONG, H5T_NATIVE_ULLONG,
+H5T_NATIVE_FLOAT, H5T_NATIVE_DOUBLE, H5T_NATIVE_LDOUBLE
+};
+int num_native_types = sizeof(native_types) / sizeof(hid_t);
+
+/* Turn off error printing from the HDF5 library */
+H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+/* --- Fuzzer-driven configuration --- */
+uint8_t use_parallel = CONSUME_DATA(uint8_t, data, size, 0) % 2;
+hsize_t dset_size = CONSUME_DATA(uint8_t, data, size, 100);
+if (dset_size == 0) dset_size = 1;
+uint8_t layout_choice = CONSUME_DATA(uint8_t, data, size, 0);
+
+/* --- Configure file access properties (for parallel I/O) --- */
+fapl = H5Pcreate(H5P_FILE_ACCESS);
+if (fapl < 0) goto cleanup;
+
+#ifdef H5_HAVE_PARALLEL
+if (use_parallel) {
+H5Pset_fapl_mpio(fapl, MPI_COMM_WORLD, MPI_INFO_NULL);
+}
+#endif
+
+/* Create an HDF5 file. */
+fid = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+if (fid < 0) {
+goto cleanup;
+}
+
+/* Create a 2D dataspace for the file. */
+hsize_t file_dims[2] = {dset_size, 1};
+sid = H5Screate_simple(2, file_dims, NULL);
+if (sid < 0) {
+goto cleanup;
+}
+
+/* Create a 1D dataspace for memory. */
+hsize_t mem_dims[1] = {dset_size};
+mem_sid = H5Screate_simple(1, mem_dims, NULL);
+if (mem_sid < 0) {
+goto cleanup;
+}
+
+/* --- Configure dataset creation properties --- */
+dcpl = H5Pcreate(H5P_DATASET_CREATE);
+if (dcpl < 0) {
+goto cleanup;
+}
+
+/* Use fuzzer data to select a layout */
+switch (layout_choice % 4) {
+case 0:
+H5Pset_layout(dcpl, H5D_CONTIGUOUS);
+break;
+case 1:
+H5Pset_layout(dcpl, H5D_COMPACT);
+break;
+case 2:
+H5Pset_layout(dcpl, H5D_CHUNKED);
+uint8_t chunk_dim_val = CONSUME_DATA(uint8_t, data, size, 10);
+if (chunk_dim_val == 0) chunk_dim_val = 1;
+if (chunk_dim_val > dset_size) chunk_dim_val = dset_size;
+hsize_t chunk_dims[2] = {chunk_dim_val, 1};
+H5Pset_chunk(dcpl, 2, chunk_dims);
+break;
+case 3: { // Virtual Dataset
+hid_t src_fid = H5I_INVALID_HID, src_did = H5I_INVALID_HID;
+hid_t src_sid = H5I_INVALID_HID, v_sid = H5I_INVALID_HID;
+
+// Create source file and dataset
+src_fid = H5Fcreate(source_filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+if (src_fid < 0) goto cleanup;
+src_sid = H5Screate_simple(2, file_dims, NULL);
+if (src_sid < 0) { H5Fclose(src_fid); goto cleanup; }
+src_did = H5Dcreate2(src_fid, "source_dset", H5T_NATIVE_INT, src_sid, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+if (src_did < 0) { H5Sclose(src_sid); H5Fclose(src_fid); goto cleanup; }
+
+// Close source objects
+H5Dclose(src_did);
+H5Sclose(src_sid);
+H5Fclose(src_fid);
+
+// Set up VDS mapping
+v_sid = H5Screate_simple(2, file_dims, NULL);
+if (v_sid < 0) goto cleanup;
+H5Pset_layout(dcpl, H5D_VIRTUAL);
+H5Pset_virtual(dcpl, v_sid, source_filename, "/source_dset", v_sid);
+H5Sclose(v_sid); // H5Pset_virtual copies the space
+break;
+}
+}
+
+/* Use fuzzer data to select a filter (only for chunked layout) */
+if (H5Pget_layout(dcpl) == H5D_CHUNKED) {
+uint8_t filter_choice = CONSUME_DATA(uint8_t, data, size, 0);
+switch (filter_choice % 3) {
+case 1: H5Pset_fletcher32(dcpl); break;
+case 2:
+if (H5Zfilter_avail(H5Z_FILTER_DEFLATE)) {
+unsigned int level = CONSUME_DATA(uint8_t, data, size, 5) % 10;
+H5Pset_deflate(dcpl, level);
+}
+break;
+}
+}
+
+/* Use fuzzer data to select memory and file datatypes to trigger conversion */
+uint8_t mem_type_idx = CONSUME_DATA(uint8_t, data, size, 0) % num_native_types;
+uint8_t file_type_idx = CONSUME_DATA(uint8_t, data, size, 0) % num_native_types;
+hid_t mem_type = native_types[mem_type_idx];
+hid_t file_type = native_types[file_type_idx];
+
+/* Create the dataset with the custom properties. */
+did = H5Dcreate2(fid, "dset", file_type, sid, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+if (did < 0) {
+goto cleanup;
+}
+
+/* Create a non-default data transfer property list */
+dxpl = H5Pcreate(H5P_DATASET_XFER);
+if (dxpl < 0) {
+goto cleanup;
+}
+
+#ifdef H5_HAVE_PARALLEL
+if (use_parallel) {
+uint8_t xfer_mode = CONSUME_DATA(uint8_t, data, size, 0) % 2;
+H5Pset_dxpl_mpio(dxpl, xfer_mode == 0 ? H5FD_MPIO_COLLECTIVE : H5FD_MPIO_INDEPENDENT);
+}
+#endif
+
+/* Ensure the remaining buffer is large enough for the chosen memory type. */
+if (size < dset_size * H5Tget_size(mem_type)) {
+goto cleanup;
+}
+
+/* Write data to the dataset using the custom DXPL. */
+H5Dwrite(did, mem_type, mem_sid, sid, dxpl, data);
+
+cleanup:
+/* Close all opened HDF5 objects. */
+if (dxpl >= 0) H5Pclose(dxpl);
+if (dcpl >= 0) H5Pclose(dcpl);
+if (did >= 0) H5Dclose(did);
+if (mem_sid >= 0) H5Sclose(mem_sid);
+if (sid >= 0) H5Sclose(sid);
+if (fid >= 0) H5Fclose(fid);
+if (fapl >= 0) H5Pclose(fapl);
+unlink(filename);
+unlink(source_filename);
+
+#ifdef H5_HAVE_PARALLEL
+if (mpi_initialized) {
+// We only finalize if we initialized it.
+// In some environments, MPI may be initialized externally.
+int mpi_finalized = 0;
+MPI_Finalized(&mpi_finalized);
+if (!mpi_finalized) {
+MPI_Finalize();
+}
+}
+#endif
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: hdf5
+function signature: herr_t H5D__write(size_t, H5D_dset_io_info_t *)
+</input>
+
+<description>
+This function, `H5D__write`, is a low-level internal function within the HDF5 library responsible for writing data to one or more datasets. It is not intended to be called directly by the user, but rather through the public API function `H5Dwrite`.
+
+The function takes a count and an array of `H5D_dset_io_info_t` structs. Each struct in the array contains all the necessary information to write to a single dataset, including the dataset object, memory and file dataspaces, the memory buffer, and datatype information.
+
+The function's execution flow involves several stages:
+1.  **Initialization:** It initializes a general `H5D_io_info_t` structure that manages the overall I/O operation for all datasets.
+2.  **Per-Dataset Setup:** It iterates through each `H5D_dset_io_info_t` element, performing checks and setup for each dataset. This includes:
+*   Verifying the validity of the dataset object and its associated file handle.
+*   Ensuring the file is opened with write permissions.
+*   Setting up datatype information for potential conversions.
+*   Validating the memory and file dataspaces, ensuring they have the same number of selected elements and have their extents defined.
+*   Handling cases where the buffer pointer is NULL (only valid if no elements are selected).
+*   Potentially creating a projected memory space if the memory and file spaces have different ranks but compatible shapes.
+*   Initializing the dataset's storage and layout-specific I/O operations.
+*   Allocating storage for the dataset if it hasn't been allocated yet.
+3.  **I/O Operation:** After setting up all datasets, it performs the actual write operation. It can use a multi-dataset I/O callback if one is provided, or it will loop through each dataset and write to them serially. The write operation is delegated to layout-specific functions (e.g., for contiguous, chunked, or compact storage).
+4.  **Cleanup:** Finally, it cleans up all temporary resources allocated during the operation, such as projected dataspaces and I/O-related buffers.
+
+The callers of this function, `H5VL__native_dataset_write` and `H5D__virtual_write_one`, are also internal functions, which construct the `H5D_dset_io_info_t` structures before calling `H5D__write`. This further indicates that `H5D__write` is a worker function deep inside the library's I/O pipeline.
+
+Based on the analysis, a fuzzer should not call this function directly. Instead, it should target the public function `H5Dwrite` and provide valid HDF5 object identifiers (for the dataset, datatypes, and dataspaces) and a valid data buffer. However, if one were to fuzz `H5D__write` directly, the input `H5D_dset_io_info_t` structure would need to be carefully crafted to represent a valid, open dataset, which is a complex task.
+</description>
+
+<requirements>
+<requirement>
+The `count` argument must be at least 1. The function is designed to process one or more datasets, and its callers always provide a count of 1 or more.
+</requirement>
+<requirement>
+The `dset_info` argument must be a valid pointer to an array of `H5D_dset_io_info_t` structs with `count` elements. This array is the primary input to the function, containing all per-dataset information.
+</requirement>
+<requirement>
+For each `dset_info[i]`, the `dset` field must point to a valid `H5D_t` object. A NULL `dset` will cause a crash due to a failed assertion.
+</requirement>
+<requirement>
+The `dset->oloc.file` field must not be NULL, and the file must be opened with read-write access (`H5F_ACC_RDWR`). These conditions are explicitly checked and will lead to an error if not met.
+</requirement>
+<requirement>
+The `mem_type` field in each `dset_info` element must be a valid pointer to an `H5T_t` object. This is used for datatype conversion and size calculations.
+</requirement>
+<requirement>
+The `file_space` and `mem_space` fields must be valid pointers to `H5S_t` objects, and they must have their extents set. The function relies on these dataspaces to determine the data layout and selection.
+</requirement>
+<requirement>
+The number of elements selected in `mem_space` and `file_space` must be identical. An inequality will result in an error, as the function cannot map data between selections of different sizes.
+</requirement>
+<requirement>
+If the number of selected elements is greater than zero, the `buf.cvp` field must not be NULL. The function will raise an error if there is data to be written but no buffer is provided.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-buffer-overflow on address 0x507000003552 at pc 0x55d8976ce1c2 bp 0x7fff8e0fcff0 sp 0x7fff8e0fc7b0
+READ of size 82 at 0x507000003552 thread T0
+SCARINESS: 26 (multi-byte-read-heap-buffer-overflow)
+#0 0x55d8976ce1c1 in __asan_memcpy /src/llvm-project/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cpp:63:3
+#1 0x55d89781e3d3 in H5D__gather_mem /src/hdf5/src/H5Dscatgath.c:415:13
+#2 0x55d8978218cb in H5D__scatgath_write /src/hdf5/src/H5Dscatgath.c:735:17
+#3 0x55d89826bdb5 in H5D__contig_write /src/hdf5/src/H5Dcontig.c:967:13
+#4 0x55d897817be5 in H5D__write /src/hdf5/src/H5Dio.c:829:17
+#5 0x55d89784409a in H5D__virtual_write_one /src/hdf5/src/H5Dvirtual.c:3011:17
+#6 0x55d89782f0ad in H5D__virtual_write /src/hdf5/src/H5Dvirtual.c:3095:17
+#7 0x55d897817be5 in H5D__write /src/hdf5/src/H5Dio.c:829:17
+#8 0x55d89817872a in H5VL__native_dataset_write /src/hdf5/src/H5VLnative_dataset.c:420:9
+#9 0x55d898134eea in H5VL__dataset_write /src/hdf5/src/H5VLcallback.c:2291:25
+#10 0x55d898134825 in H5VL_dataset_write /src/hdf5/src/H5VLcallback.c:2338:9
+#11 0x55d8977db9dc in H5D__write_api_common /src/hdf5/src/H5D.c:1305:9
+#12 0x55d8977dae6a in H5Dwrite /src/hdf5/src/H5D.c:1358:9
+#13 0x55d8977110f4 in LLVMFuzzerTestOneInput /src/h5_read_fuzzer.c:191:5
+#14 0x55d8975c4500 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#15 0x55d8975c3d25 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#16 0x55d8975c5505 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#17 0x55d8975c6295 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#18 0x55d8975b50db in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#19 0x55d8975e04b2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#20 0x7f3f1dcc2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#21 0x55d8975a795d in _start (out/libfuzzer-address-x86_64/h5_read_fuzzer+0x43495d)
+
+DEDUP_TOKEN: __asan_memcpy--H5D__gather_mem--H5D__scatgath_write
+0x507000003552 is located 0 bytes after 66-byte region [0x507000003510,0x507000003552)
+allocated by thread T0 here:
+#0 0x55d8976d02cf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d89835a193 in operator new(unsigned long) cxa_noexception.cpp
+#2 0x55d8975c3d25 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#3 0x55d8975c5505 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#4 0x55d8975c6295 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#5 0x55d8975b50db in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#6 0x55d8975e04b2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#7 0x7f3f1dcc2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--operator new(unsigned long)--fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a heap-buffer-overflow caused by a bug within the HDF5 library's virtual dataset writing mechanism. The library fails to correctly use the data type information provided by the user.
+
+1.  The fuzzer provides a buffer (`data`) of 66 bytes to the `H5Dwrite` function. It correctly calculates that this buffer is sufficient for 41 elements of the specified memory data type (`mem_type`), which has a size of 1 byte.
+2.  The `H5Dwrite` call involves a virtual dataset. When writing to this dataset, the HDF5 library must read from the user-provided buffer (`data`).
+3.  The bug lies in how the library calculates the amount of data to read. Instead of using the size of the provided `mem_type` (1 byte), it incorrectly uses the size of the dataset's *file* data type (`file_type`), which in this case is 2 bytes.
+4.  The library, therefore, attempts to read `41 elements * 2 bytes/element = 82 bytes` from the 66-byte buffer. This over-read triggers the AddressSanitizer and causes the crash.
+
+The core issue is that the library does not honor the `mem_type` argument in the `H5Dwrite` call when determining the read size from the user's buffer in the context of a virtual dataset write.
+
+**Suggestion for Project Patch:**
+The HDF5 library's implementation of virtual dataset writes needs to be corrected. Specifically, the code path that reads data from the user's application buffer must be modified to use the size of the `mem_type_id` passed into the `H5Dwrite` function. The data type of the destination file should only be considered for the subsequent data type conversion and the final write to disk, not for the initial read from the user's memory.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/h5_read_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/h5_read_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

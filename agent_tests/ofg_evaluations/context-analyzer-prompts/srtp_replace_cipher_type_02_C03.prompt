@@ -1,0 +1,596 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libsrtp.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+/* By Guido Vranken <guidovranken@gmail.com> --
+* https://guidovranken.wordpress.com/ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <limits.h>
+#include "srtp.h"
+#include "srtp_priv.h"
+#include "mt19937.h"
+#include "testmem.h"
+#include "/src/libsrtp/crypto/include/cipher.h"
+#include "/src/libsrtp/crypto/include/cipher_types.h"
+
+/* Global variables */
+static bool g_no_align = false; /* Can be enabled with --no_align */
+static bool g_post_init =
+false; /* Set to true once past initialization phase */
+static bool g_write_input = false;
+
+#ifdef FUZZ_32BIT
+#include <sys/mman.h>
+static bool g_no_mmap = false; /* Can be enabled with --no_mmap */
+static void *g_mmap_allocation =
+NULL; /* Keeps current mmap() allocation address */
+static size_t g_mmap_allocation_size =
+0; /* Keeps current mmap() allocation size */
+#endif
+
+/* Custom allocator functions */
+
+static void *fuzz_alloc(const size_t size, const bool do_zero)
+{
+void *ret = NULL;
+#ifdef FUZZ_32BIT
+bool do_malloc = true;
+#endif
+bool do_mmap, mmap_high = true;
+
+if (size == 0) {
+size_t ret_val;
+/* Allocations of size 0 are not illegal, but are a bad practice, since
+* writing just a single byte to this region constitutes undefined
+* behavior per the C spec. glibc will return a small, valid memory
+* region
+* whereas OpenBSD will crash upon writing to it.
+* Intentionally return a pointer to an invalid page to detect
+* unsound code efficiently.
+* fuzz_free is aware of this pointer range and will not attempt
+* to free()/munmap() it.
+*/
+ret_val = 0x01 + (fuzz_mt19937_get() % 1024);
+return (void *)ret_val;
+}
+
+/* Don't do mmap()-based allocations during initialization */
+if (g_post_init == true) {
+/* Even extract these values if --no_mmap is specified.
+* This keeps the PRNG output stream consistent across
+* fuzzer configurations.
+*/
+do_mmap = (fuzz_mt19937_get() % 64) == 0 ? true : false;
+if (do_mmap == true) {
+mmap_high = (fuzz_mt19937_get() % 2) == 0 ? true : false;
+}
+} else {
+do_mmap = false;
+}
+
+#ifdef FUZZ_32BIT
+/* g_mmap_allocation must be NULL because we only support a single
+* concurrent mmap allocation at a time
+*/
+if (g_mmap_allocation == NULL && g_no_mmap == false && do_mmap == true) {
+void *mmap_address;
+if (mmap_high == true) {
+mmap_address = (void *)0xFFFF0000;
+} else {
+mmap_address = (void *)0x00010000;
+}
+g_mmap_allocation_size = size;
+
+ret = mmap(mmap_address, g_mmap_allocation_size, PROT_READ | PROT_WRITE,
+MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+if (ret == MAP_FAILED) {
+/* That's okay -- just return NULL to the caller */
+
+ret = NULL;
+
+/* Reset this for the sake of cleanliness */
+g_mmap_allocation_size = 0;
+}
+/* ret not being MAP_FAILED does not mean that ret is the requested
+* address (mmap_address). That's okay. We're not going to perform
+* a munmap() on it and call malloc() instead. It won't gain us
+* anything.
+*/
+
+g_mmap_allocation = ret;
+do_malloc = false;
+}
+
+if (do_malloc == true)
+#endif
+{
+ret = malloc(size);
+}
+
+/* Mimic calloc() if so requested */
+if (ret != NULL && do_zero) {
+memset(ret, 0, size);
+}
+
+return ret;
+}
+
+void *fuzz_calloc(const size_t nmemb, const size_t size)
+{
+/* We must be past srtp_init() to prevent that that function fails */
+if (g_post_init == true) {
+/* Fail 1 in 64 allocations on average to test whether the library
+* can deal with this properly.
+*/
+if ((fuzz_mt19937_get() % 64) == 0) {
+return NULL;
+}
+}
+
+return fuzz_alloc(nmemb * size, true);
+}
+
+static bool fuzz_is_special_pointer(void *ptr)
+{
+/* Special, invalid pointers introduced when code attempted
+* to do size = 0 allocations.
+*/
+if ((size_t)ptr >= 0x01 && (size_t)ptr < (0x01 + 1024)) {
+return true;
+} else {
+return false;
+}
+}
+
+void fuzz_free(void *ptr)
+{
+if (fuzz_is_special_pointer(ptr) == true) {
+return;
+}
+
+#ifdef FUZZ_32BIT
+if (g_post_init == true && ptr != NULL && ptr == g_mmap_allocation) {
+if (munmap(g_mmap_allocation, g_mmap_allocation_size) == -1) {
+/* Shouldn't happen */
+abort();
+}
+g_mmap_allocation = NULL;
+} else
+#endif
+{
+free(ptr);
+}
+}
+
+void fuzz_srtp_event_handler(srtp_event_data_t *data)
+{
+fuzz_testmem(data, sizeof(srtp_event_data_t));
+if (data->session != NULL) {
+fuzz_testmem(data->session, sizeof(*data->session));
+}
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv)
+{
+char **_argv = *argv;
+int i;
+bool no_custom_event_handler = false;
+
+if (srtp_init() != srtp_err_status_ok) {
+/* Shouldn't happen */
+abort();
+}
+
+for (i = 0; i < *argc; i++) {
+if (strcmp("--no_align", _argv[i]) == 0) {
+g_no_align = true;
+} else if (strcmp("--no_custom_event_handler", _argv[i]) == 0) {
+no_custom_event_handler = true;
+} else if (strcmp("--write_input", _argv[i]) == 0) {
+g_write_input = true;
+}
+#ifdef FUZZ_32BIT
+else if (strcmp("--no_mmap", _argv[i]) == 0) {
+g_no_mmap = true;
+}
+#endif
+else if (strncmp("--", _argv[i], 2) == 0) {
+printf("Invalid argument: %s\n", _argv[i]);
+exit(0);
+}
+}
+
+if (no_custom_event_handler == false) {
+if (srtp_install_event_handler(fuzz_srtp_event_handler) !=
+srtp_err_status_ok) {
+/* Shouldn't happen */
+abort();
+}
+}
+
+/* Fully initialized -- past this point, simulated allocation failures
+* are allowed to occur */
+g_post_init = true;
+
+return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+/* We need at least 1 byte for mode selection and sizeof(id) */
+if (size < 1 + sizeof(srtp_cipher_type_id_t)) {
+return 0;
+}
+
+/* Use the first byte to decide whether to add or replace */
+bool replace_mode = (data[0] % 2 == 0);
+data++;
+size--;
+
+/* Extract the cipher ID from the fuzzer input first */
+srtp_cipher_type_id_t fuzzed_id;
+memcpy(&fuzzed_id, data, sizeof(fuzzed_id));
+data += sizeof(fuzzed_id);
+size -= sizeof(fuzzed_id);
+
+/*
+* Create a new cipher type. This must be static to prevent a
+* use-after-return, as the library stores the pointer globally.
+*/
+static srtp_cipher_type_t fuzzed_cipher_type;
+
+/* Start with a valid base to have valid pointers if the input is small */
+memcpy(&fuzzed_cipher_type, &srtp_null_cipher, sizeof(srtp_cipher_type_t));
+
+/*
+* Use the remaining fuzzer data to populate the cipher type struct.
+* This is key to triggering failures in the self-test.
+*/
+if (size > 0) {
+size_t copy_len =
+size < sizeof(srtp_cipher_type_t) ? size : sizeof(srtp_cipher_type_t);
+memcpy(&fuzzed_cipher_type, data, copy_len);
+}
+
+/*
+* To satisfy the requirement that new_ct->id matches the id parameter,
+* we set our custom cipher's ID to the fuzzed value. This must be done
+* *after* the memcpy from the fuzzer data.
+*/
+fuzzed_cipher_type.id = fuzzed_id;
+
+/* Call the appropriate function based on the fuzzer's choice */
+if (replace_mode) {
+srtp_replace_cipher_type(&fuzzed_cipher_type, fuzzed_id);
+} else {
+/* srtp_crypto_kernel_load_cipher_type is declared in srtp_priv.h */
+srtp_crypto_kernel_load_cipher_type(&fuzzed_cipher_type, fuzzed_id);
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libsrtp
+function signature: srtp_err_status_t srtp_replace_cipher_type(const srtp_cipher_type_t *, srtp_cipher_type_id_t)
+</input>
+
+<description>
+This function replaces an existing cipher type in the srtp crypto kernel with a new implementation. It acts as a wrapper for the `srtp_crypto_kernel_do_load_cipher_type` function, passing the new cipher type and its corresponding ID. The underlying function performs several checks to ensure the validity of the new cipher before loading it. These checks include verifying that the provided cipher type is not NULL, that its internal ID matches the one passed to the function, and that it passes a self-test to confirm its correctness. Although the function is named `replace_cipher_type`, its implementation allows for the addition of a new cipher if the provided ID does not already exist in the kernel.
+</description>
+
+<requirements>
+<requirement>
+The `new_ct` parameter must not be a NULL pointer. This is to prevent a NULL pointer dereference within the `srtp_crypto_kernel_do_load_cipher_type` function, which would lead to a crash.
+</requirement>
+<requirement>
+The `id` field of the `srtp_cipher_type_t` struct pointed to by `new_ct` must match the `id` parameter. This is a consistency check performed by the underlying `srtp_crypto_kernel_do_load_cipher_type` function to ensure the correct cipher is being replaced or added.
+</requirement>
+<requirement>
+The `srtp_cipher_type_t` struct pointed to by `new_ct` must be fully initialized with valid function pointers and test data. This is because the `srtp_cipher_type_self_test` function is called on `new_ct`, and it relies on these members to verify the correctness of the cipher implementation.
+</requirement>
+<requirement>
+The `id` parameter should be a value from the `srtp_cipher_type_id_t` enumeration. While the function can handle a new, previously unseen `id` by adding it, using a valid enum value ensures consistency and avoids potential issues with unhandled ID values.
+</requirement>
+<requirement>
+The `srtp_init()` function must be called before calling `srtp_replace_cipher_type`. This ensures that the crypto kernel is properly initialized and in a state where cipher types can be safely modified or added.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: stack-buffer-overflow on address 0x7ff154672430 at pc 0x5610feb66958 bp 0x7ffe324984a0 sp 0x7ffe32498498
+READ of size 8 at 0x7ff154672430 thread T0
+SCARINESS: 48 (8-byte-read-stack-buffer-overflow-far-from-bounds)
+#0 0x5610feb66957 in srtp_get_user_data /src/libsrtp/srtp/srtp.c:4840:17
+#1 0x5610feb69001 in srtp_cipher_type_alloc /src/libsrtp/crypto/cipher/cipher.c:72:13
+#2 0x5610feb69001 in srtp_cipher_type_test /src/libsrtp/crypto/cipher/cipher.c:227:18
+#3 0x5610feb6f98f in srtp_crypto_kernel_do_load_cipher_type /src/libsrtp/crypto/kernel/crypto_kernel.c:291:14
+#4 0x5610feb6f98f in srtp_crypto_kernel_load_cipher_type /src/libsrtp/crypto/kernel/crypto_kernel.c:341:12
+#5 0x5610feb4fd41 in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:268:9
+#6 0x5610fea04300 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x5610fea03b25 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x5610fea05ab2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x5610fea05da2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x5610fe9f4edb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x5610fea202b2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7ff154bd4082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#13 0x5610fe9e775d in _start (out/libfuzzer-address-x86_64/srtp-fuzzer+0x4f75d)
+
+DEDUP_TOKEN: srtp_get_user_data--srtp_cipher_type_alloc--srtp_cipher_type_test
+Address 0x7ff154672430 is located in stack of thread T0 at offset 48 in frame
+#0 0x5610feb68dbf in srtp_cipher_type_test /src/libsrtp/crypto/cipher/cipher.c:201
+
+DEDUP_TOKEN: srtp_cipher_type_test
+This frame has 6 object(s):
+[32, 40) 'c' (line 203) <== Memory access at offset 48 overflows this variable
+[64, 192) 'buffer' (line 205) <== Memory access at offset 48 underflows this variable
+[224, 232) 'len' (line 207)
+[256, 264) 'encrypted_len' (line 437)
+[288, 296) 'decrypted_len' (line 438)
+[320, 384) 'key253' (line 439)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+(longjmp and C++ exceptions *are* supported)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The crash is a stack-buffer-overflow within the `srtp_get_user_data` function, which is caused by a bug in the `srtp_cipher_type_alloc` function of the libsrtp project. The fuzzer is not at fault; it successfully uncovered a latent bug.
+
+The root cause is the use of an uninitialized variable `s` in `srtp_cipher_type_alloc`. The investigation using GDB and source code analysis revealed the following sequence:
+
+1.  The fuzzer's input leads to the execution of `srtp_cipher_type_test`, a self-test function.
+2.  `srtp_cipher_type_test` calls `srtp_cipher_type_alloc`.
+3.  Inside `srtp_cipher_type_alloc` (at `crypto/cipher/cipher.c:75`), the code calls `srtp_get_user_data(s)`. However, the variable `s` is not declared, passed as a parameter, or initialized within this function's scope.
+4.  The compiler, when faced with this uninitialized variable, uses a garbage value from a register or the stack. GDB analysis confirmed this value is the stack address of a local variable from the calling function (`srtp_cipher_type_test`).
+5.  This invalid stack address is passed to `srtp_get_user_data`, which attempts to dereference it as a valid pointer to an SRTP session structure, leading to an invalid memory read and the subsequent crash.
+
+**Suggestion:**
+
+The bug lies entirely within the libsrtp project code. The fix is to correct the implementation of `srtp_cipher_type_alloc`. Since this function is called from a self-test context where no SRTP session (`srtp_t`) exists, it is impossible to retrieve user data associated with a session. The call to `srtp_get_user_data(s)` should be replaced with `NULL`.
+
+**Patch for `crypto/cipher/cipher.c`:**
+```diff
+--- a/crypto/cipher/cipher.c
++++ b/crypto/cipher/cipher.c
+@@ -63,12 +63,8 @@
+int key_len,
+int tag_len)
+{
+-    /*
+-     * srtp_get_user_data() is a bit of a hack, but it's the only way to
+-     * get the user_data into the cipher allocator, which is needed by the
+-     * KDF, which is needed by the alloc function.
+-     */
+-    return ct->alloc(c, key_len, tag_len, srtp_get_user_data(s));
++    /* In this context, there is no srtp_t, so user_data is NULL */
++    return ct->alloc(c, key_len, tag_len, NULL);
+}
+
+srtp_err_status_t srtp_cipher_dealloc(srtp_cipher_t *c)
+
+```
+This patch correctly handles the case where no SRTP session is available, resolving the use of the uninitialized variable and preventing the crash.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libsrtp/fuzzer/fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libsrtp/fuzzer/fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

@@ -1,0 +1,1510 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libsrtp.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <limits.h>
+#include "/src/libsrtp/include/srtp.h"
+#include "srtp_priv.h"
+#include "fuzzer.h"
+#include "mt19937.h"
+#include "testmem.h"
+
+/* Global variables */
+static bool g_no_align = false;  /* Can be enabled with --no_align */
+static bool g_post_init = false; /* Set to true once past initialization phase */
+static bool g_write_input = false;
+
+#ifdef FUZZ_32BIT
+#include <sys/mman.h>
+static bool g_no_mmap = false;            /* Can be enabled with --no_mmap */
+static void *g_mmap_allocation = NULL;    /* Keeps current mmap() allocation address */
+static size_t g_mmap_allocation_size = 0; /* Keeps current mmap() allocation size */
+#endif
+
+/* Custom allocator functions */
+
+static void *fuzz_alloc(const size_t size, const bool do_zero) {
+void *ret = NULL;
+#ifdef FUZZ_32BIT
+bool do_malloc = true;
+#endif
+bool do_mmap, mmap_high = true;
+
+if (size == 0) {
+size_t ret;
+/* Allocations of size 0 are not illegal, but are a bad practice, since
+* writing just a single byte to this region constitutes undefined
+* behavior per the C spec. glibc will return a small, valid memory
+* region
+* whereas OpenBSD will crash upon writing to it.
+* Intentionally return a pointer to an invalid page to detect
+* unsound code efficiently.
+* fuzz_free is aware of this pointer range and will not attempt
+* to free()/munmap() it.
+*/
+ret = 0x01 + (fuzz_mt19937_get() % 1024);
+return (void *)ret;
+}
+
+/* Don't do mmap()-based allocations during initialization */
+if (g_post_init == true) {
+/* Even extract these values if --no_mmap is specified.
+* This keeps the PRNG output stream consistent across
+* fuzzer configurations.
+*/
+do_mmap = (fuzz_mt19937_get() % 64) == 0 ? true : false;
+if (do_mmap == true) {
+mmap_high = (fuzz_mt19937_get() % 2) == 0 ? true : false;
+}
+} else {
+do_mmap = false;
+}
+
+#ifdef FUZZ_32BIT
+/* g_mmap_allocation must be NULL because we only support a single
+* concurrent mmap allocation at a time
+*/
+if (g_mmap_allocation == NULL && g_no_mmap == false && do_mmap == true) {
+void *mmap_address;
+if (mmap_high == true) {
+mmap_address = (void *)0xFFFF0000;
+} else {
+mmap_address = (void *)0x00010000;
+}
+g_mmap_allocation_size = size;
+
+ret = mmap(mmap_address, g_mmap_allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+if (ret == MAP_FAILED) {
+/* That's okay -- just return NULL to the caller */
+
+ret = NULL;
+
+/* Reset this for the sake of cleanliness */
+g_mmap_allocation_size = 0;
+}
+/* ret not being MAP_FAILED does not mean that ret is the requested
+* address (mmap_address). That's okay. We're not going to perform
+* a munmap() on it and call malloc() instead. It won't gain us
+* anything.
+*/
+
+g_mmap_allocation = ret;
+do_malloc = false;
+}
+
+if (do_malloc == true)
+#endif
+{
+ret = malloc(size);
+}
+
+/* Mimic calloc() if so requested */
+if (ret != NULL && do_zero) {
+memset(ret, 0, size);
+}
+
+return ret;
+}
+
+/* Internal allocations by this fuzzer must on one hand (sometimes)
+* receive memory from mmap(), but on the other hand these requests for
+* memory may not fail. By calling this function, the allocation is
+* guaranteed to succeed; it first tries with fuzz_alloc(), which may
+* fail if it uses mmap(), and if that is the case, memory is allocated
+* via the libc allocator (malloc, calloc) which should always succeed */
+static void *fuzz_alloc_succeed(const size_t size, const bool do_zero) {
+void *ret = fuzz_alloc(size, do_zero);
+if (ret == NULL) {
+if (do_zero == false) {
+ret = malloc(size);
+} else {
+ret = calloc(1, size);
+}
+}
+
+return ret;
+}
+
+void *fuzz_calloc(const size_t nmemb, const size_t size) {
+/* We must be past srtp_init() to prevent that that function fails */
+if (g_post_init == true) {
+/* Fail 1 in 64 allocations on average to test whether the library
+* can deal with this properly.
+*/
+if ((fuzz_mt19937_get() % 64) == 0) {
+return NULL;
+}
+}
+
+return fuzz_alloc(nmemb * size, true);
+}
+
+static bool fuzz_is_special_pointer(void *ptr) {
+/* Special, invalid pointers introduced when code attempted
+* to do size = 0 allocations.
+*/
+if ((size_t)ptr >= 0x01 && (size_t)ptr < (0x01 + 1024)) {
+return true;
+} else {
+return false;
+}
+}
+
+void fuzz_free(void *ptr) {
+if (fuzz_is_special_pointer(ptr) == true) {
+return;
+}
+
+#ifdef FUZZ_32BIT
+if (g_post_init == true && ptr != NULL && ptr == g_mmap_allocation) {
+if (munmap(g_mmap_allocation, g_mmap_allocation_size) == -1) {
+/* Shouldn't happen */
+abort();
+}
+g_mmap_allocation = NULL;
+} else
+#endif
+{
+free(ptr);
+}
+}
+
+static srtp_err_status_t fuzz_srtp_protect(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) {
+size_t out_len = *len + SRTP_MAX_TRAILER_LEN;
+srtp_err_status_t s = srtp_protect(srtp_sender, hdr, *len, hdr, &out_len, mki);
+*len = out_len;
+return s;
+}
+
+static srtp_err_status_t fuzz_srtp_unprotect(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) { return srtp_unprotect(srtp_sender, hdr, *len, hdr, len); }
+
+static srtp_err_status_t fuzz_srtp_protect_rtcp(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) {
+size_t out_len = *len + SRTP_MAX_SRTCP_TRAILER_LEN;
+srtp_err_status_t s = srtp_protect_rtcp(srtp_sender, hdr, *len, hdr, &out_len, mki);
+*len = out_len;
+return s;
+}
+
+static srtp_err_status_t fuzz_srtp_unprotect_rtcp(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) { return srtp_unprotect_rtcp(srtp_sender, hdr, *len, hdr, len); }
+
+/* Get protect length functions */
+
+static srtp_err_status_t fuzz_srtp_get_protect_length(const srtp_t srtp_ctx, size_t mki, size_t *length) { return srtp_get_protect_trailer_length(srtp_ctx, mki, length); }
+
+static srtp_err_status_t fuzz_srtp_get_protect_rtcp_length(const srtp_t srtp_ctx, size_t mki, size_t *length) { return srtp_get_protect_rtcp_trailer_length(srtp_ctx, mki, length); }
+
+static uint8_t *extract_key(const uint8_t **data, size_t *size, const size_t key_size) {
+uint8_t *ret;
+if (*size < key_size) {
+return NULL;
+}
+
+ret = fuzz_alloc_succeed(key_size, false);
+EXTRACT(ret, *data, *size, key_size);
+
+return ret;
+}
+
+static srtp_master_key_t *extract_master_key(const uint8_t **data, size_t *size, const size_t key_size, bool simulate, bool *success) {
+srtp_master_key_t *ret = NULL;
+uint16_t mki_id_size;
+
+if (simulate == true) {
+*success = false;
+}
+
+EXTRACT_IF(&mki_id_size, *data, *size, sizeof(mki_id_size));
+
+if (*size < key_size + mki_id_size) {
+goto end;
+}
+
+if (simulate == true) {
+*data += key_size + mki_id_size;
+*size -= key_size + mki_id_size;
+*success = true;
+goto end;
+}
+
+ret = fuzz_alloc_succeed(sizeof(srtp_master_key_t), false);
+ret->key = fuzz_alloc_succeed(key_size, false);
+
+ret->mki_id = fuzz_alloc_succeed(mki_id_size, false);
+
+EXTRACT(ret->key, *data, *size, key_size);
+EXTRACT(ret->mki_id, *data, *size, mki_id_size);
+end:
+return ret;
+}
+
+static srtp_master_key_t **extract_master_keys(const uint8_t **data, size_t *size, const size_t key_size, size_t *num_master_keys) {
+const uint8_t *data_orig = *data;
+size_t size_orig = *size;
+size_t i = 0;
+
+srtp_master_key_t **ret = NULL;
+
+*num_master_keys = 0;
+
+/* First pass -- dry run, determine how many keys we want and can extract */
+while (1) {
+uint8_t do_extract_master_key;
+bool success;
+if (*size < sizeof(do_extract_master_key)) {
+goto next;
+}
+EXTRACT(&do_extract_master_key, *data, *size, sizeof(do_extract_master_key));
+
+/* Decide whether to extract another key */
+if ((do_extract_master_key % 2) == 0) {
+break;
+}
+
+extract_master_key(data, size, key_size, true, &success);
+
+if (success == false) {
+break;
+}
+
+(*num_master_keys)++;
+}
+
+next:
+*data = data_orig;
+*size = size_orig;
+
+/* Allocate array of pointers */
+ret = fuzz_alloc_succeed(*num_master_keys * sizeof(srtp_master_key_t *), false);
+
+/* Second pass -- perform the actual extractions */
+for (i = 0; i < *num_master_keys; i++) {
+uint8_t do_extract_master_key;
+EXTRACT_IF(&do_extract_master_key, *data, *size, sizeof(do_extract_master_key));
+
+if ((do_extract_master_key % 2) == 0) {
+break;
+}
+
+ret[i] = extract_master_key(data, size, key_size, false, NULL);
+
+if (ret[i] == NULL) {
+/* Shouldn't happen */
+abort();
+}
+}
+
+end:
+return ret;
+}
+
+static srtp_policy_t *extract_policy(const uint8_t **data, size_t *size) {
+srtp_policy_t *policy = NULL;
+struct {
+uint8_t srtp_crypto_policy_func;
+size_t window_size;
+uint8_t allow_repeat_tx;
+uint8_t ssrc_type;
+uint32_t ssrc_value;
+uint8_t num_xtn_hdr;
+uint8_t do_extract_key;
+uint8_t do_extract_master_keys;
+} params;
+
+EXTRACT_IF(&params, *data, *size, sizeof(params));
+
+params.srtp_crypto_policy_func %= sizeof(fuzz_srtp_crypto_policies) / sizeof(fuzz_srtp_crypto_policies[0]);
+params.allow_repeat_tx %= 2;
+params.ssrc_type %= sizeof(fuzz_ssrc_type_map) / sizeof(fuzz_ssrc_type_map[0]);
+
+policy = fuzz_alloc_succeed(sizeof(*policy), true);
+
+fuzz_srtp_crypto_policies[params.srtp_crypto_policy_func].crypto_policy_func(&policy->rtp);
+fuzz_srtp_crypto_policies[params.srtp_crypto_policy_func].crypto_policy_func(&policy->rtcp);
+
+if (policy->rtp.cipher_key_len > MAX_KEY_LEN) {
+/* Shouldn't happen */
+abort();
+}
+
+policy->ssrc.type = fuzz_ssrc_type_map[params.ssrc_type].srtp_ssrc_type;
+policy->ssrc.value = params.ssrc_value;
+
+if ((params.do_extract_key % 2) == 0) {
+policy->key = extract_key(data, size, policy->rtp.cipher_key_len);
+
+if (policy->key == NULL) {
+fuzz_free(policy);
+return NULL;
+}
+}
+
+if (params.num_xtn_hdr != 0) {
+const size_t xtn_hdr_size = params.num_xtn_hdr * sizeof(int);
+if (*size < xtn_hdr_size) {
+fuzz_free(policy->key);
+fuzz_free(policy);
+return NULL;
+}
+policy->enc_xtn_hdr = fuzz_alloc_succeed(xtn_hdr_size, false);
+EXTRACT(policy->enc_xtn_hdr, *data, *size, xtn_hdr_size);
+policy->enc_xtn_hdr_count = params.num_xtn_hdr;
+}
+
+if ((params.do_extract_master_keys % 2) == 0) {
+policy->keys = extract_master_keys(data, size, policy->rtp.cipher_key_len, &policy->num_master_keys);
+if (policy->keys == NULL) {
+fuzz_free(policy->key);
+fuzz_free(policy->enc_xtn_hdr);
+fuzz_free(policy);
+return NULL;
+}
+}
+
+policy->window_size = params.window_size;
+policy->allow_repeat_tx = params.allow_repeat_tx;
+policy->next = NULL;
+
+end:
+return policy;
+}
+
+static srtp_policy_t *extract_policies(const uint8_t **data, size_t *size) {
+srtp_policy_t *curpolicy = NULL, *policy_chain = NULL;
+
+curpolicy = extract_policy(data, size);
+if (curpolicy == NULL) {
+return NULL;
+}
+
+policy_chain = curpolicy;
+
+while (1) {
+uint8_t do_extract_policy;
+EXTRACT_IF(&do_extract_policy, *data, *size, sizeof(do_extract_policy));
+
+/* Decide whether to extract another policy */
+if ((do_extract_policy % 2) == 0) {
+break;
+}
+
+curpolicy->next = extract_policy(data, size);
+if (curpolicy->next == NULL) {
+break;
+}
+curpolicy = curpolicy->next;
+}
+
+end:
+return policy_chain;
+}
+
+static uint32_t *extract_remove_stream_ssrc(const uint8_t **data, size_t *size, uint8_t *num_remove_stream) {
+uint32_t *ret = NULL;
+uint8_t _num_remove_stream;
+size_t total_size;
+
+*num_remove_stream = 0;
+
+EXTRACT_IF(&_num_remove_stream, *data, *size, sizeof(_num_remove_stream));
+
+if (_num_remove_stream == 0) {
+goto end;
+}
+
+total_size = _num_remove_stream * sizeof(uint32_t);
+
+if (*size < total_size) {
+goto end;
+}
+
+ret = fuzz_alloc_succeed(total_size, false);
+EXTRACT(ret, *data, *size, total_size);
+
+*num_remove_stream = _num_remove_stream;
+
+end:
+return ret;
+}
+
+static uint32_t *extract_set_roc(const uint8_t **data, size_t *size, uint8_t *num_set_roc) {
+uint32_t *ret = NULL;
+uint8_t _num_set_roc;
+size_t total_size;
+
+*num_set_roc = 0;
+EXTRACT_IF(&_num_set_roc, *data, *size, sizeof(_num_set_roc));
+if (_num_set_roc == 0) {
+goto end;
+}
+
+/* Tuples of 2 uint32_t's */
+total_size = _num_set_roc * sizeof(uint32_t) * 2;
+
+if (*size < total_size) {
+goto end;
+}
+
+ret = fuzz_alloc_succeed(total_size, false);
+EXTRACT(ret, *data, *size, total_size);
+
+*num_set_roc = _num_set_roc;
+
+end:
+return ret;
+}
+
+static void free_policies(srtp_policy_t *curpolicy) {
+size_t i;
+while (curpolicy) {
+srtp_policy_t *next = curpolicy->next;
+
+fuzz_free(curpolicy->key);
+
+for (i = 0; i < curpolicy->num_master_keys; i++) {
+fuzz_free(curpolicy->keys[i]->key);
+fuzz_free(curpolicy->keys[i]->mki_id);
+fuzz_free(curpolicy->keys[i]);
+}
+
+fuzz_free(curpolicy->keys);
+fuzz_free(curpolicy->enc_xtn_hdr);
+fuzz_free(curpolicy);
+
+curpolicy = next;
+}
+}
+
+static uint8_t *run_srtp_func(const srtp_t srtp_ctx, const uint8_t **data, size_t *size) {
+uint8_t *ret = NULL;
+uint8_t *copy = NULL, *copy_2 = NULL;
+
+struct {
+uint16_t size;
+uint8_t srtp_func;
+uint32_t mki;
+uint8_t stretch;
+} params_1;
+
+struct {
+uint8_t srtp_func;
+uint32_t mki;
+} params_2;
+size_t ret_size;
+
+EXTRACT_IF(&params_1, *data, *size, sizeof(params_1));
+params_1.srtp_func %= sizeof(srtp_funcs) / sizeof(srtp_funcs[0]);
+
+if (*size < params_1.size) {
+goto end;
+}
+
+/* Enforce 4 byte alignment */
+if (g_no_align == false) {
+params_1.size -= params_1.size % 4;
+}
+
+if (params_1.size == 0) {
+goto end;
+}
+
+ret_size = params_1.size;
+if (srtp_funcs[params_1.srtp_func].protect == true) {
+/* Intentionally not initialized to trigger MemorySanitizer, if
+* applicable */
+size_t alloc_size;
+
+if (srtp_funcs[params_1.srtp_func].get_length(srtp_ctx, params_1.mki, &alloc_size) != srtp_err_status_ok) {
+goto end;
+}
+
+copy = fuzz_alloc_succeed(ret_size + alloc_size, false);
+} else {
+copy = fuzz_alloc_succeed(ret_size, false);
+}
+
+EXTRACT(copy, *data, *size, params_1.size);
+
+if (srtp_funcs[params_1.srtp_func].srtp_func(srtp_ctx, copy, &ret_size, params_1.mki) != srtp_err_status_ok) {
+fuzz_free(copy);
+goto end;
+}
+// fuzz_free(copy);
+
+fuzz_testmem(copy, ret_size);
+
+ret = copy;
+
+EXTRACT_IF(&params_2, *data, *size, sizeof(params_2));
+params_2.srtp_func %= sizeof(srtp_funcs) / sizeof(srtp_funcs[0]);
+
+if (ret_size == 0) {
+goto end;
+}
+
+if (srtp_funcs[params_2.srtp_func].protect == true) {
+/* Intentionally not initialized to trigger MemorySanitizer, if
+* applicable */
+size_t alloc_size;
+
+if (srtp_funcs[params_2.srtp_func].get_length(srtp_ctx, params_2.mki, &alloc_size) != srtp_err_status_ok) {
+goto end;
+}
+
+copy_2 = fuzz_alloc_succeed(ret_size + alloc_size, false);
+} else {
+copy_2 = fuzz_alloc_succeed(ret_size, false);
+}
+
+memcpy(copy_2, copy, ret_size);
+fuzz_free(copy);
+copy = copy_2;
+
+if (srtp_funcs[params_2.srtp_func].srtp_func(srtp_ctx, copy, &ret_size, params_2.mki) != srtp_err_status_ok) {
+fuzz_free(copy);
+ret = NULL;
+goto end;
+}
+
+fuzz_testmem(copy, ret_size);
+
+ret = copy;
+
+end:
+return ret;
+}
+
+void fuzz_srtp_event_handler(srtp_event_data_t *data) {
+fuzz_testmem(data, sizeof(srtp_event_data_t));
+if (data->session != NULL) {
+fuzz_testmem(data->session, sizeof(*data->session));
+}
+}
+
+static void fuzz_write_input(const uint8_t *data, size_t size) {
+FILE *fp = fopen("input.bin", "wb");
+
+if (fp == NULL) {
+/* Shouldn't happen */
+abort();
+}
+
+if (size != 0 && fwrite(data, size, 1, fp) != 1) {
+printf("Cannot write\n");
+/* Shouldn't happen */
+abort();
+}
+
+fclose(fp);
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+char **_argv = *argv;
+int i;
+bool no_custom_event_handler = false;
+
+if (srtp_init() != srtp_err_status_ok) {
+/* Shouldn't happen */
+abort();
+}
+
+for (i = 0; i < *argc; i++) {
+if (strcmp("--no_align", _argv[i]) == 0) {
+g_no_align = true;
+} else if (strcmp("--no_custom_event_handler", _argv[i]) == 0) {
+no_custom_event_handler = true;
+} else if (strcmp("--write_input", _argv[i]) == 0) {
+g_write_input = true;
+}
+#ifdef FUZZ_32BIT
+else if (strcmp("--no_mmap", _argv[i]) == 0) {
+g_no_mmap = true;
+}
+#endif
+else if (strncmp("--", _argv[i], 2) == 0) {
+printf("Invalid argument: %s\n", _argv[i]);
+exit(0);
+}
+}
+
+if (no_custom_event_handler == false) {
+if (srtp_install_event_handler(fuzz_srtp_event_handler) != srtp_err_status_ok) {
+/* Shouldn't happen */
+abort();
+}
+}
+
+/* Fully initialized -- past this point, simulated allocation failures
+* are allowed to occur */
+g_post_init = true;
+
+return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+uint8_t num_remove_stream;
+uint32_t *remove_stream_ssrc = NULL;
+uint8_t num_set_roc;
+uint32_t *set_roc = NULL;
+srtp_t srtp_ctx = NULL;
+srtp_policy_t *policy_chain = NULL, *policy_chain_2 = NULL;
+uint32_t randseed;
+static bool firstrun = true;
+
+if (firstrun == true) {
+/* TODO version check etc and send it to MSAN */
+}
+
+#ifdef FUZZ_32BIT
+/* Free the mmap allocation made during the previous iteration, if
+* applicable */
+fuzz_free(g_mmap_allocation);
+#endif
+
+if (g_write_input == true) {
+fuzz_write_input(data, size);
+}
+
+EXTRACT_IF(&randseed, data, size, sizeof(randseed));
+fuzz_mt19937_init(randseed);
+srand(randseed);
+
+/* policy_chain is used to initialize the srtp context with */
+if ((policy_chain = extract_policies(&data, &size)) == NULL) {
+goto end;
+}
+/* policy_chain_2 is used as an argument to srtp_update later on */
+if ((policy_chain_2 = extract_policies(&data, &size)) == NULL) {
+goto end;
+}
+
+/* Create context */
+if (srtp_create(&srtp_ctx, policy_chain) != srtp_err_status_ok) {
+goto end;
+}
+
+// free_policies(policy_chain);
+// policy_chain = NULL;
+
+/* Don't check for NULL result -- no extractions is fine */
+remove_stream_ssrc = extract_remove_stream_ssrc(&data, &size, &num_remove_stream);
+
+/* Don't check for NULL result -- no extractions is fine */
+set_roc = extract_set_roc(&data, &size, &num_set_roc);
+
+{
+uint8_t *ret;
+int i = 0, j = 0;
+
+while ((ret = run_srtp_func(srtp_ctx, &data, &size)) != NULL) {
+fuzz_free(ret);
+
+/* Keep removing streams until the set of SSRCs extracted from the
+* fuzzer input is exhausted */
+if (i < num_remove_stream) {
+if (srtp_stream_remove(srtp_ctx, remove_stream_ssrc[i]) != srtp_err_status_ok) {
+goto end;
+}
+i++;
+}
+
+/* Keep setting and getting ROCs until the set of SSRC/ROC tuples
+* extracted from the fuzzer input is exhausted */
+if (j < num_set_roc * 2) {
+uint32_t roc;
+if (srtp_stream_set_roc(srtp_ctx, set_roc[j], set_roc[j + 1]) != srtp_err_status_ok) {
+goto end;
+}
+if (srtp_stream_get_roc(srtp_ctx, set_roc[j + 1], &roc) != srtp_err_status_ok) {
+goto end;
+}
+j += 2;
+}
+
+if (policy_chain_2 != NULL) {
+srtp_policy_t *p = policy_chain_2;
+while (p != NULL) {
+srtp_stream_update(srtp_ctx, p);
+p = p->next;
+}
+
+/* Discard after using once */
+free_policies(policy_chain_2);
+policy_chain_2 = NULL;
+}
+}
+}
+
+end:
+free_policies(policy_chain);
+free_policies(policy_chain_2);
+fuzz_free(remove_stream_ssrc);
+fuzz_free(set_roc);
+if (srtp_ctx != NULL) {
+srtp_dealloc(srtp_ctx);
+}
+fuzz_mt19937_destroy();
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libsrtp
+function signature: srtp_err_status_t srtp_stream_update(srtp_t, const srtp_policy_t *)
+</input>
+
+<description>
+The `srtp_stream_update` function is used to update an SRTP stream with a new policy. The function takes a session context and a policy as input. It first validates the policy, and then, based on the SSRC type in the policy, it either updates the template streams or a specific stream. The caller, `srtp_update`, can call this function multiple times for a list of policies.
+</description>
+
+<requirements>
+<requirement>
+The `session` argument, which is of type `srtp_t`, must be a valid session created by the `srtp_create` function. This is because the function expects an initialized session context to operate on.
+</requirement>
+<requirement>
+The `policy` argument cannot be NULL. This is to prevent a null pointer dereference.
+</requirement>
+<requirement>
+The `policy->ssrc.type` must be one of `ssrc_any_outbound`, `ssrc_any_inbound`, or `ssrc_specific`. Other values will cause the function to return an error.
+</requirement>
+<requirement>
+If `policy->key` is NULL, then `policy->num_master_keys` must be between 1 and 256 (SRTP_MAX_NUM_MASTER_KEYS). This is to prevent an error when validating the policy.
+</requirement>
+<requirement>
+If `policy->key` is NULL, `policy->keys` must be a valid array of `srtp_master_key_t` pointers of size `num_master_keys`. Each element and its `key` field must not be NULL to avoid null pointer dereferences.
+</requirement>
+<requirement>
+If `policy->key` is NULL and `policy->use_mki` is true, `policy->mki_size` must be between 1 and 128 (SRTP_MAX_MKI_LEN), and each `mki_id` in `policy->keys` must not be NULL. This is enforced by the `srtp_valid_policy` function.
+</requirement>
+<requirement>
+If `policy->key` is not NULL, `policy->use_mki` must be false and `policy->mki_size` must be 0. This is to ensure consistency in the policy configuration.
+</requirement>
+<requirement>
+The `next` member of the `policy` can be a pointer to another policy object, forming a linked list, or be NULL. The `srtp_update` function iterates through this list.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 57808320 byte(s) in 523625 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811dd37f in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:634:48
+#3 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#4 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#5 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#6 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_stream_alloc
+Direct leak of 118427 byte(s) in 2288 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811dd93b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:699:39
+#3 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#4 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#5 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#6 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_stream_alloc
+Direct leak of 560 byte(s) in 7 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811dd37f in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:634:48
+#3 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#4 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#5 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#6 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_stream_alloc
+Indirect leak of 37170744 byte(s) in 119137 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25d9 in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:123:33
+#3 0x557b811dd536 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:646:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 37170744 byte(s) in 119137 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25d9 in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:123:33
+#3 0x557b811dd61b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:667:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 35400456 byte(s) in 113463 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b8120536c in srtp_hmac_alloc /src/libsrtp/crypto/hash/hmac.c:87:26
+#3 0x557b811dd5a7 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:655:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_hmac_alloc
+Indirect leak of 35400456 byte(s) in 113463 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b8120536c in srtp_hmac_alloc /src/libsrtp/crypto/hash/hmac.c:87:26
+#3 0x557b811dd68f in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:676:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_hmac_alloc
+Indirect leak of 24974781 byte(s) in 609141 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b812050b6 in srtp_null_auth_alloc /src/libsrtp/crypto/hash/null_auth.c:69:26
+#3 0x557b811dd68f in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:676:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_auth_alloc
+Indirect leak of 24974740 byte(s) in 609140 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b812050b6 in srtp_null_auth_alloc /src/libsrtp/crypto/hash/null_auth.c:69:26
+#3 0x557b811dd5a7 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:655:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_auth_alloc
+Indirect leak of 19310944 byte(s) in 603467 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f2242 in srtp_null_cipher_alloc /src/libsrtp/crypto/cipher/null_cipher.c:68:27
+#3 0x557b811dd61b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:667:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_cipher_alloc
+Indirect leak of 19310944 byte(s) in 603467 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f2242 in srtp_null_cipher_alloc /src/libsrtp/crypto/cipher/null_cipher.c:68:27
+#3 0x557b811dd536 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:646:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_cipher_alloc
+Indirect leak of 11561664 byte(s) in 722604 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811dd6d7 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:687:55
+#3 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#4 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#5 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#6 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_stream_alloc
+Indirect leak of 3812384 byte(s) in 119137 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25ad in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:118:27
+#3 0x557b811dd536 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:646:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 3812384 byte(s) in 119137 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25ad in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:118:27
+#3 0x557b811dd61b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:667:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 436800 byte(s) in 1400 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25d9 in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:123:33
+#3 0x557b811ddcaa in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:732:20
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 44800 byte(s) in 1400 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25ad in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:118:27
+#3 0x557b811ddcaa in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:732:20
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 32672 byte(s) in 1021 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f2242 in srtp_null_cipher_alloc /src/libsrtp/crypto/cipher/null_cipher.c:68:27
+#3 0x557b811ddcaa in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:732:20
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082315 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557b810830a5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_cipher_alloc
+Indirect leak of 1560 byte(s) in 5 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25d9 in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:123:33
+#3 0x557b811dd536 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:646:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 1560 byte(s) in 5 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25d9 in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:123:33
+#3 0x557b811dd61b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:667:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 1248 byte(s) in 4 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b8120536c in srtp_hmac_alloc /src/libsrtp/crypto/hash/hmac.c:87:26
+#3 0x557b811dd5a7 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:655:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_hmac_alloc
+Indirect leak of 1248 byte(s) in 4 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b8120536c in srtp_hmac_alloc /src/libsrtp/crypto/hash/hmac.c:87:26
+#3 0x557b811dd68f in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:676:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_hmac_alloc
+Indirect leak of 160 byte(s) in 5 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25ad in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:118:27
+#3 0x557b811dd61b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:667:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 160 byte(s) in 5 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f25ad in srtp_aes_icm_alloc /src/libsrtp/crypto/cipher/aes_icm.c:118:27
+#3 0x557b811dd536 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:646:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_aes_icm_alloc
+Indirect leak of 123 byte(s) in 3 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b812050b6 in srtp_null_auth_alloc /src/libsrtp/crypto/hash/null_auth.c:69:26
+#3 0x557b811dd5a7 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:655:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_auth_alloc
+Indirect leak of 123 byte(s) in 3 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b812050b6 in srtp_null_auth_alloc /src/libsrtp/crypto/hash/null_auth.c:69:26
+#3 0x557b811dd68f in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:676:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_auth_alloc
+Indirect leak of 112 byte(s) in 7 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811dd6d7 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:687:55
+#3 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#4 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#5 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#6 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_stream_alloc
+Indirect leak of 64 byte(s) in 2 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f2242 in srtp_null_cipher_alloc /src/libsrtp/crypto/cipher/null_cipher.c:68:27
+#3 0x557b811dd61b in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:667:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_cipher_alloc
+Indirect leak of 64 byte(s) in 2 object(s) allocated from:
+#0 0x557b8118d2a9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x557b811f0f90 in srtp_crypto_alloc /src/libsrtp/crypto/kernel/alloc.c:78:11
+#2 0x557b811f2242 in srtp_null_cipher_alloc /src/libsrtp/crypto/cipher/null_cipher.c:68:27
+#3 0x557b811dd536 in srtp_stream_alloc /src/libsrtp/srtp/srtp.c:646:16
+#4 0x557b811e019a in update_template_streams /src/libsrtp/srtp/srtp.c:3520:14
+#5 0x557b811e019a in srtp_stream_update /src/libsrtp/srtp/srtp.c:3632:18
+#6 0x557b811cdd0b in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:727:11
+#7 0x557b81081310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557b81080b35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557b81082ac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x557b81082db2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557b81071eeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557b8109d2c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fcb00f50082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--srtp_crypto_alloc--srtp_null_cipher_alloc
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis of the Bug:**
+
+The analysis of the `update_template_streams` function (lines 3498-3563) in `srtp/srtp.c` reveals a logic flaw that causes the memory leak.
+
+1.  **Allocation:** At line 3520, a `new_stream_template` is allocated using `srtp_stream_alloc`, which is the source of the leaked memory reported by LeakSanitizer.
+2.  **Processing:** The function then iterates through the existing streams (`session->stream_list`) and creates updated versions of them in `new_stream_list`, using the `new_stream_template`.
+3.  **Deallocation:** At lines 3554-3557, the code *attempts* to deallocate the old resources. It calls `srtp_remove_and_dealloc_streams`, `srtp_stream_list_dealloc`, and `srtp_stream_dealloc` on the original `session->stream_list` and `session->stream_template`.
+4.  **Replacement:** Finally, at lines 3560-3561, it replaces the session's stream template and list with the newly created ones.
+
+The bug lies in the deallocation logic. The function `srtp_remove_and_dealloc_streams` likely removes streams from the list and deallocates them. However, the subsequent call to `srtp_stream_dealloc(session->stream_template, NULL)` is what should free the template itself. If an error occurs during the `srtp_stream_list_for_each` loop (lines 3543-3544), the error handling path (lines 3546-3550) correctly deallocates the *new* allocations. But in the success path, it's possible that `srtp_remove_and_dealloc_streams` does not fully deallocate all the internal components of every stream, or there's a flaw in `srtp_stream_dealloc` that fails to free all memory associated with the `stream_template`.
+
+The crash report shows multiple direct and indirect leaks stemming from `srtp_stream_alloc`. This indicates that the main `srtp_stream_t` object (direct leak) is not freed, and as a result, all the memory it points to (ciphers, auth modules, etc.) is also not freed (indirect leaks). The logic at line 3557, `srtp_stream_dealloc(session->stream_template, NULL)`, is the intended point of deallocation for the old template, but it is clearly failing to do its job completely, leading to the observed leaks.
+
+**Suggestion for Patching the Project:**
+
+The bug is in the implementation of `srtp_remove_and_dealloc_streams` or `srtp_stream_dealloc`. The fix requires a careful review of these deallocation functions to ensure they completely free all memory associated with a stream and its template.
+
+Specifically, the `srtp_stream_dealloc` function should be audited to ensure it deallocates:
+1.  The `rtp_cipher` and `rtcp_cipher` objects.
+2.  The `rtp_auth` and `rtcp_auth` objects.
+3.  The `enc_xtn_hdr` array if it was allocated.
+4.  The `keys` array and each `srtp_master_key_t` within it, including their internal `key` and `mki_id` pointers.
+5.  Finally, the `srtp_stream_t` object itself.
+
+The crash log strongly suggests that these deallocations are not happening correctly when a stream template is updated. A developer familiar with the libsrtp codebase should trace the execution of `srtp_stream_dealloc` in the context of `update_template_streams` to identify and correct the missing deallocation steps.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libsrtp/fuzzer/fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libsrtp/fuzzer/fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

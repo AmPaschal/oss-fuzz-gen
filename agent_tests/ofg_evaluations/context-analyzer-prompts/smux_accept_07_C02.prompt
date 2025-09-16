@@ -1,0 +1,470 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project net-snmp.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/net-snmp/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/agent/net-snmp-agent-includes.h>
+
+#include "../agent/mibgroup/smux/smux.h"
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// smux_listen_sd is a global variable defined in smux.c, used by smux_accept
+extern int smux_listen_sd;
+
+// The OID and password for the SMUX peer we will simulate
+static const oid PEER_OID[] = {1, 3, 6, 1, 4, 1, 9999, 1};
+static const size_t PEER_OID_LEN = sizeof(PEER_OID) / sizeof(oid);
+static char PEER_PASS[] = "fuzz_password";
+static char PEER_DESCR[] = "fuzz_peer";
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+// Basic Net-SNMP initialization for an agent component
+init_snmp("snmpd");
+
+// Set up SMUX handlers
+init_smux();
+
+// Manually configure an authorized peer to allow authentication to succeed.
+// This avoids needing an external snmpd.conf file.
+char peer_config[256];
+snprintf(peer_config, sizeof(peer_config), ".1.3.6.1.4.1.9999.1 %s", PEER_PASS);
+smux_parse_peer_auth("smuxpeer", peer_config);
+
+// Create the SMUX listening socket
+real_init_smux();
+
+if (smux_listen_sd < 0) {
+// If the listening socket failed to initialize, we cannot proceed.
+fprintf(stderr, "Failed to initialize SMUX listening socket.\n");
+exit(1);
+}
+
+return 0;
+}
+
+int smux_accept(int);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (smux_listen_sd < 0) {
+return 0;
+}
+
+// Create a client socket to connect to the smux listening socket
+int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+if (client_fd < 0) {
+return 0;
+}
+
+struct sockaddr_in serv_addr;
+socklen_t len = sizeof(serv_addr);
+if (getsockname(smux_listen_sd, (struct sockaddr *)&serv_addr, &len) == -1) {
+close(client_fd);
+return 0;
+}
+
+if (connect(client_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+close(client_fd);
+return 0;
+}
+
+// To get past the initial authentication, we must send a valid SMUX_OPEN PDU.
+// We construct one here and append the fuzzer's data to it.
+u_char open_pdu_buf[1024];
+u_char *open_pdu_ptr = open_pdu_buf;
+size_t open_pdu_len = sizeof(open_pdu_buf);
+long version = 1;
+
+// The body of the SMUX_OPEN PDU contains: version, oid, descr, password
+u_char body_buf[512];
+u_char *body_ptr = body_buf;
+size_t body_len = sizeof(body_buf);
+
+body_ptr = asn_build_int(body_ptr, &body_len,
+(u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_INTEGER),
+&version, sizeof(version));
+if (!body_ptr) { close(client_fd); return 0; }
+
+body_ptr = asn_build_objid(body_ptr, &body_len,
+(u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OBJECT_ID),
+PEER_OID, PEER_OID_LEN);
+if (!body_ptr) { close(client_fd); return 0; }
+
+body_ptr = asn_build_string(body_ptr, &body_len,
+(u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OCTET_STR),
+(const u_char*)PEER_DESCR, strlen(PEER_DESCR));
+if (!body_ptr) { close(client_fd); return 0; }
+
+body_ptr = asn_build_string(body_ptr, &body_len,
+(u_char)(ASN_UNIVERSAL | ASN_PRIMITIVE | ASN_OCTET_STR),
+(const u_char*)PEER_PASS, strlen(PEER_PASS));
+if (!body_ptr) { close(client_fd); return 0; }
+
+// Wrap the body in the SMUX_OPEN sequence header
+size_t total_body_len = body_ptr - body_buf;
+open_pdu_ptr = asn_build_sequence(open_pdu_ptr, &open_pdu_len, SMUX_OPEN, total_body_len);
+if (!open_pdu_ptr) { close(client_fd); return 0; }
+
+memcpy(open_pdu_ptr, body_buf, total_body_len);
+open_pdu_ptr += total_body_len;
+size_t final_open_pdu_len = open_pdu_ptr - open_pdu_buf;
+
+// Combine our crafted PDU with the raw fuzzer data
+u_char *full_data = (u_char *)malloc(final_open_pdu_len + size);
+if (!full_data) { close(client_fd); return 0; }
+memcpy(full_data, open_pdu_buf, final_open_pdu_len);
+memcpy(full_data + final_open_pdu_len, data, size);
+
+// Send the combined data to the listening socket
+send(client_fd, full_data, final_open_pdu_len + size, 0);
+free(full_data);
+
+// Now, call the target function. It will accept() our client connection
+// and recv() the data we just sent.
+int peer_fd = smux_accept(smux_listen_sd);
+
+// Close the client side of the connection. This will cause the server side (peer_fd)
+// to register an EOF on its next read.
+close(client_fd);
+
+if (peer_fd >= 0) {
+// If a peer was successfully accepted, we must trigger its cleanup
+// to reset the state (e.g., npeers counter) for the next fuzz iteration.
+// Calling smux_process() on the fd of a disconnected peer will cause it
+// to call the internal smux_peer_cleanup() function.
+smux_process(peer_fd);
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: net-snmp
+function signature: int smux_accept(int)
+</input>
+
+<description>
+The `smux_accept` function accepts a new SMUX peer connection on a listening socket. It takes a socket descriptor `sd` as input. The function calls `accept()` on the provided socket descriptor to establish a new connection. After a connection is made, it expects to receive an OpenPDU from the new peer, which is then authenticated. If the peer is successfully authenticated, a new socket descriptor for the peer is returned. Otherwise, the connection is closed and -1 is returned. The listening socket descriptor passed to `smux_accept` is a global variable `smux_listen_sd` which is initialized by the `real_init_smux` function.
+</description>
+
+<requirements>
+
+<requirement>
+The function `init_smux` must be called before `smux_accept`. This is because `init_smux` registers configuration handlers that are necessary for peer authentication.
+</requirement>
+<requirement>
+The function `real_init_smux` must be called before `smux_accept`. This is because `real_init_smux` creates, binds, and listens on the SMUX socket, initializing the `smux_listen_sd` global variable that is passed as the argument to `smux_accept`.
+</requirement>
+<requirement>
+The integer argument `sd` must be a valid file descriptor for a listening TCP socket. This is to ensure that the `accept` call within the function succeeds.
+</requirement>
+<requirement>
+The number of active peers, stored in the global variable `npeers`, should be less than `SMUX_MAX_PEERS` (which is 16). This is to prevent the function from rejecting new connections.
+</requirement>
+<requirement>
+The data received from the accepted socket should be fuzzed, starting with a valid SMUX_OPEN PDU. This is because the function's control flow depends on the content of the received data, and a valid open PDU is required for the connection to be established.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-use-after-free on address 0x50700004bf90 at pc 0x55b641f08711 bp 0x7fff1ace8640 sp 0x7fff1ace8638
+READ of size 8 at 0x50700004bf90 thread T0
+SCARINESS: 51 (8-byte-read-heap-use-after-free)
+#0 0x55b641f08710 in netsnmp_unregister_handler /src/net-snmp/agent/agent_handler.c:345:44
+#1 0x55b641f05f6a in smux_replace_active /src/net-snmp/agent/mibgroup/smux/smux.c:1295:9
+#2 0x55b641f047b6 in smux_rreq_process /src/net-snmp/agent/mibgroup/smux/smux.c:1115:17
+#3 0x55b641f047b6 in smux_pdu_process /src/net-snmp/agent/mibgroup/smux/smux.c:833:19
+#4 0x55b641f02231 in smux_accept /src/net-snmp/agent/mibgroup/smux/smux.c:726:13
+#5 0x55b641efaa45 in LLVMFuzzerTestOneInput /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:128:19
+#6 0x55b641daef60 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55b641dae785 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55b641daff65 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55b641db0cf5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55b641d9fb3b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55b641dcaf12 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f18bc38d082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#13 0x55b641d923bd in _start (out/libfuzzer-address-x86_64/snmp_scoped_pdu_parse_fuzzer+0x1583bd)
+
+DEDUP_TOKEN: netsnmp_unregister_handler--smux_replace_active--smux_rreq_process
+0x50700004bf90 is located 16 bytes inside of 80-byte region [0x50700004bf80,0x50700004bfd0)
+freed by thread T0 here:
+#0 0x55b641ebaa96 in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:52:3
+#1 0x55b641f0e792 in netsnmp_subtree_free /src/net-snmp/agent/agent_registry.c:491:5
+#2 0x55b641f14ba2 in unregister_mib_context /src/net-snmp/agent/agent_registry.c:1795:5
+#3 0x55b641f043b2 in smux_rreq_process /src/net-snmp/agent/mibgroup/smux/smux.c:1105:13
+#4 0x55b641f043b2 in smux_pdu_process /src/net-snmp/agent/mibgroup/smux/smux.c:833:19
+#5 0x55b641f02231 in smux_accept /src/net-snmp/agent/mibgroup/smux/smux.c:726:13
+#6 0x55b641efaa45 in LLVMFuzzerTestOneInput /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:128:19
+#7 0x55b641daef60 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55b641dae785 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55b641daff65 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55b641db0cf5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55b641d9fb3b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55b641dcaf12 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f18bc38d082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_free--netsnmp_subtree_free--unregister_mib_context
+previously allocated by thread T0 here:
+#0 0x55b641ebaef9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55b641f076ac in netsnmp_handler_registration_create /src/net-snmp/agent/agent_handler.c:181:15
+#2 0x55b641f076ac in netsnmp_create_handler_registration /src/net-snmp/agent/agent_handler.c:233:14
+#3 0x55b641f042bb in smux_rreq_process /src/net-snmp/agent/mibgroup/smux/smux.c:1225:15
+#4 0x55b641f042bb in smux_pdu_process /src/net-snmp/agent/mibgroup/smux/smux.c:833:19
+#5 0x55b641f02231 in smux_accept /src/net-snmp/agent/mibgroup/smux/smux.c:726:13
+#6 0x55b641efaa45 in LLVMFuzzerTestOneInput /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:128:19
+#7 0x55b641daef60 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55b641dae785 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55b641daff65 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55b641db0cf5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55b641d9fb3b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55b641dcaf12 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f18bc38d082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--netsnmp_handler_registration_create--netsnmp_create_handler_registration
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The root cause of the crash is a use-after-free vulnerability in the SMUX protocol implementation within the Net-SNMP agent. The bug is triggered by a specific sequence of SMUX Protocol Data Units (PDUs) that can be sent by a single client in one session.
+
+1.  **Allocation:** A client sends an `rreq` PDU to register a MIB subtree, which is then committed. This allocates a `netsnmp_handler_registration` structure and adds a corresponding entry to the peer's list of active registrations (`p->registrations`).
+
+2.  **Free:** The client sends a subsequent `rreq` PDU for the same MIB subtree. The agent code in `smux_rreq_process` detects the existing registration and calls `unregister_mib_context` to remove it. This function correctly frees the `netsnmp_handler_registration` structure.
+
+3.  **Dangling Pointer:** The critical flaw is that while the underlying `netsnmp_handler_registration` memory is freed, the pointer to it within the peer's `p->registrations` list is not removed. This list now contains a dangling pointer.
+
+4.  **Use-After-Free:** The client sends a third `rreq` PDU with the `SMUX_REG_REPLACE` operation. This eventually calls `smux_replace_active`, which iterates through the `p->registrations` list. When it processes the entry with the dangling pointer, it passes the invalid pointer to `netsnmp_unregister_handler`, which attempts to dereference the freed memory, leading to the crash.
+
+The fuzz driver is not at fault; it correctly identified a valid but unhandled sequence of operations in the project's code.
+
+**Suggestion for Patch:**
+The vulnerability should be fixed in `smux_rreq_process` located in `/src/net-snmp/agent/mibgroup/smux/smux.c`. When an existing registration is found and `unregister_mib_context` is called successfully, the corresponding entry must also be removed from the peer's `p->registrations` linked list to prevent a dangling pointer.
+
+A potential fix would involve iterating through the `p->registrations` list after a successful unregistration, finding the entry that corresponds to the MIB that was just unregistered, and properly unlinking it from the list.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

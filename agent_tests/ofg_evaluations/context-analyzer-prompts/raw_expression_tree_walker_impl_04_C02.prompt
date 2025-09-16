@@ -1,0 +1,465 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libpg_query.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/libpg_query/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include "pg_query.h"
+#include "src/pg_query_internal.h"
+#include "src/postgres/include/nodes/nodeFuncs.h"
+#include "src/postgres/include/nodes/makefuncs.h"
+#include "src/postgres/include/nodes/parsenodes.h"
+#include "src/postgres/include/catalog/pg_type.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+// Helper function to manually create a Const node, avoiding the need to link makefuncs.c
+static Node* create_const_node(Oid type, int len, Datum value, bool isnull, bool byval) {
+Const *c = makeNode(Const);
+c->consttype = type;
+c->consttypmod = -1;
+c->constcollid = InvalidOid;
+c->constlen = len;
+c->constvalue = value;
+c->constisnull = isnull;
+c->constbyval = byval;
+c->location = -1;
+return (Node *)c;
+}
+
+// Walker function whose behavior is controlled by the fuzzer.
+// The context is a pointer to a boolean.
+bool fuzz_walker(Node *node, void *context) {
+(void)node; // Unused
+if (context != NULL) {
+// Return true or false based on the fuzzer-controlled context.
+return *((bool *)context);
+}
+return false;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 2) {
+return 0;
+}
+
+// Set up the memory context for node creation.
+MemoryContext ctx = pg_query_enter_memory_context();
+
+// Use a byte from the input to control the walker's return value.
+bool walker_return_value = (data[0] % 2 == 0);
+
+// Use another byte to select which type of node to create.
+uint8_t node_type_selector = data[1];
+const uint8_t *fuzz_data = data + 2;
+size_t fuzz_size = size - 2;
+
+Node *node_to_walk = NULL;
+
+// Programmatically create different node types based on fuzzer input.
+switch (node_type_selector % 10) {
+case 0:
+// T_Const
+node_to_walk = create_const_node(INT4OID, 4, Int32GetDatum(123), false, true);
+break;
+case 1:
+{
+// T_RangeVar
+RangeVar *rv = makeNode(RangeVar);
+rv->schemaname = "public";
+rv->relname = "my_table";
+rv->alias = makeNode(Alias);
+rv->alias->aliasname = "t";
+node_to_walk = (Node *)rv;
+break;
+}
+case 2:
+{
+// T_SubLink
+SubLink *sl = makeNode(SubLink);
+sl->subLinkType = ANY_SUBLINK;
+sl->testexpr = create_const_node(INT4OID, 4, Int32GetDatum(1), false, true);
+sl->subselect = (Node *)makeNode(SelectStmt);
+node_to_walk = (Node *)sl;
+break;
+}
+case 3:
+{
+// T_CaseExpr
+CaseExpr *ce = makeNode(CaseExpr);
+ce->arg = (Expr *)create_const_node(INT4OID, 4, Int32GetDatum(42), false, true);
+CaseWhen *cw = makeNode(CaseWhen);
+cw->expr = (Expr *)create_const_node(BOOLOID, 1, BoolGetDatum(true), false, true);
+cw->result = (Expr *)create_const_node(INT4OID, 4, Int32GetDatum(100), false, true);
+ce->args = list_make1(cw);
+node_to_walk = (Node *)ce;
+break;
+}
+case 4:
+// Test the NULL node case.
+node_to_walk = NULL;
+break;
+case 5:
+{
+// T_A_Expr (Arithmetic Expression)
+A_Expr *ae = makeNode(A_Expr);
+ae->kind = AEXPR_OP;
+ae->name = list_make1(makeString("=")); 
+ae->lexpr = create_const_node(INT4OID, 4, Int32GetDatum(1), false, true);
+ae->rexpr = create_const_node(INT4OID, 4, Int32GetDatum(2), false, true);
+node_to_walk = (Node *)ae;
+break;
+}
+case 6:
+{
+// T_BoolExpr
+BoolExpr *be = makeNode(BoolExpr);
+be->boolop = AND_EXPR;
+Node *arg1 = create_const_node(BOOLOID, 1, BoolGetDatum(true), false, true);
+Node *arg2 = create_const_node(BOOLOID, 1, BoolGetDatum(false), false, true);
+be->args = list_make2(arg1, arg2);
+node_to_walk = (Node *)be;
+break;
+}
+case 7:
+{
+// T_JoinExpr
+JoinExpr *je = makeNode(JoinExpr);
+je->jointype = JOIN_INNER;
+je->larg = (Node *)makeNode(RangeVar);
+je->rarg = (Node *)makeNode(RangeVar);
+node_to_walk = (Node *)je;
+break;
+}
+case 8:
+{
+// T_List
+Node *item1 = create_const_node(INT4OID, 4, Int32GetDatum(1), false, true);
+Node *item2 = create_const_node(INT4OID, 4, Int32GetDatum(2), false, true);
+node_to_walk = (Node *)list_make2(item1, item2);
+break;
+}
+case 9:
+{
+// T_ParamRef
+ParamRef *pr = makeNode(ParamRef);
+if (fuzz_size > 0) {
+pr->number = fuzz_data[0];
+} else {
+pr->number = 1;
+}
+node_to_walk = (Node *)pr;
+break;
+}
+}
+
+// Walk the constructed tree using the function under test.
+raw_expression_tree_walker_impl(node_to_walk, fuzz_walker, &walker_return_value);
+
+// Clean up the memory context.
+pg_query_exit_memory_context(ctx);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libpg_query
+function signature: bool raw_expression_tree_walker_impl(Node *, tree_walker_callback, void *)
+</input>
+
+<description>
+The `raw_expression_tree_walker_impl` function is a recursive function that walks a raw expression tree. It takes a `Node`, a walker callback function, and a context as input. It traverses the tree and calls the walker function for each node in the tree. The walker function can then perform some action on the node, such as collecting information about it. The traversal can be stopped if the walker function returns `true`. The function handles a large number of `Node` types, and for each type, it recursively calls itself on the sub-nodes.
+
+The callers of this function, such as those in `pg_query_normalize.c` and `pg_query_parse_plpgsql.c`, use it to extract specific information from the parsed query tree. For example, `pg_query_normalize.c` uses it to find all the constants in a query so they can be replaced with placeholders. `pg_query_parse_plpgsql.c` uses it to find all the `CREATE FUNCTION` and `DO` statements in a PL/pgSQL block.
+
+A key aspect of this function is the `check_stack_depth()` call, which is a safeguard against stack overflow due to excessively deep recursion. This implies that the input `Node` tree should not be too deep.
+
+The walker callback function and its associated context are crucial. The implementation of the walker determines what the traversal does. For example, the `const_record_walker` and `stmts_walker` callbacks show two different uses of the tree walker. The context is used to pass state between the calls to the walker.
+</description>
+
+<requirements>
+<requirement>
+The `node` argument must be a valid pointer to a `Node` struct, or `NULL`. This is because the function dereferences the `node` pointer to access its tag and fields.
+</requirement>
+<requirement>
+The `node`'s type, accessed via `nodeTag(node)`, must be one of the `T_*` enum values handled in the `switch` statement. An unhandled `NodeTag` will cause a fatal error, terminating the program.
+</requirement>
+<requirement>
+The `walker` argument must be a valid function pointer with the signature `bool (*tree_walker_callback) (Node *node, void *context)`. The function's logic depends on this callback to process the nodes.
+</requirement>
+<requirement>
+The `context` argument should be a pointer to a data structure that the `walker` callback function can use to store state. The structure of the context is defined by the walker function.
+</requirement>
+<requirement>
+The input `Node` tree should not be excessively deep. The function calls `check_stack_depth()` to prevent stack overflows, which will cause a crash if the limit is exceeded.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+libFuzzer: fuzz target exited
+#0 0x558028498ac1 in __sanitizer_print_stack_trace /src/llvm-project/compiler-rt/lib/asan/asan_stack.cpp:87:3
+#1 0x55802839da58 in fuzzer::PrintStackTrace() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerUtil.cpp:210:5
+#2 0x558028380eac in fuzzer::Fuzzer::ExitCallback() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:248:3
+#3 0x7f4f1ab318a6  (/lib/x86_64-linux-gnu/libc.so.6+0x468a6) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#4 0x7f4f1ab31a5f in exit (/lib/x86_64-linux-gnu/libc.so.6+0x46a5f) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#5 0x5580284e9bc0 in proc_exit /src/libpg_query/src/postgres/src_backend_storage_ipc_ipc.c:111:80
+#6 0x5580284debe5 in errfinish /src/libpg_query/src/postgres/src_backend_utils_error_elog.c:618:3
+#7 0x5580284d754e in raw_expression_tree_walker_impl /src/libpg_query/src/postgres/src_backend_nodes_nodeFuncs.c:1640:4
+#8 0x5580284cec0a in LLVMFuzzerTestOneInput /src/libpg_query/./test/fuzz/fuzz_parser.c:154:3
+#9 0x558028382300 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x558028381b25 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x558028383305 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x558028384095 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x558028372edb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55802839e2b2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f4f1ab0f082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#16 0x55802836575d in _start (out/libfuzzer-address-x86_64/fuzz_parser+0x5975d)
+
+DEDUP_TOKEN: __sanitizer_print_stack_trace--fuzzer::PrintStackTrace()--fuzzer::Fuzzer::ExitCallback()
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is caused by an unhandled node type in the `raw_expression_tree_walker_impl` function within the `libpg_query` project. The GDB session, despite showing a misleading intermediate state, ultimately produced a crash report identical to the initial one. This confirms the crash occurs because execution reaches the `default` case of a large `switch` statement, which triggers a fatal error for "unrecognized node type".
+
+The root cause, as determined by inspecting the fuzzer code, `Makefile`, and patch files, is an inconsistency in the project's source code management. A patch (`01_parser_additional_param_ref_support.patch`) is applied during the build process to make the SQL parser generate `T_ParamRef` nodes. However, the `raw_expression_tree_walker_impl` function, which is supposed to process all nodes generated by the parser, was not updated to handle `T_ParamRef`.
+
+The fuzzer correctly generated a valid AST (Abstract Syntax Tree) containing a `T_ParamRef` node, exposing this oversight in the project's tree-walking logic.
+
+**Suggestion:**
+The project's `raw_expression_tree_walker_impl` function in `src/postgres/src_backend_nodes_nodeFuncs.c` must be updated to handle the `T_ParamRef` node type. Since `ParamRef` is a leaf node with no children to recurse into, adding it to the list of primitive node types that simply `break` from the `switch` statement is the correct fix.
+
+Example patch:
+```c
+// In raw_expression_tree_walker_impl's switch statement in nodeFuncs.c
+
+case T_BitString:
+case T_A_Const:
+/* primitive node types with no subnodes */
+break;
++		case T_ParamRef:
++			/* primitive node types with no subnodes */
++			break;
+case T_A_Star:
+...
+```
+This will make the tree walker aware of the `T_ParamRef` node, preventing it from falling through to the `default` error case and resolving the crash.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libpg_query/test/fuzz/fuzz_parser.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libpg_query/test/fuzz/fuzz_parser.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

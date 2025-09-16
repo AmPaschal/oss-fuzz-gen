@@ -1,0 +1,492 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project liblouis.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/liblouis/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <map>
+#include <algorithm>
+
+extern "C" {
+#include "/src/liblouis/liblouis/liblouis.h"
+}
+
+// Suppress log messages to avoid fuzzing log spam
+static void quiet_log_callback(logLevels level, const char *message) {
+(void)level;
+(void)message;
+}
+
+// A more comprehensive dictionary of keywords from liblouis table files.
+const std::vector<std::string> keywords = {
+"include", "undefined", "display", "multind", "compbrl", "comp6",
+"nocont", "always", "repeated", "space", "fallback", "hyphen",
+"begcaps", "endcaps", "capsnocont", "dec", "hex", "oct", "emphclass",
+"lowercase", "uppercase", "sign", "begemphword", "endemphword",
+"characterclass", "definemacro", "deletemacro", "swap", "pass2",
+"pass3", "pass4", "rule", "norule", "letternosign", "letter",
+"number", "punctuation", "math", "contraction", "uncontracted",
+"grade", "nocross", "noback", "noletsign", "nobrl", "brldot",
+"replace", "context", "scontext", "econtext", "word", "syllable",
+"grouping", "begingroup", "endgroup", "pretrans", "posttrans"
+};
+
+// Generates a valid-looking argument for a liblouis rule.
+std::string generate_argument(FuzzedDataProvider &provider) {
+std::string arg;
+uint8_t choice = provider.ConsumeIntegralInRange<uint8_t>(0, 2);
+switch (choice) {
+case 0: // A short, random string
+arg = provider.ConsumeRandomLengthString(8);
+break;
+case 1: // A hex value like \x41
+arg = "\\x" + provider.ConsumeBytesAsString(provider.ConsumeIntegralInRange(1, 2));
+break;
+case 2: // A braille dot pattern like 123
+arg = std::to_string(provider.ConsumeIntegralInRange(1, 6)) +
+std::to_string(provider.ConsumeIntegralInRange(1, 6)) +
+std::to_string(provider.ConsumeIntegralInRange(1, 6));
+break;
+}
+// Ensure the argument doesn't contain problematic characters like spaces or newlines
+arg.erase(std::remove_if(arg.begin(), arg.end(), ::isspace), arg.end());
+if (arg.empty()) {
+arg = "a"; // Ensure not empty
+}
+return arg;
+}
+
+// Generates content for a single table file.
+std::string generate_table_content(FuzzedDataProvider &provider, const std::vector<std::string> &table_names, std::map<std::string, std::string>& macros) {
+std::stringstream table_content;
+int num_lines = provider.ConsumeIntegralInRange<int>(1, 30);
+for (int i = 0; i < num_lines; ++i) {
+std::string keyword = keywords[provider.ConsumeIntegralInRange<size_t>(0, keywords.size() - 1)];
+table_content << keyword << " ";
+
+if (keyword == "include" && !table_names.empty()) {
+table_content << table_names[provider.ConsumeIntegralInRange<size_t>(0, table_names.size() - 1)];
+} else if (keyword == "definemacro") {
+std::string macro_name = provider.ConsumeRandomLengthString(5);
+if (!macro_name.empty()) {
+std::string macro_value = generate_argument(provider);
+table_content << macro_name << " " << macro_value;
+macros[macro_name] = macro_value;
+}
+} else if (keyword == "deletemacro" && !macros.empty()) {
+auto it = macros.begin();
+std::advance(it, provider.ConsumeIntegralInRange<size_t>(0, macros.size() - 1));
+table_content << it->first;
+macros.erase(it);
+} else if (keyword == "emphclass" || keyword == "characterclass") {
+table_content << provider.ConsumeRandomLengthString(6) << " " << generate_argument(provider);
+} else if (keyword == "compbrl" || keyword == "multind" || keyword == "lowercase" || keyword == "uppercase" || keyword == "swap" || keyword == "replace") {
+table_content << generate_argument(provider) << " " << generate_argument(provider);
+} else if (keyword == "context" || keyword == "scontext" || keyword == "econtext") {
+table_content << generate_argument(provider) << " " << generate_argument(provider) << " " << provider.ConsumeIntegralInRange(0, 5);
+} else {
+// Use a defined macro sometimes
+if (provider.ConsumeBool() && !macros.empty()) {
+auto it = macros.begin();
+std::advance(it, provider.ConsumeIntegralInRange<size_t>(0, macros.size() - 1));
+table_content << it->first;
+} else {
+table_content << generate_argument(provider);
+}
+}
+table_content << "\n";
+}
+return table_content.str();
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+static bool first_run = true;
+if (first_run) {
+lou_registerLogCallback(quiet_log_callback);
+first_run = false;
+}
+
+if (size < 1) {
+return 0;
+}
+
+FuzzedDataProvider provider(data, size);
+std::vector<std::string> temp_filenames;
+std::map<std::string, std::string> macros;
+
+int num_tables = provider.ConsumeIntegralInRange<int>(1, 4);
+for (int i = 0; i < num_tables; ++i) {
+std::string filename = "/tmp/fuzz_table_" + std::to_string(i) + ".tbl";
+temp_filenames.push_back(filename);
+}
+
+for (size_t i = 0; i < temp_filenames.size(); ++i) {
+const auto& current_filename = temp_filenames[i];
+std::vector<std::string> includable_tables;
+if (i + 1 < temp_filenames.size()) {
+includable_tables.assign(temp_filenames.begin() + i + 1, temp_filenames.end());
+}
+
+std::string table_content = generate_table_content(provider, includable_tables, macros);
+std::ofstream temp_table_file(current_filename);
+if (temp_table_file.is_open()) {
+temp_table_file << table_content;
+temp_table_file.close();
+}
+}
+
+std::stringstream table_list_stream;
+if (num_tables > 0) {
+int tables_in_list = provider.ConsumeIntegralInRange<int>(1, num_tables);
+for (int i = 0; i < tables_in_list; ++i) {
+table_list_stream << temp_filenames[provider.ConsumeIntegralInRange<size_t>(0, temp_filenames.size() - 1)];
+if (i < tables_in_list - 1) {
+table_list_stream << ",";
+}
+}
+}
+std::string table_list = table_list_stream.str();
+
+if (!table_list.empty()) {
+const char **emph_classes = lou_getEmphClasses(table_list.c_str());
+if (emph_classes != nullptr) {
+for (int i = 0; emph_classes[i] != nullptr; ++i) {
+(void)strlen(emph_classes[i]);
+}
+free((void *)emph_classes);
+}
+}
+
+for (const auto& filename : temp_filenames) {
+remove(filename.c_str());
+}
+
+lou_free();
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: liblouis
+function signature: const char ** lou_getEmphClasses(const char *)
+</input>
+
+<description>
+The `lou_getEmphClasses` function retrieves the emphasis class names from a given translation table. It takes a `tableList` as input, which is a comma-separated list of table file names. The function first calls `_lou_getTranslationTable` to get the `TranslationTableHeader`. If the table is not found, it returns `NULL`. Otherwise, it iterates through the `emphClassNames` array in the table header, copies the names into a newly allocated array of strings, and returns this new array. The returned array is `NULL`-terminated.
+</description>
+
+<requirements>
+<requirement>
+The `tableList` argument must be a comma-separated list of valid paths to translation table files. This is because the function passes this argument to `_lou_getTranslationTable` to load the table, and an invalid path will cause the loading to fail.
+</requirement>
+<requirement>
+The table file specified by `tableList` must be a valid translation table with emphasis class definitions. The function expects to find a `emphClassNames` array in the table header, and will fail if this is not present.
+</requirement>
+<requirement>
+The caller is responsible for freeing the memory allocated for the returned array. The function allocates memory for the result using `malloc`, and this memory must be freed to prevent memory leaks.
+</requirement>
+<requirement>
+The `lou_free()` function should be called after using the library. This is to ensure that all resources allocated by the library are properly released.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: stack-buffer-overflow on address 0x7ffeeaa80e82 at pc 0x5604bf9c1b2b bp 0x7ffeeaa7dad0 sp 0x7ffeeaa7dac8
+READ of size 2 at 0x7ffeeaa80e82 thread T0
+SCARINESS: 29 (2-byte-read-stack-buffer-overflow)
+#0 0x5604bf9c1b2a in compileRule /src/liblouis/liblouis/compileTranslationTable.c:4038:19
+#1 0x5604bf9b65d3 in compileFile /src/liblouis/liblouis/compileTranslationTable.c:4882:9
+#2 0x5604bf9b1449 in compileTable /src/liblouis/liblouis/compileTranslationTable.c:5024:10
+#3 0x5604bf9b1449 in getTable /src/liblouis/liblouis/compileTranslationTable.c:5177:7
+#4 0x5604bf9b0257 in _lou_getTranslationTable /src/liblouis/liblouis/compileTranslationTable.c:5106:2
+#5 0x5604bf9b0257 in lou_getEmphClasses /src/liblouis/liblouis/compileTranslationTable.c:5055:40
+#6 0x5604bf9a4d4d in LLVMFuzzerTestOneInput /src/liblouis/tests/fuzzing/table_fuzzer.cc:155:37
+#7 0x5604bf852db0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x5604bf8525d5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x5604bf853db5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x5604bf854b45 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x5604bf84398b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x5604bf86ed62 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f10589cc082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#14 0x5604bf83620d in _start (out/libfuzzer-address-x86_64/table_fuzzer+0x6f20d)
+
+DEDUP_TOKEN: compileRule--compileFile--compileTable
+Address 0x7ffeeaa80e82 is located in stack of thread T0 at offset 12866 in frame
+#0 0x5604bf9b670f in compileRule /src/liblouis/liblouis/compileTranslationTable.c:2866
+
+DEDUP_TOKEN: compileRule
+This frame has 19 object(s):
+[32, 4130) 'token' (line 2867)
+[4400, 8498) 'ruleChars' (line 2869)
+[8768, 12866) 'ruleDots' (line 2870) <== Memory access at offset 12866 overflows this variable
+[13136, 17234) 'cells' (line 2871)
+[17504, 21602) 'scratchPad' (line 2872)
+[21872, 25970) 'emphClass' (line 2873)
+[26240, 26248) 'after' (line 2874)
+[26272, 26280) 'before' (line 2875)
+[26304, 30402) 'includedFile' (line 2912)
+[30672, 34824) 'tmpFile' (line 2981)
+[35088, 39184) 'arg.sroa.4' (line 3031)
+[39312, 43410) 'ptn_before' (line 3088)
+[43680, 47778) 'ptn_after' (line 3088)
+[48048, 52146) 'ptn_before371' (line 3139)
+[52416, 56514) 'ptn_after372' (line 3139)
+[56784, 60882) 'dots'
+[61152, 65250) 'x' (line 3971)
+[65520, 69618) 'y' (line 3971)
+[69888, 73986) 'characters' (line 4176)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+(longjmp and C++ exceptions *are* supported)
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a stack-buffer-overflow read in the `compileRule` function of `liblouis`. The AddressSanitizer report indicates a 2-byte read at an address that is exactly at the end of the `ruleDots` buffer, which is a `CharsString` struct allocated on the stack.
+
+The relevant code snippet is a loop that iterates based on `ruleDots.length`:
+```c
+for (int k = 0; k < ruleDots.length; k++)
+putChar(file, ruleDots.chars[k], table, NULL, (*table)->ruleCounter);
+```
+In a normal execution flow, this loop should be safe. However, the fuzzer has discovered an input that causes `ruleDots.length` to be corrupted at some point before this loop is executed. This leads to the loop attempting to read past the end of the `ruleDots.chars` array.
+
+While GDB inspection at the breakpoint doesn't immediately show a corrupted `ruleDots.length`, the ASan report is definitive. The overflow happens because the program state has been compromised by processing a malformed table file. The complex logic for parsing different rule types and opcodes within `compileRule` and its callees provides many opportunities for such a corruption to occur, especially with crafted input from a fuzzer. The `memmove` operation found earlier is a prime example of potentially unsafe memory manipulation within the function.
+
+The bug is in the `liblouis` project code, not the fuzz driver. The fuzzer has successfully identified a security vulnerability.
+
+**Suggestion for patching the project:**
+A thorough audit of the `compileRule` function and its helper functions (`getToken`, `parseDots`, `getRuleDotsPattern`, etc.) is needed to identify all code paths that can modify the `length` field of `CharsString` objects on the stack. Bounds checks should be added before any access to the `chars` array within these structures, particularly after calls to functions that parse tokens from the input file. The value of the `length` field should always be validated against the maximum possible size (`MAXSTRING`). For example, after a token is parsed into a `CharsString`, its length should be checked:
+
+```c
+if (token.length >= MAXSTRING) {
+// Handle error: token too long
+compileError(file, "Token is too long.");
+return 0; // Or other error handling
+}
+```
+This kind of defensive programming will prevent corrupted length values from causing buffer overflows. The `memmove` operation should also be carefully reviewed to ensure its size argument can never exceed the buffer's boundaries.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/liblouis/tests/fuzzing/table_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/liblouis/tests/fuzzing/table_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

@@ -1,0 +1,641 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project sql-parser.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+/* Copyright 2021 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <functional>
+#include <fuzzer/FuzzedDataProvider.h>
+#include "SQLParser.h"
+
+// Forward declarations for recursive generation
+std::string GenerateExpression(FuzzedDataProvider& provider, int depth);
+std::string GenerateSelectStatement(FuzzedDataProvider& provider, int depth);
+
+// Helper to generate a lexically valid SQL identifier.
+// Starts with a letter, followed by letters, numbers, or underscores.
+std::string GenerateIdentifier(FuzzedDataProvider& provider) {
+const char kFirstChars[] = "abcdefghijklmnopqrstuvwxyz";
+const char kOtherChars[] = "abcdefghijklmnopqrstuvwxyz0123456789_";
+
+std::string identifier;
+identifier += provider.PickValueInArray(kFirstChars);
+
+size_t len = provider.ConsumeIntegralInRange<size_t>(0, 15);
+for (size_t i = 0; i < len; ++i) {
+identifier += provider.PickValueInArray(kOtherChars);
+}
+return identifier;
+}
+
+// Helper to generate a data type string.
+std::string GenerateDataType(FuzzedDataProvider& provider) {
+return provider.PickValueInArray<std::string>({
+"INT", "INTEGER", "TEXT", "CHAR(10)", "VARCHAR(255)", "DOUBLE", "BOOLEAN", "DATETIME", "DATE"
+});
+}
+
+// Helper to generate a column definition (e.g., "col_name INT NOT NULL").
+std::string GenerateColumnDefinition(FuzzedDataProvider& provider) {
+std::string def = GenerateIdentifier(provider) + " " + GenerateDataType(provider);
+if (provider.ConsumeBool()) {
+def += " ";
+def += provider.PickValueInArray<std::string>({"PRIMARY KEY", "UNIQUE", "NOT NULL", "NULL"});
+}
+return def;
+}
+
+// Helper to generate a literal value.
+std::string GenerateLiteral(FuzzedDataProvider& provider) {
+return provider.PickValueInArray<std::function<std::string()>>({
+[&]() { 
+std::string content = provider.ConsumeRandomLengthString(20);
+size_t pos = 0;
+while ((pos = content.find('\'', pos)) != std::string::npos) {
+content.replace(pos, 1, "''");
+pos += 2;
+}
+return "'" + content + "'";
+},
+[&]() { return std::to_string(provider.ConsumeIntegral<int64_t>()); },
+[&]() { return std::to_string(provider.ConsumeFloatingPoint<double>()); },
+[&]() { return provider.PickValueInArray<std::string>({"NULL", "TRUE", "FALSE"}); }
+})();
+}
+
+// Recursive helper to generate a simple SQL expression.
+std::string GenerateExpression(FuzzedDataProvider& provider, int depth) {
+if (depth <= 0 || provider.ConsumeIntegralInRange(0, 4) == 0) {
+// Base case: a literal or an identifier
+return provider.ConsumeBool() ? GenerateIdentifier(provider) : GenerateLiteral(provider);
+}
+
+// Recursive case: binary operation
+std::string op = provider.PickValueInArray<std::string>({
+"=", "!=", "<>", "<", ">", "<=", ">=", "AND", "OR", "LIKE", "IN", "+", "-", "*", "/"
+});
+
+if (op == "IN") {
+return GenerateExpression(provider, depth - 1) + " IN (" + GenerateLiteral(provider) + ")";
+}
+
+return GenerateExpression(provider, depth - 1) + " " + op + " " + GenerateExpression(provider, depth - 1);
+}
+
+// Generates a CREATE TABLE statement.
+std::string GenerateCreateTable(FuzzedDataProvider& provider) {
+std::string query = "CREATE TABLE " + GenerateIdentifier(provider) + " (";
+size_t num_cols = provider.ConsumeIntegralInRange<size_t>(1, 8);
+for (size_t i = 0; i < num_cols; ++i) {
+if (i > 0) query += ", ";
+query += GenerateColumnDefinition(provider);
+}
+query += ");";
+return query;
+}
+
+// Generates a simple INSERT statement.
+std::string GenerateInsert(FuzzedDataProvider& provider) {
+std::string query = "INSERT INTO " + GenerateIdentifier(provider) + " VALUES (";
+size_t num_values = provider.ConsumeIntegralInRange<size_t>(1, 8);
+for (size_t i = 0; i < num_values; ++i) {
+if (i > 0) query += ", ";
+query += GenerateLiteral(provider);
+}
+query += ");";
+return query;
+}
+
+// Generates a simple UPDATE statement.
+std::string GenerateUpdate(FuzzedDataProvider& provider) {
+std::string query = "UPDATE " + GenerateIdentifier(provider) + " SET ";
+size_t num_updates = provider.ConsumeIntegralInRange<size_t>(1, 4);
+for (size_t i = 0; i < num_updates; ++i) {
+if (i > 0) query += ", ";
+query += GenerateIdentifier(provider) + " = " + GenerateLiteral(provider);
+}
+if (provider.ConsumeBool()) {
+query += " WHERE " + GenerateExpression(provider, 2);
+}
+query += ";";
+return query;
+}
+
+// Generates a simple DELETE statement.
+std::string GenerateDelete(FuzzedDataProvider& provider) {
+std::string query = "DELETE FROM " + GenerateIdentifier(provider);
+if (provider.ConsumeBool()) {
+query += " WHERE " + GenerateExpression(provider, 2);
+}
+query += ";";
+return query;
+}
+
+// Generates a simple SELECT statement.
+std::string GenerateSelectStatement(FuzzedDataProvider& provider, int depth) {
+std::string query = "SELECT ";
+
+if (provider.ConsumeBool()) {
+query += "DISTINCT ";
+}
+
+// Select list
+if (provider.ConsumeBool()) {
+query += "*";
+} else {
+size_t num_cols = provider.ConsumeIntegralInRange<size_t>(1, 5);
+for (size_t i = 0; i < num_cols; ++i) {
+if (i > 0) query += ", ";
+query += GenerateExpression(provider, 1);
+}
+}
+
+// FROM clause
+query += " FROM " + GenerateIdentifier(provider);
+if (provider.ConsumeBool()) {
+query += " AS " + GenerateIdentifier(provider);
+}
+
+// Optional WHERE clause
+if (provider.ConsumeBool()) {
+query += " WHERE " + GenerateExpression(provider, 2);
+}
+
+// Optional GROUP BY
+if (provider.ConsumeBool()) {
+query += " GROUP BY " + GenerateIdentifier(provider);
+if (provider.ConsumeBool()) {
+query += " HAVING " + GenerateExpression(provider, 1);
+}
+}
+
+// Optional ORDER BY
+if (provider.ConsumeBool()) {
+query += " ORDER BY " + GenerateIdentifier(provider) + (provider.ConsumeBool() ? " ASC" : " DESC");
+}
+
+// Optional LIMIT
+if (provider.ConsumeBool()) {
+query += " LIMIT " + std::to_string(provider.ConsumeIntegralInRange<int>(1, 100));
+}
+
+query += ";";
+return query;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 1) {
+return 0;
+}
+FuzzedDataProvider provider(data, size);
+std::string query;
+
+// Choose a statement type to generate
+auto statement_generator = provider.PickValueInArray<std::function<std::string(FuzzedDataProvider&)>>({
+GenerateCreateTable,
+GenerateInsert,
+GenerateUpdate,
+GenerateDelete,
+[](FuzzedDataProvider& p) { return GenerateSelectStatement(p, 3); },
+});
+
+query = statement_generator(provider);
+
+hsql::SQLParserResult res;
+hsql::SQLParser::parseSQLString(query, &res);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: sql-parser
+function signature: bool hsql::SQLParser::parseSQLString(const string &, SQLParserResult *)
+</input>
+
+<description>
+The function `hsql::SQLParser::parseSQLString` parses an SQL query string. It is a wrapper around the `hsql::SQLParser::parse` function, which uses a lexer and a parser to process the input string. The result of the parsing, including syntax errors, is stored in the `SQLParserResult` object provided by the caller. The function's return value indicates whether the parsing process was initialized and completed successfully, not whether the SQL query itself is valid. The validity of the SQL is indicated within the `SQLParserResult` object.
+</description>
+
+<requirements>
+<requirement>
+The `sql` argument should be a fuzzed string. This string is processed as an SQL query, and fuzzing it can uncover vulnerabilities in the parser.
+</requirement>
+<requirement>
+The `result` argument must be a valid pointer to a `SQLParserResult` object. A null pointer will cause a crash when the function attempts to write the parsing results to it.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 2910400 byte(s) in 18190 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75718474 in hsql::Expr::makeOpUnary(hsql::OperatorType, hsql::Expr*) /src/sql-parser/src/sql/Expr.cpp:87:13
+#2 0x559c756c1c2b in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1033:43
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeOpUnary(hsql::OperatorType, hsql::Expr*)--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 1842560 byte(s) in 11516 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75719dc7 in hsql::Expr::makeNullLiteral() /src/sql-parser/src/sql/Expr.cpp:172:13
+#2 0x559c756c2e43 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1154:38
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeNullLiteral()--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 1828800 byte(s) in 11430 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c7571964d in hsql::Expr::makeLiteral(long) /src/sql-parser/src/sql/Expr.cpp:147:13
+#2 0x559c756c52f5 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1152:39
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(long)--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 522400 byte(s) in 3265 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75719bec in hsql::Expr::makeLiteral(bool) /src/sql-parser/src/sql/Expr.cpp:165:13
+#2 0x559c756c2f53 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1147:26
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(bool)--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 377769 byte(s) in 49836 object(s) allocated from:
+#0 0x559c75655e7a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x559c75701fb2 in hsql_lex(HSQL_STYPE*, HSQL_CUST_LTYPE*, void*) /src/sql-parser/flex_lexer.l:276:18
+#2 0x559c756c0503 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.cpp:3227:16
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: ___interceptor_strdup--hsql_lex(HSQL_STYPE*, HSQL_CUST_LTYPE*, void*)--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 336480 byte(s) in 2103 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75719bec in hsql::Expr::makeLiteral(bool) /src/sql-parser/src/sql/Expr.cpp:165:13
+#2 0x559c756c4faf in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1146:38
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(bool)--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 290880 byte(s) in 1818 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75719a0d in hsql::Expr::makeLiteral(char*) /src/sql-parser/src/sql/Expr.cpp:159:13
+#2 0x559c756c3838 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1144:42
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(char*)--hsql_parse(hsql::SQLParserResult*, void*)
+Direct leak of 242240 byte(s) in 1514 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75719830 in hsql::Expr::makeLiteral(double) /src/sql-parser/src/sql/Expr.cpp:153:13
+#2 0x559c756c5472 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1149:41
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(double)--hsql_parse(hsql::SQLParserResult*, void*)
+Indirect leak of 2329600 byte(s) in 14560 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c7571964d in hsql::Expr::makeLiteral(long) /src/sql-parser/src/sql/Expr.cpp:147:13
+#2 0x559c756c52f5 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1152:39
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(long)--hsql_parse(hsql::SQLParserResult*, void*)
+Indirect leak of 580800 byte(s) in 3630 object(s) allocated from:
+#0 0x559c756ab36d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559c75719830 in hsql::Expr::makeLiteral(double) /src/sql-parser/src/sql/Expr.cpp:153:13
+#2 0x559c756c5472 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.y:1149:41
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--hsql::Expr::makeLiteral(double)--hsql_parse(hsql::SQLParserResult*, void*)
+Indirect leak of 31153 byte(s) in 1818 object(s) allocated from:
+#0 0x559c75655e7a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x559c75701c58 in hsql_lex(HSQL_STYPE*, HSQL_CUST_LTYPE*, void*) /src/sql-parser/flex_lexer.l:283:27
+#2 0x559c756c0503 in hsql_parse(hsql::SQLParserResult*, void*) /src/sql-parser/bison_parser.cpp:3227:16
+#3 0x559c756b79a8 in hsql::SQLParser::parse(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, hsql::SQLParserResult*) /src/sql-parser/src/SQLParser.cpp:27:13
+#4 0x559c756b4ccf in LLVMFuzzerTestOneInput /src/sql-parser/fuzz_sql_parse.cpp:217:5
+#5 0x559c755621d0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x559c755619f5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x559c755631d5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x559c75563f65 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x559c75552dab in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x559c7557e182 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f17969e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: ___interceptor_strdup--hsql_lex(HSQL_STYPE*, HSQL_CUST_LTYPE*, void*)--hsql_parse(hsql::SQLParserResult*, void*)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a memory leak reported by LeakSanitizer. The stack traces in the report indicate that memory is allocated within the `hsql-parser` library functions like `hsql::Expr::makeOpUnary`, `hsql::Expr::makeLiteral`, and `hsql_lex`. These allocations happen during the SQL parsing process initiated by the fuzzer.
+
+The fuzz driver (`fuzz_sql_parse.cpp`) correctly creates an `hsql::SQLParserResult` object on the stack. According to the `SQLParserResult.h` header file, this class is designed to take ownership of the dynamically allocated Abstract Syntax Tree (AST) nodes created during parsing. Its destructor is explicitly documented to "delete all statements in the result." By using a stack-allocated `SQLParserResult`, the fuzz driver is correctly following the RAII (Resource Acquisition Is Initialization) paradigm, relying on the object's destructor to perform cleanup automatically.
+
+The GDB debugging attempt revealed that the provided crash-reproducing test case is empty, which prevents hitting breakpoints within the main logic of the fuzzer. However, the initial leak report is sufficient evidence. The existence of leaks demonstrates that the `SQLParserResult` destructor is failing to deallocate all the memory that was allocated during the `hsql::SQLParser::parseSQLString` call. This points to a memory management bug within the `hsql-parser` library, not a misuse of the API by the fuzz driver.
+
+**Suggestion:**
+The bug is in the `hsql-parser` project. The project developers should thoroughly review the memory deallocation logic. Specifically, the destructor of `hsql::SQLParserResult` and its helper function `reset()` must be audited to ensure they recursively traverse the entire AST and free all associated objects (`SQLStatement`, `Expr`, and any strings allocated by `strdup` in the lexer). The destructors of the various `SQLStatement` and `Expr` subclasses should also be checked to ensure they correctly free their members.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/sql-parser/fuzz_sql_parse.cpp
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/sql-parser/fuzz_sql_parse.cpp`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

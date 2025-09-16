@@ -1,0 +1,453 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libzip.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/libzip/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "/src/libzip/lib/zip.h"
+#include "/src/libzip/lib/zipint.h"
+
+#define MAX_EXTRA_FIELDS 16
+
+// Structure to hold parameters for adding an extra field.
+typedef struct {
+zip_uint16_t ef_id;
+zip_uint16_t ef_len;
+uint8_t ef_data[256];
+} extra_field_param_t;
+
+// Structure to hold all fuzzer-derived parameters.
+typedef struct {
+zip_uint8_t num_extra_fields;
+extra_field_param_t fields[MAX_EXTRA_FIELDS];
+zip_uint16_t del_ef_id;
+zip_uint16_t del_ef_idx;
+zip_flags_t del_flags;
+} fuzz_params_t;
+
+// Helper to consume data from the fuzzer input buffer.
+static int consume_data(const uint8_t **data, size_t *size, void *dest, size_t len) {
+if (*size < len) {
+return 0;
+}
+if (dest) {
+memcpy(dest, *data, len);
+}
+*data += len;
+*size -= len;
+return 1;
+}
+
+#ifdef __cplusplus
+extern "C"
+#endif
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < sizeof(fuzz_params_t)) {
+return 0;
+}
+
+fuzz_params_t params;
+if (!consume_data(&data, &size, &params, sizeof(params))) {
+return 0;
+}
+
+// Cap the number of extra fields to a reasonable limit.
+params.num_extra_fields %= (MAX_EXTRA_FIELDS + 1);
+
+zip_source_t *src = NULL;
+zip_t *za = NULL;
+zip_error_t err;
+zip_error_init(&err);
+
+// Phase 1: Create an archive in memory with multiple extra fields.
+// This builds a complex state to be tested in Phase 2.
+src = zip_source_buffer_create(NULL, 0, 1, &err);
+if (src == NULL) {
+zip_error_fini(&err);
+return 0;
+}
+
+za = zip_open_from_source(src, ZIP_CREATE | ZIP_TRUNCATE, &err);
+if (za == NULL) {
+zip_source_free(src);
+zip_error_fini(&err);
+return 0;
+}
+
+zip_source_t *file_s = zip_source_buffer(za, "file_content", 12, 0);
+if (file_s == NULL) {
+zip_close(za);
+zip_error_fini(&err);
+return 0;
+}
+zip_int64_t idx = zip_file_add(za, "test_file", file_s, ZIP_FL_ENC_UTF_8);
+if (idx < 0) {
+zip_source_free(file_s);
+zip_close(za);
+zip_error_fini(&err);
+return 0;
+}
+
+// Add a variable number of extra fields to create a complex list.
+for (int i = 0; i < params.num_extra_fields; i++) {
+extra_field_param_t *p = &params.fields[i];
+// Ensure length is valid
+p->ef_len %= sizeof(p->ef_data);
+if (p->ef_len > 0) {
+zip_file_extra_field_set(za, (zip_uint64_t)idx, p->ef_id, ZIP_EXTRA_FIELD_NEW, p->ef_data, p->ef_len, ZIP_EF_BOTH);
+}
+}
+
+// To test re-opening from a buffer, we must keep the source alive after closing the archive.
+// This MUST be called BEFORE zip_close() to prevent zip_close() from freeing the source.
+zip_source_keep(src);
+
+// Closing the archive finalizes it in the source buffer.
+if (zip_close(za) < 0) {
+// Errors can happen here, e.g., if extra fields are invalid.
+// This is a valid fuzz outcome. Since we kept the source, we are responsible for freeing it.
+zip_source_free(src);
+zip_error_fini(&err);
+return 0;
+}
+za = NULL; // za is invalid after zip_close
+
+// Phase 2: Re-open the created archive from the buffer.
+// This simulates loading an existing file and populates internal
+// structures like `e->orig`, which is crucial for coverage.
+zip_source_seek(src, 0, SEEK_SET);
+
+za = zip_open_from_source(src, 0, &err);
+if (za == NULL) {
+zip_source_free(src);
+zip_error_fini(&err);
+return 0;
+}
+
+// Now, call the target function.
+// We pass the raw, fuzzer-provided values for del_flags and del_ef_idx.
+// We DO NOT sanitize them, allowing the fuzzer to find invalid combinations
+// like (flags=ZIP_EF_BOTH, idx!=ZIP_EXTRA_FIELD_ALL) to test error paths.
+zip_file_extra_field_delete_by_id(za, (zip_uint64_t)idx, params.del_ef_id, params.del_ef_idx, params.del_flags);
+
+// Clean up.
+zip_close(za);
+// The source is freed automatically by zip_close unless zip_source_keep was called.
+// Since we called it, we must free it ourselves.
+zip_source_free(src);
+zip_error_fini(&err);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libzip
+function signature: int zip_file_extra_field_delete_by_id(zip_t *, zip_uint64_t, zip_uint16_t, zip_uint16_t, zip_flags_t)
+</input>
+
+<description>
+The function `zip_file_extra_field_delete_by_id` is used to delete an extra field from a file within a zip archive. It identifies the file by its index `idx` and the extra field by its ID `ef_id` and index `ef_idx`. The `flags` argument specifies whether to delete the extra field from the local header, the central directory, or both. The function performs several checks, including whether the archive is read-only, if the file index is valid, and if the combination of `flags` and `ef_idx` is valid. The only caller of this function is in `ziptool.c`, where the arguments are obtained from command-line arguments, meaning they can be controlled by the user.
+</description>
+
+<requirements>
+<requirement>
+The `za` pointer must be a valid pointer to a `zip_t` structure that is not opened in read-only mode. This is because the function needs to modify the zip archive and checks for the read-only flag.</requirement>
+<requirement>
+The `idx` argument must be a valid index for a file entry within the zip archive `za`. This is to prevent out-of-bounds access when retrieving file information.</requirement>
+<requirement>
+The `flags` argument must have at least one of `ZIP_EF_LOCAL` (1) or `ZIP_EF_CENTRAL` (2) set. This is a precondition checked by the function to ensure the operation is valid.</requirement>
+<requirement>
+If the `flags` argument has both `ZIP_EF_LOCAL` and `ZIP_EF_CENTRAL` set, then the `ef_idx` argument must be `ZIP_EXTRA_FIELD_ALL` (65535). This is a specific constraint checked within the function logic.</requirement>
+<requirement>
+The `ef_id` argument should be fuzzed. The function uses this value to identify which extra field to delete, and in the calling context of `ziptool`, this value is user-controlled.</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-use-after-free on address 0x5080000000e8 at pc 0x558eab636bc0 bp 0x7ffedf20b500 sp 0x7ffedf20b4f8
+READ of size 4 at 0x5080000000e8 thread T0
+SCARINESS: 45 (4-byte-read-heap-use-after-free)
+#0 0x558eab636bbf in zip_source_free /src/libzip/lib/zip_source_free.c:45:14
+#1 0x558eab614f39 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c
+#2 0x558eab4c9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x558eab4c8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x558eab4cae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#5 0x558eab4cb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#6 0x558eab4ba24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x558eab4e5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f3163b77082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#9 0x558eab4acacd in _start (out/libfuzzer-address-x86_64/zip_write_encrypt_pkware_file_fuzzer+0x54acd)
+
+DEDUP_TOKEN: zip_source_free--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+0x5080000000e8 is located 72 bytes inside of 88-byte region [0x5080000000a0,0x5080000000f8)
+freed by thread T0 here:
+#0 0x558eab5d51a6 in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:52:3
+#1 0x558eab6210bb in zip_discard /src/libzip/lib/zip_discard.c:53:9
+#2 0x558eab6166d9 in zip_close /src/libzip/lib/zip_close.c
+#3 0x558eab614f20 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:135:5
+#4 0x558eab4c9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x558eab4c8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x558eab4cae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#7 0x558eab4cb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#8 0x558eab4ba24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x558eab4e5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f3163b77082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_free--zip_discard--zip_close
+previously allocated by thread T0 here:
+#0 0x558eab5d543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x558eab636ce7 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x558eab636ce7 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x558eab630b45 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x558eab630930 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x558eab630930 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x558eab614c99 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:65:11
+#7 0x558eab4c9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x558eab4c8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x558eab4cae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x558eab4cb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x558eab4ba24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x558eab4e5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f3163b77082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The root cause of the crash is a heap corruption bug within the `libzip` library, which is triggered before the use-after-free occurs. The use-after-free is a secondary symptom.
+
+1.  The fuzzer initializes a valid `zip_t` archive handle (`za`). GDB inspection confirms `za` is a valid pointer before entering the loop at `zip_write_encrypt_pkware_file_fuzzer.c:93`.
+2.  The fuzzer then enters a loop to call `zip_file_extra_field_set` multiple times with fuzzer-derived data.
+3.  When a breakpoint is set at the first `zip_close` call (line 107), GDB shows that the `za` pointer has been corrupted to an invalid, unaligned address (`0x7f2b8a000066`).
+4.  This corruption happens within the preceding loop, indicating a bug in `zip_file_extra_field_set`. This function is likely writing out of bounds when processing certain combinations of extra field ID, length, and data, thereby overwriting the `za` pointer on the stack or corrupting the heap structure it points to.
+5.  The subsequent call to `zip_close(za)` uses this corrupted pointer, leading to undefined behavior which manifests as a use-after-free later in the execution when the fuzzer tries to clean up resources.
+
+The bug is not in the fuzzer; the fuzzer is successfully discovering a memory corruption vulnerability in the project code.
+
+**Suggestion for Project Patch:**
+
+The `zip_file_extra_field_set` function and its internal callees need to be audited for memory safety. Specifically, developers should add robust bounds checking for all operations involving the `ef_id`, `ef_len`, and `ef_data` parameters to prevent any possibility of a buffer overflow or out-of-bounds write. The crash input from the fuzzer should be used as a regression test case to validate the fix.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

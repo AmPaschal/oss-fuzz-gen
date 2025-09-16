@@ -1,0 +1,1664 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project jq.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/jq/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+#include "/src/jq/src/jv.h"
+#include "/src/jq/src/jv_alloc.h"
+
+// Forward declaration for the function under test
+void jv_show(jv, int);
+
+#define MAX_RECURSION_DEPTH 5
+
+// Helper function to consume data safely from the buffer
+static bool consume_data(const uint8_t **data, size_t *size, void *out, size_t len) {
+if (*size < len) {
+return false;
+}
+memcpy(out, *data, len);
+*data += len;
+*size -= len;
+return true;
+}
+
+// Recursive function to generate a jv object from raw data
+jv generate_jv(const uint8_t **data, size_t *size, int depth) {
+if (depth > MAX_RECURSION_DEPTH || *size == 0) {
+return jv_null();
+}
+
+uint8_t type_selector;
+if (!consume_data(data, size, &type_selector, sizeof(type_selector))) {
+return jv_null();
+}
+
+// Use modulo 9 to cover all jv kinds plus our new special case
+switch (type_selector % 9) {
+case 0: { // JV_KIND_STRING
+uint8_t str_len;
+if (!consume_data(data, size, &str_len, sizeof(str_len)) || str_len == 0) {
+return jv_string("");
+}
+size_t len = str_len % (*size + 1);
+char* str = (char*)malloc(len + 1);
+if (str == NULL) return jv_null();
+if (consume_data(data, size, str, len)) {
+str[len] = '\0';
+jv x = jv_string(str);
+free(str);
+return x;
+}
+free(str);
+return jv_string("");
+}
+case 1: { // JV_KIND_NUMBER
+double num;
+if (consume_data(data, size, &num, sizeof(num))) {
+return jv_number(num);
+}
+return jv_number(0.0);
+}
+case 2: { // JV_KIND_ARRAY
+jv x = jv_array();
+uint8_t num_elements;
+if (consume_data(data, size, &num_elements, sizeof(num_elements))) {
+for (int i = 0; i < (num_elements % 8); i++) {
+x = jv_array_append(x, generate_jv(data, size, depth + 1));
+}
+}
+return x;
+}
+case 3: { // JV_KIND_OBJECT
+jv x = jv_object();
+uint8_t num_elements;
+if (consume_data(data, size, &num_elements, sizeof(num_elements))) {
+for (int i = 0; i < (num_elements % 8); i++) {
+char key_str[16];
+snprintf(key_str, sizeof(key_str), "key%d", i);
+jv key = jv_string(key_str);
+jv value = generate_jv(data, size, depth + 1);
+// jv_object_set consumes both the key and the value.
+x = jv_object_set(x, key, value);
+}
+}
+return x;
+}
+case 4: { // JV_KIND_INVALID
+return jv_invalid();
+}
+case 5: { // JV_KIND_TRUE
+return jv_true();
+}
+case 6: { // JV_KIND_FALSE
+return jv_false();
+}
+case 7: { // JV_KIND_NULL
+return jv_null();
+}
+case 8: { // JV_KIND_INVALID with message
+jv msg = jv_string("fuzz-invalid-msg");
+// jv_invalid_with_msg consumes the msg.
+jv invalid_obj = jv_invalid_with_msg(msg);
+return invalid_obj;
+}
+default:
+return jv_null();
+}
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < sizeof(int) + 1) {
+return 0;
+}
+
+// Consume flags from the beginning of the data
+int flags;
+memcpy(&flags, data, sizeof(int));
+data += sizeof(int);
+size -= sizeof(int);
+
+// Generate a potentially complex jv object from the remaining data
+jv x = generate_jv(&data, &size, 0);
+
+// Call the function under test.
+// jv_show calls jv_dumpf with jv_copy(x), so it does not consume x.
+jv_show(x, flags);
+
+// Free the created jv object.
+jv_free(x);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: jq
+function signature: void jv_show(jv, int)
+</input>
+
+<description>
+The `jv_show` function is a debugging utility that prints a `jv` object to `stderr`. It takes a `jv` object and a set of flags as input. If the flags argument is -1, a default set of pretty-printing flags is used. The function then calls `jv_dumpf` to perform the actual printing, adding the `JV_PRINT_INVALID` flag to ensure that even invalid `jv` objects can be printed. This function is designed to be called from a debugger to inspect the contents of a `jv` object.
+</description>
+
+<requirements>
+<requirement>
+The first argument `x` should be a `jv` object of any `jv_kind`, such as `JV_KIND_STRING`, `JV_KIND_NUMBER`, `JV_KIND_ARRAY`, or `JV_KIND_OBJECT`. This is because the function is a generic pretty-printer for any `jv` type.
+</requirement>
+<requirement>
+The `jv` object `x` can be created using any of the `jv_*` constructor functions like `jv_string`, `jv_number`, `jv_array`, and `jv_object`. This is to ensure high code coverage of the printing logic for different `jv` types.
+</requirement>
+<requirement>
+The `jv` object `x` can be an invalid `jv` created by `jv_invalid()`. The function is designed to handle invalid `jv`s by passing the `JV_PRINT_INVALID` flag to the underlying print function.
+</requirement>
+<requirement>
+The second argument `flags` should be an integer representing a bitmask of `jv_print_flags`. Fuzzing this parameter with different integer values will test different printing options.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 198990 byte(s) in 6030 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#9 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 144969 byte(s) in 4393 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#10 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 135465 byte(s) in 4105 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 131109 byte(s) in 3973 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 100221 byte(s) in 3037 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 22935 byte(s) in 695 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#8 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 22902 byte(s) in 694 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 17193 byte(s) in 521 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#10 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 15873 byte(s) in 481 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 11319 byte(s) in 343 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 10494 byte(s) in 318 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 10263 byte(s) in 311 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 9636 byte(s) in 292 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 8547 byte(s) in 259 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 7755 byte(s) in 235 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 7293 byte(s) in 221 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 6897 byte(s) in 209 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#9 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 5874 byte(s) in 178 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 5610 byte(s) in 170 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 5379 byte(s) in 163 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4917 byte(s) in 149 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#10 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4554 byte(s) in 138 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4521 byte(s) in 137 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4521 byte(s) in 137 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4488 byte(s) in 136 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4389 byte(s) in 133 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 4389 byte(s) in 133 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 3399 byte(s) in 103 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 3333 byte(s) in 101 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 3102 byte(s) in 94 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 2838 byte(s) in 86 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 2772 byte(s) in 84 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 2706 byte(s) in 82 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 2508 byte(s) in 76 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#10 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 1716 byte(s) in 52 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 1518 byte(s) in 46 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 1353 byte(s) in 41 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 1221 byte(s) in 37 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 825 byte(s) in 25 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 825 byte(s) in 25 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 462 byte(s) in 14 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 429 byte(s) in 13 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 429 byte(s) in 13 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 396 byte(s) in 12 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 297 byte(s) in 9 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#11 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 264 byte(s) in 8 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 264 byte(s) in 8 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 198 byte(s) in 6 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 198 byte(s) in 6 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 165 byte(s) in 5 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 165 byte(s) in 5 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 99 byte(s) in 3 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 99 byte(s) in 3 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#12 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 66 byte(s) in 2 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 66 byte(s) in 2 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 33 byte(s) in 1 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+Direct leak of 33 byte(s) in 1 object(s) allocated from:
+#0 0x55e48b91d4bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55e48b96ba3f in jv_mem_alloc /src/jq/src/jv_alloc.c:142:13
+#2 0x55e48b960b7f in jvp_string_alloc /src/jq/src/jv.c:1106:19
+#3 0x55e48b960b7f in jvp_string_new /src/jq/src/jv.c:1138:19
+#4 0x55e48b960b7f in jv_string_sized /src/jq/src/jv.c:1281:5
+#5 0x55e48b960b7f in jv_string /src/jq/src/jv.c:1290:10
+#6 0x55e48b95cfcd in generate_jv /src/jq/tests/jq_fuzz_load_file.c:100:18
+#7 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#8 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#9 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#10 0x55e48b95d125 in generate_jv /src/jq/tests/jq_fuzz_load_file.c:80:28
+#11 0x55e48b95d05f in generate_jv /src/jq/tests/jq_fuzz_load_file.c:67:40
+#12 0x55e48b95d53c in LLVMFuzzerTestOneInput /src/jq/tests/jq_fuzz_load_file.c:122:12
+#13 0x55e48b8116f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55e48b810f15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55e48b8126f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55e48b813485 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55e48b8022cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55e48b82d6a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f00545df082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--jv_mem_alloc--jvp_string_alloc
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a memory leak caused by a bug in the project's `jv_invalid_with_msg` function.
+
+**Analysis:**
+
+1.  The fuzz driver's `generate_jv` function, in `case 8`, creates a `jv` string object `msg` using `jv_string("fuzz-invalid-msg")`.
+2.  This `msg` object is then passed to `jv_invalid_with_msg`.
+3.  The implementation of `jv_invalid_with_msg` in `jv.c` allocates a new `jvp_invalid` struct and stores the passed `err` (our `msg`) object inside it.
+4.  However, `jv_invalid_with_msg` does not take ownership of the passed `jv` object in a way that would lead to it being freed when the new invalid object is freed. Specifically, it doesn't call `jv_free` on the `err` object it receives if it's no longer needed, nor does it properly manage its reference count in a way that would prevent a leak in this usage pattern. The fuzz driver correctly assumes that a function "consuming" a value will handle its lifecycle.
+5.  The `msg` object created in the fuzz driver is never explicitly freed, and since `jv_invalid_with_msg` doesn't free it either, the memory allocated for the string "fuzz-invalid-msg" is leaked in every iteration that hits `case 8`.
+
+**Suggestion:**
+
+The bug is in the `jq` library. The `jv_invalid_with_msg` function should properly handle the lifecycle of the `jv` object passed to it. A potential fix would be for `jv_invalid_with_msg` to call `jv_free` on its `err` parameter after it has been used, or for the library's reference counting system to be adjusted to handle this case correctly.
+
+A workaround in the fuzz driver would be to manually free the `msg` object after calling `jv_invalid_with_msg`, but this contradicts the documented behavior ("consumes the msg") and would be an incorrect usage of the API if the project bug were fixed. The correct fix is within the `jq` project itself.
+
+```c
+// In jq_fuzz_load_file.c, case 8:
+jv msg = jv_string("fuzz-invalid-msg");
+// jv_invalid_with_msg consumes the msg.
+jv invalid_obj = jv_invalid_with_msg(msg);
+// jv_free(msg); // This would be a workaround, but the real bug is in the project.
+return invalid_obj;
+```
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/jq/tests/jq_fuzz_load_file.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/jq/tests/jq_fuzz_load_file.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

@@ -1,0 +1,2253 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project lcms.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/lcms/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "lcms2.h"
+#include "/src/lcms/include/lcms2_plugin.h"
+
+// Forward declaration as it's an internal function
+cmsPipeline * _cmsDefaultICCintents(cmsContext, cmsUInt32Number, cmsUInt32Number *, cmsHPROFILE *, cmsBool *, cmsFloat64Number *, cmsUInt32Number);
+
+#define MAX_PROFILES 8
+#define NUM_PROFILE_TYPES 6 // Removed NamedColor profile type
+
+// A factory to create a CMYK profile (as a devicelink), which is required for black preservation paths.
+cmsHPROFILE CreateCmykDevicelink(cmsContext ctx) {
+cmsToneCurve* gamma_curve = cmsBuildGamma(ctx, 2.2);
+if (gamma_curve == NULL) return NULL;
+cmsToneCurve* curves[4] = { gamma_curve, gamma_curve, gamma_curve, gamma_curve };
+cmsHPROFILE hProfile = cmsCreateLinearizationDeviceLinkTHR(ctx, cmsSigCmykData, curves);
+cmsFreeToneCurve(gamma_curve);
+return hProfile;
+}
+
+// A factory to create different kinds of profiles based on fuzzer input.
+cmsHPROFILE CreateDiverseProfile(cmsContext ctx, uint8_t type) {
+cmsToneCurve* gamma_curve = cmsBuildGamma(ctx, 2.2);
+// cmsCreateGrayProfileTHR does not need a gamma curve if whitepoint is NULL
+// but we use it for other profile types, so we still create it.
+
+cmsHPROFILE hProfile = NULL;
+
+switch (type % NUM_PROFILE_TYPES) {
+case 0: hProfile = cmsCreate_sRGBProfileTHR(ctx); break;
+case 1: hProfile = cmsCreateGrayProfileTHR(ctx, NULL, gamma_curve); break;
+case 2: hProfile = cmsCreateBCHSWabstractProfileTHR(ctx, 16, 0.0, 1.0, 0.0, 1.0, 5000, 6000); break;
+case 3: hProfile = CreateCmykDevicelink(ctx); break;
+case 4: hProfile = cmsCreateNULLProfileTHR(ctx); break;
+case 5:
+default: hProfile = cmsCreateProfilePlaceholder(ctx); break;
+}
+
+if (gamma_curve) cmsFreeToneCurve(gamma_curve);
+return hProfile;
+}
+
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 4) {
+return 0;
+}
+
+uint8_t scenario = data[0] % 6; // Now 6 scenarios
+uint8_t fuzzer_flags = data[1];
+cmsUInt32Number nProfiles = (data[2] % (MAX_PROFILES - 1)) + 1; // nProfiles can be 1
+data += 3;
+size -= 3;
+
+size_t required_size = nProfiles + // profile types
+nProfiles * (sizeof(cmsUInt32Number) + sizeof(cmsBool) + sizeof(cmsFloat64Number));
+if (size < required_size) {
+return 0;
+}
+
+cmsContext ctx = cmsCreateContext(NULL, NULL);
+if (ctx == NULL) return 0;
+
+cmsHPROFILE hProfiles[MAX_PROFILES] = {0};
+cmsUInt32Number TheIntents[MAX_PROFILES];
+cmsBool BPC[MAX_PROFILES];
+cmsFloat64Number AdaptationStates[MAX_PROFILES];
+
+const uint8_t* profile_types = data;
+data += nProfiles;
+
+// More controlled dwFlags
+cmsUInt32Number dwFlags = 0;
+if (fuzzer_flags & 0x01) dwFlags |= cmsFLAGS_NONEGATIVES;
+if (fuzzer_flags & 0x02) dwFlags |= cmsFLAGS_NOOPTIMIZE;
+if (fuzzer_flags & 0x04) dwFlags |= cmsFLAGS_NULLTRANSFORM;
+if (fuzzer_flags & 0x08) dwFlags |= cmsFLAGS_SOFTPROOFING;
+
+for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+hProfiles[i] = CreateDiverseProfile(ctx, profile_types[i]);
+memcpy(&TheIntents[i], data, sizeof(cmsUInt32Number)); data += sizeof(cmsUInt32Number);
+TheIntents[i] %= 16;
+memcpy(&BPC[i], data, sizeof(cmsBool)); data += sizeof(cmsBool);
+memcpy(&AdaptationStates[i], data, sizeof(cmsFloat64Number)); data += sizeof(cmsFloat64Number);
+}
+
+// --- Scenario-based profile adjustments ---
+switch (scenario) {
+case 1: // K-Only preservation
+if (nProfiles < 2) nProfiles = 2;
+TheIntents[0] = INTENT_PRESERVE_K_ONLY_PERCEPTUAL;
+if (hProfiles[0]) cmsCloseProfile(hProfiles[0]);
+hProfiles[0] = CreateCmykDevicelink(ctx);
+if (hProfiles[nProfiles - 1]) cmsCloseProfile(hProfiles[nProfiles - 1]);
+hProfiles[nProfiles-1] = CreateCmykDevicelink(ctx);
+break;
+case 2: // K-Plane preservation
+if (nProfiles < 2) nProfiles = 2;
+TheIntents[0] = INTENT_PRESERVE_K_PLANE_PERCEPTUAL;
+if (hProfiles[0]) cmsCloseProfile(hProfiles[0]);
+hProfiles[0] = CreateCmykDevicelink(ctx);
+if (hProfiles[nProfiles - 1]) cmsCloseProfile(hProfiles[nProfiles - 1]);
+hProfiles[nProfiles - 1] = CreateCmykDevicelink(ctx);
+break;
+case 3: // Incompatible color space (Gray -> sRGB)
+if (nProfiles < 2) nProfiles = 2;
+if (hProfiles[0]) cmsCloseProfile(hProfiles[0]);
+hProfiles[0] = cmsCreateGrayProfileTHR(ctx, NULL, cmsBuildGamma(ctx, 2.2));
+if (hProfiles[1]) cmsCloseProfile(hProfiles[1]);
+hProfiles[1] = cmsCreate_sRGBProfileTHR(ctx);
+break;
+case 4: // Abstract profile as non-initial profile
+if (nProfiles < 2) nProfiles = 2;
+if (hProfiles[0]) cmsCloseProfile(hProfiles[0]);
+hProfiles[0] = cmsCreate_sRGBProfileTHR(ctx);
+if (hProfiles[1]) cmsCloseProfile(hProfiles[1]);
+hProfiles[1] = cmsCreateBCHSWabstractProfileTHR(ctx, 16, 0.0, 1.0, 0.0, 1.0, 5000, 6000);
+break;
+case 5: // nProfiles = 1 with a DeviceLink profile
+nProfiles = 1;
+if (hProfiles[0]) cmsCloseProfile(hProfiles[0]);
+hProfiles[0] = CreateCmykDevicelink(ctx);
+break;
+case 0:
+default: // Default randomized scenario
+break;
+}
+
+// Ensure all profiles were created successfully before calling the function
+for(cmsUInt32Number i = 0; i < nProfiles; i++) {
+if (hProfiles[i] == NULL) {
+for (cmsUInt32Number j = 0; j < nProfiles; j++) if (hProfiles[j]) cmsCloseProfile(hProfiles[j]);
+cmsDeleteContext(ctx);
+return 0;
+}
+}
+
+cmsPipeline *pipeline = _cmsDefaultICCintents(ctx, nProfiles, TheIntents, hProfiles, BPC, AdaptationStates, dwFlags);
+
+if (pipeline != NULL) cmsPipelineFree(pipeline);
+for (cmsUInt32Number i = 0; i < nProfiles; i++) if (hProfiles[i]) cmsCloseProfile(hProfiles[i]);
+cmsDeleteContext(ctx);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: lcms
+function signature: cmsPipeline*  CMSEXPORT _cmsDefaultICCintents(cmsContext     ContextID,
+cmsUInt32Number nProfiles,
+cmsUInt32Number TheIntents[],
+cmsHPROFILE     hProfiles[],
+cmsBool         BPC[],
+cmsFloat64Number AdaptationStates[],
+cmsUInt32Number dwFlags)
+</input>
+
+<description>
+The function `_cmsDefaultICCintents` creates a pipeline of transformations based on a series of ICC profiles. It iterates through the profiles, determines the appropriate color space conversions, and builds a lookup table (LUT) to represent the combined transformations. The function handles device link, abstract, and named color profiles, and it can also apply black point compensation and adaptation states. The caller in the test suite, `MyNewIntent`, which is a custom intent, shows that `TheIntents` can be modified before calling `_cmsDefaultICCintents`, indicating that this parameter can be used to control the behavior of the function.
+</description>
+
+<requirements>
+
+<requirement>
+The `nProfiles` argument must be greater than 0. This is to prevent a NULL pointer being returned, and subsequent crashes when the caller tries to use the returned pipeline.
+</requirement>
+<requirement>
+The `hProfiles` array must contain valid `cmsHPROFILE` handles. These handles are created by functions like `cmsCreateProfilePlaceholder`, `cmsOpenProfileFromFile` or `cmsCreateLinearizationDeviceLinkTHR`.
+</requirement>
+<requirement>
+The `TheIntents`, `BPC`, and `AdaptationStates` arrays must be allocated with at least `nProfiles` elements. This is because the function iterates from 0 to `nProfiles`-1 and accesses these arrays at each iteration.
+</requirement>
+<requirement>
+The values in `TheIntents` can be user-controlled. The caller `MyNewIntent` shows that the values in this array can be modified before calling `_cmsDefaultICCintents`.
+</requirement>
+<requirement>
+The `dwFlags` argument can be used to control the behavior of the function. For example, the `cmsFLAGS_NONEGATIVES` flag will clip negative values in the output.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 16754560 byte(s) in 4456 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fd6fd0 in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:528:45
+#4 0x55d1c9fb0b98 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:38:29
+#5 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#6 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Direct leak of 14897120 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fd6fd0 in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:528:45
+#4 0x55d1ca01e8c5 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:296:12
+#5 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#6 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Direct leak of 11953040 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fd6fd0 in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:528:45
+#4 0x55d1ca020dea in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:967:16
+#5 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Direct leak of 11874080 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fd6fd0 in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:528:45
+#4 0x55d1ca01e6cc in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:234:12
+#5 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Direct leak of 1947680 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fd6fd0 in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:528:45
+#4 0x55d1ca020719 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:891:12
+#5 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Direct leak of 1571680 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fd6fd0 in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:528:45
+#4 0x55d1ca01de63 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:113:12
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Direct leak of 1255744 byte(s) in 22424 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3a2 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:232:25
+#4 0x55d1c9fbc1d6 in cmsBuildSegmentedToneCurve /src/lcms/src/cmsgamma.c:813:9
+#5 0x55d1c9fbc1d6 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:903:12
+#6 0x55d1c9fbc514 in cmsBuildGamma /src/lcms/src/cmsgamma.c:911:12
+#7 0x55d1c9fb1460 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:110:63
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 183697408 byte(s) in 22424 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba4c5 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:256:42
+#4 0x55d1c9fbc1d6 in cmsBuildSegmentedToneCurve /src/lcms/src/cmsgamma.c:813:9
+#5 0x55d1c9fbc1d6 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:903:12
+#6 0x55d1c9fbc514 in cmsBuildGamma /src/lcms/src/cmsgamma.c:911:12
+#7 0x55d1c9fb1460 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:110:63
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 129794048 byte(s) in 15844 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba4c5 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:256:42
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#9 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#10 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#11 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#12 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 25870336 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba4c5 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:256:42
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e7a9 in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:267:14
+#6 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 12730368 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fe7392 in CLUTElemDup /src/lcms/src/cmslut.c:504:50
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020865 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:928:5
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 4843584 byte(s) in 22424 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fc5b76 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55d1c9fc6184 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55d1c9fbacbf in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:298:24
+#6 0x55d1c9fbc1d6 in cmsBuildSegmentedToneCurve /src/lcms/src/cmsgamma.c:813:9
+#7 0x55d1c9fbc1d6 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:903:12
+#8 0x55d1c9fbc514 in cmsBuildGamma /src/lcms/src/cmsgamma.c:911:12
+#9 0x55d1c9fb1460 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:110:63
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 3424256 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba4c5 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:256:42
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e157 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:183:14
+#6 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#7 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 3422304 byte(s) in 15844 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fc5b76 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55d1c9fc6184 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55d1c9fbacbf in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:298:24
+#6 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#7 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#8 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#9 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#10 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#11 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#12 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#13 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#14 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#15 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#16 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#17 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#18 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#19 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#20 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 2746656 byte(s) in 12716 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fc5b76 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55d1c9fc6184 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55d1c9fbacbf in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:298:24
+#6 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#7 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#8 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#9 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#10 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#11 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#12 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#13 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 2511488 byte(s) in 22424 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3dd in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:241:43
+#4 0x55d1c9fbc1d6 in cmsBuildSegmentedToneCurve /src/lcms/src/cmsgamma.c:813:9
+#5 0x55d1c9fbc1d6 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:903:12
+#6 0x55d1c9fbc514 in cmsBuildGamma /src/lcms/src/cmsgamma.c:911:12
+#7 0x55d1c9fb1460 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:110:63
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 1774528 byte(s) in 15844 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3dd in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:241:43
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#9 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#10 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#11 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#12 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 887264 byte(s) in 15844 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3a2 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:232:25
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#9 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#10 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#11 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#12 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 712096 byte(s) in 12716 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3a2 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:232:25
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#9 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 682128 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fc5b76 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55d1c9fc6184 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55d1c9fbacbf in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:298:24
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca01e7a9 in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:267:14
+#8 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 610368 byte(s) in 9537 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9feb6b8 in _cmsStageAllocPlaceholder /src/lcms/src/cmslut.c:40:32
+#4 0x55d1c9feb6b8 in cmsStageDup /src/lcms/src/cmslut.c:1255:14
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 380352 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#4 0x55d1ca01e970 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:321:10
+#5 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#6 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 353696 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3dd in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:241:43
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e7a9 in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:267:14
+#6 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 348656 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#4 0x55d1ca01e970 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:321:10
+#5 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#6 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 305184 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#4 0x55d1ca020e19 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:973:10
+#5 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 303168 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#4 0x55d1ca01e72b in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:256:10
+#5 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 285264 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9febacd in cmsPipelineAlloc /src/lcms/src/cmslut.c:1385:32
+#4 0x55d1c9fecb37 in cmsPipelineDup /src/lcms/src/cmslut.c:1472:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#7 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#8 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 267036 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#4 0x55d1ca020e19 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:973:10
+#5 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 253568 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9feb6b8 in _cmsStageAllocPlaceholder /src/lcms/src/cmslut.c:40:32
+#4 0x55d1c9feb6b8 in cmsStageDup /src/lcms/src/cmslut.c:1255:14
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 253568 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca01cdcf in cmsDupProfileSequenceDescription /src/lcms/src/cmsnamed.c:1049:41
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1c9fe373b in _cmsWriteProfileSequence /src/lcms/src/cmsio1.c:924:18
+#6 0x55d1ca01eb25 in SetSeqDescTag /src/lcms/src/cmsvirt.c:86:10
+#7 0x55d1ca01e9b1 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:323:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 253568 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca01cdcf in cmsDupProfileSequenceDescription /src/lcms/src/cmsnamed.c:1049:41
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1c9fe36f7 in _cmsWriteProfileSequence /src/lcms/src/cmsio1.c:920:10
+#6 0x55d1ca01eb25 in SetSeqDescTag /src/lcms/src/cmsvirt.c:86:10
+#7 0x55d1ca01e9b1 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:323:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 228888 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9febacd in cmsPipelineAlloc /src/lcms/src/cmslut.c:1385:32
+#4 0x55d1c9fecb37 in cmsPipelineDup /src/lcms/src/cmslut.c:1472:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#7 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 179392 byte(s) in 22424 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba669 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:275:45
+#4 0x55d1c9fbc1d6 in cmsBuildSegmentedToneCurve /src/lcms/src/cmsgamma.c:813:9
+#5 0x55d1c9fbc1d6 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:903:12
+#6 0x55d1c9fbc514 in cmsBuildGamma /src/lcms/src/cmsgamma.c:911:12
+#7 0x55d1c9fb1460 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:110:63
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 179392 byte(s) in 22424 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba411 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:244:55
+#4 0x55d1c9fbc1d6 in cmsBuildSegmentedToneCurve /src/lcms/src/cmsgamma.c:813:9
+#5 0x55d1c9fbc1d6 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:903:12
+#6 0x55d1c9fbc514 in cmsBuildGamma /src/lcms/src/cmsgamma.c:911:12
+#7 0x55d1c9fb1460 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:110:63
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 178240 byte(s) in 4456 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb9323 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb9323 in defMtxCreate /src/lcms/src/cmserr.c:549:41
+#3 0x55d1c9fd70ec in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:561:22
+#4 0x55d1c9fb0b98 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:38:29
+#5 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#6 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--defMtxCreate
+Indirect leak of 176848 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3a2 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:232:25
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e7a9 in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:267:14
+#6 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 164216 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#4 0x55d1ca01e72b in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:256:10
+#5 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 158480 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca01e970 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:321:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 158480 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca01e970 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:321:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 158480 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb9323 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb9323 in defMtxCreate /src/lcms/src/cmserr.c:549:41
+#3 0x55d1c9fd70ec in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:561:22
+#4 0x55d1ca01e8c5 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:296:12
+#5 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#6 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--defMtxCreate
+Indirect leak of 127160 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca020e19 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:973:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 127160 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb9323 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb9323 in defMtxCreate /src/lcms/src/cmserr.c:549:41
+#3 0x55d1c9fd70ec in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:561:22
+#4 0x55d1ca020dea in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:967:16
+#5 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--defMtxCreate
+Indirect leak of 127160 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca020e19 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:973:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 126752 byte(s) in 3961 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fe51eb in CurveSetDup /src/lcms/src/cmslut.c:219:44
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 126752 byte(s) in 15844 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba411 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:244:55
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#9 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#10 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#11 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#12 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 126752 byte(s) in 15844 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba669 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:275:45
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#9 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#10 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#11 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#12 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#13 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#14 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#15 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#16 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#17 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#18 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 126320 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb9323 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb9323 in defMtxCreate /src/lcms/src/cmserr.c:549:41
+#3 0x55d1c9fd70ec in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:561:22
+#4 0x55d1ca01e6cc in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:234:12
+#5 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--defMtxCreate
+Indirect leak of 126320 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca01e72b in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:256:10
+#8 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 126320 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca01e72b in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:256:10
+#8 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 111888 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fc5b76 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55d1c9fe7324 in CLUTElemDup /src/lcms/src/cmslut.c:510:26
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca020865 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:928:5
+#9 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 101728 byte(s) in 6358 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fe5188 in CurveSetDup /src/lcms/src/cmslut.c:215:42
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 101728 byte(s) in 6358 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fe51eb in CurveSetDup /src/lcms/src/cmslut.c:219:44
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 95088 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca01cd89 in cmsDupProfileSequenceDescription /src/lcms/src/cmsnamed.c:1045:24
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1c9fe373b in _cmsWriteProfileSequence /src/lcms/src/cmsio1.c:924:18
+#4 0x55d1ca01eb25 in SetSeqDescTag /src/lcms/src/cmsvirt.c:86:10
+#5 0x55d1ca01e9b1 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:323:10
+#6 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#7 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsDupProfileSequenceDescription--cmsWriteTag
+Indirect leak of 95088 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca01cd89 in cmsDupProfileSequenceDescription /src/lcms/src/cmsnamed.c:1045:24
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1c9fe36f7 in _cmsWriteProfileSequence /src/lcms/src/cmsio1.c:920:10
+#4 0x55d1ca01eb25 in SetSeqDescTag /src/lcms/src/cmsvirt.c:86:10
+#5 0x55d1ca01e9b1 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:323:10
+#6 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#7 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsDupProfileSequenceDescription--cmsWriteTag
+Indirect leak of 90288 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fc5b76 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55d1c9fc6184 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55d1c9fbacbf in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:298:24
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca01e157 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:183:14
+#8 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#9 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 76296 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca020f93 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:999:10
+#5 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 76296 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fe61ba in MatrixElemDup /src/lcms/src/cmslut.c:352:44
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 63392 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fe5188 in CurveSetDup /src/lcms/src/cmslut.c:215:42
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca01e991 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:322:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 50864 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fe6138 in MatrixElemDup /src/lcms/src/cmslut.c:347:38
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 50864 byte(s) in 12716 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba4c5 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:256:42
+#4 0x55d1c9fe52a7 in CurveSetDup /src/lcms/src/cmslut.c:226:34
+#5 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#6 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#7 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#8 0x55d1ca020f69 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:998:10
+#9 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 49728 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#4 0x55d1ca020822 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:924:10
+#5 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 47544 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca01e970 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:321:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 47544 byte(s) in 3962 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca01e970 in cmsCreateLinearizationDeviceLinkTHR /src/lcms/src/cmsvirt.c:321:10
+#8 0x55d1c9fb0b48 in CreateCmykDevicelink /src/cms_gdb_fuzzer.c:18:28
+#9 0x55d1c9fb0b48 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:35:28
+#10 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#11 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 46816 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3dd in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:241:43
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e157 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:183:14
+#6 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#7 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 40128 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#4 0x55d1ca01fc9c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:668:13
+#5 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 38148 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca020e19 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:973:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 38148 byte(s) in 3179 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca020e19 in cmsCreateNULLProfileTHR /src/lcms/src/cmsvirt.c:973:10
+#8 0x55d1c9fb0ac3 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:36:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 37896 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca01e72b in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:256:10
+#8 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 37896 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca01e72b in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:256:10
+#8 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 37296 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9febacd in cmsPipelineAlloc /src/lcms/src/cmslut.c:1385:32
+#4 0x55d1c9fecb37 in cmsPipelineDup /src/lcms/src/cmslut.c:1472:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca020865 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:928:5
+#7 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 33152 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9feb6b8 in _cmsStageAllocPlaceholder /src/lcms/src/cmslut.c:40:32
+#4 0x55d1c9feb6b8 in cmsStageDup /src/lcms/src/cmslut.c:1255:14
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020865 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:928:5
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 30096 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca01df50 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:151:14
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 30096 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca01e20c in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:205:14
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 26936 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#4 0x55d1ca020822 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:924:10
+#5 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 25264 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba669 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:275:45
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e7a9 in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:267:14
+#6 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 25264 byte(s) in 3158 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba411 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:244:55
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e7a9 in cmsCreateGrayProfileTHR /src/lcms/src/cmsvirt.c:267:14
+#6 0x55d1c9fb0b77 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:33:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 23408 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba3a2 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:232:25
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e157 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:183:14
+#6 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#7 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 21736 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1ca018126 in cmsMLUdup /src/lcms/src/cmsnamed.c:456:28
+#2 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#3 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#4 0x55d1ca01fc9c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:668:13
+#5 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--cmsMLUdup--cmsWriteTag
+Indirect leak of 20720 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca020822 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:924:10
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 20720 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb9323 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb9323 in defMtxCreate /src/lcms/src/cmserr.c:549:41
+#3 0x55d1c9fd70ec in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:561:22
+#4 0x55d1ca020719 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:891:12
+#5 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--defMtxCreate
+Indirect leak of 20720 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca020822 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:924:10
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 16720 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca01fc9c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:668:13
+#8 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 16720 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb9323 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb9323 in defMtxCreate /src/lcms/src/cmserr.c:549:41
+#3 0x55d1c9fd70ec in cmsCreateProfilePlaceholder /src/lcms/src/cmsio0.c:561:22
+#4 0x55d1ca01de63 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:113:12
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--defMtxCreate
+Indirect leak of 16720 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f38 in cmsMLUalloc /src/lcms/src/cmsnamed.c:41:21
+#4 0x55d1ca017f38 in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca01fc9c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:668:13
+#8 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 12432 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca020852 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:926:5
+#5 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#6 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#7 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 12432 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fe712b in CLUTElemDup /src/lcms/src/cmslut.c:491:36
+#4 0x55d1c9feb847 in cmsStageDup /src/lcms/src/cmslut.c:1269:25
+#5 0x55d1c9fecb87 in cmsPipelineDup /src/lcms/src/cmslut.c:1479:23
+#6 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#7 0x55d1ca020865 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:928:5
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 10032 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca01defa in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:145:14
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 10032 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca01e094 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:174:14
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 10032 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca01e0e8 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:176:14
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 10032 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb790b in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb790b in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#4 0x55d1ca01e0be in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:175:14
+#5 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#6 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#7 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#8 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 6216 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca020822 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:924:10
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 6216 byte(s) in 518 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca020822 in cmsCreateBCHSWabstractProfileTHR /src/lcms/src/cmsvirt.c:924:10
+#8 0x55d1c9fb0af6 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:34:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 5016 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e4ed in SetTextTags /src/lcms/src/cmsvirt.c:47:10
+#7 0x55d1ca01fc9c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:668:13
+#8 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 5016 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1ca017f6b in cmsMLUalloc /src/lcms/src/cmsnamed.c:47:37
+#4 0x55d1ca017f6b in cmsMLUdup /src/lcms/src/cmsnamed.c:437:14
+#5 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#6 0x55d1ca01e515 in SetTextTags /src/lcms/src/cmsvirt.c:48:10
+#7 0x55d1ca01fc9c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:668:13
+#8 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#9 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#10 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 3344 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba411 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:244:55
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e157 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:183:14
+#6 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#7 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 3344 byte(s) in 418 object(s) allocated from:
+#0 0x55d1c9f7116f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d1c9fb7695 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55d1c9fb7695 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55d1c9fba669 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:275:45
+#4 0x55d1c9fdee4f in cmsWriteTag /src/lcms/src/cmsio0.c:1883:35
+#5 0x55d1ca01e157 in cmsCreateRGBProfileTHR /src/lcms/src/cmsvirt.c:183:14
+#6 0x55d1ca01fc7c in cmsCreate_sRGBProfileTHR /src/lcms/src/cmsvirt.c:664:16
+#7 0x55d1c9fb0ab0 in CreateDiverseProfile /src/cms_gdb_fuzzer.c:32:28
+#8 0x55d1c9fb104a in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:82:24
+#9 0x55d1c9e653a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x55d1c9e64bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x55d1c9e663a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x55d1c9e67135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x55d1c9e55f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x55d1c9e81352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f013296e082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+
+</crash-stacktrace>
+
+<crash-analysis>
+
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/cms_gdb_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/cms_gdb_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

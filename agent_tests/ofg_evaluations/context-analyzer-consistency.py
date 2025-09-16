@@ -28,7 +28,7 @@ def run_command(yaml_path, func, prompt_file, model, repeat, output_dir):
             "-l", model,
         ]
         with open(out_file, "w") as f:
-            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+            subprocess.run(cmd, stdout=f, stderr=f)
         results.append(str(out_file))
     return results
 
@@ -45,29 +45,37 @@ def process_case(idx, test, model, repeat, output_root):
     prompt_file = test["-pf"]
     prompt_file_name = Path(prompt_file).name
     case_out_dir = Path(output_root) / f"case_{idx}_{prompt_file_name}"
-    print(f"[Case {idx}] Running: {yaml_path}, {func}, {prompt_file}")
+    output_log_file = Path(output_root) / "summary.log"
 
+    with open(output_log_file, "a") as outf:
+        outf.write(f"[Case {idx}] Running: {yaml_path}, {func}, {prompt_file}\n")
+        
     log_files = run_command(yaml_path, func, prompt_file, model, repeat, case_out_dir)
 
     all_feasibles = []
     for lf in log_files:
         all_feasibles.extend(parse_feasibility(lf))
 
-    if not all_feasibles:
-        return idx, None, "⚠️ No feasibility results found"
-
-    consistent = len(set(all_feasibles)) == 1
-    if consistent:
-        return idx, all_feasibles, f"✅ Consistent: {all_feasibles[0]}"
+    if not all_feasibles or len(all_feasibles) <= 1:
+        text = f"[Case {idx}]: Some feasibility results missing.\n"
+        consistent = None
     else:
-        return idx, all_feasibles, "❌ Inconsistent results"
+        consistent = len(set(all_feasibles)) == 1
+        status = "consistent" if consistent else "inconsistent"
+        text = f"[Case {idx}]: Feasibility results: {all_feasibles} ({status})\n"
+
+    with open(output_log_file, "a") as outf:
+        outf.write(text)
+
+    return consistent
+        
 
 def main():
     parser = argparse.ArgumentParser(description="Batch runner for agent_tests.")
     parser.add_argument("input_json", help="Path to JSON file containing test cases")
     parser.add_argument("-r", "--repeat", type=int, default=3, help="Number of times to repeat each test")
     parser.add_argument("-o", "--output", help="Directory to store logs (default: timestamped)")
-    parser.add_argument("-l", "--model", default="gpt-5", help="Model name (default gpt-5)")
+    parser.add_argument("-l", "--model", required=True, help="Model name (default gpt-5)")
     parser.add_argument("-j", "--jobs", type=int, default=2, help="Number of parallel jobs")
     args = parser.parse_args()
 
@@ -76,7 +84,7 @@ def main():
         output_root = Path(args.output)
     else:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_root = Path(f"results_catest_{timestamp}")
+        output_root = Path(f"results-ca-consistency-{timestamp}")
 
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -91,12 +99,6 @@ def main():
             )
 
         for future in as_completed(futures):
-            idx, all_feasibles, status = future.result()
-            if all_feasibles is None:
-                print(f"[Case {idx}] {status}")
-            else:
-                print(f"[Case {idx}] feasibility results: {all_feasibles}")
-                print(f"[Case {idx}] {status}")
+            future.result()
 
-if __name__ == "__main__":
-    main()
+        print(f"All test cases completed.")

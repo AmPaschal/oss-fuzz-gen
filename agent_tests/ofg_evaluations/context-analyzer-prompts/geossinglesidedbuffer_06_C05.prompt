@@ -1,0 +1,1317 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project geos.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/geos/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#include "geos_c.h"
+
+// Use the re-entrant API for better context management.
+static GEOSContextHandle_t g_geos_context = NULL;
+FILE *flogOut;
+
+void notice(const char *fmt, ...) {
+va_list ap;
+fprintf(flogOut, "NOTICE: ");
+va_start(ap, fmt);
+vfprintf(flogOut, fmt, ap);
+va_end(ap);
+fprintf(flogOut, "\n");
+}
+
+void log_and_exit(const char *fmt, ...) {
+va_list ap;
+fprintf(flogOut, "ERROR: ");
+va_start(ap, fmt);
+vfprintf(flogOut, fmt, ap);
+va_end(ap);
+fprintf(flogOut, "\n");
+}
+
+static void geos_cleanup(void)
+{
+if (g_geos_context) {
+finishGEOS_r(g_geos_context);
+g_geos_context = NULL;
+}
+}
+
+typedef struct {
+double width;
+int quadsegs;
+int joinStyle;
+double mitreLimit;
+int leftSide;
+} FuzzParams;
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+if (g_geos_context == NULL) {
+flogOut = fopen("/dev/null", "wb");
+g_geos_context = initGEOS_r(notice, log_and_exit);
+atexit(geos_cleanup);
+}
+
+if (Size <= sizeof(FuzzParams)) {
+return 0;
+}
+
+const FuzzParams* params = (const FuzzParams*)Data;
+const uint8_t* geom_data = Data + sizeof(FuzzParams);
+size_t geom_size = Size - sizeof(FuzzParams);
+
+GEOSGeometry *g1 = GEOSGeomFromWKB_buf_r(g_geos_context, geom_data, geom_size);
+
+if (g1 != NULL) {
+// Check for validity to avoid triggering exceptions in the library
+// which are known to cause memory leaks.
+if (GEOSisValid_r(g_geos_context, g1) != 1) {
+GEOSGeom_destroy_r(g_geos_context, g1);
+return 0;
+}
+
+// GEOSSingleSidedBuffer is only intended for linear geometries.
+// Passing other types can cause memory leaks.
+int type = GEOSGeomTypeId_r(g_geos_context, g1);
+if (type != GEOS_LINESTRING && type != GEOS_LINEARRING && type != GEOS_MULTILINESTRING) {
+GEOSGeom_destroy_r(g_geos_context, g1);
+return 0;
+}
+
+// A simple (non-self-intersecting) and non-empty geometry is required
+// for the operation to not throw an exception and leak memory internally.
+// GEOSisSimple returns 1 for simple, 0 for not, 2 for error.
+// GEOSisEmpty returns 1 for empty, 0 for not, 2 for error.
+if (GEOSisSimple_r(g_geos_context, g1) != 1 || GEOSisEmpty_r(g_geos_context, g1) != 0) {
+GEOSGeom_destroy_r(g_geos_context, g1);
+return 0;
+}
+
+double width = params->width;
+// Non-finite values can cause exceptions.
+if (!isfinite(width)) {
+width = 1.0;
+}
+
+int quadsegs = params->quadsegs;
+int joinStyle = params->joinStyle;
+double mitreLimit = params->mitreLimit;
+int leftSide = params->leftSide;
+
+// Requirement: quadsegs must be a positive integer.
+if (quadsegs <= 0) {
+quadsegs = 1;
+}
+// Cap quadsegs to a reasonable value to avoid long run times.
+quadsegs = (abs(quadsegs) % 16) + 1;
+
+// Requirement: joinStyle must be one of the supported values.
+joinStyle = (abs(joinStyle) % 3) + 1; // 1, 2, or 3
+
+// Non-finite values can cause exceptions.
+if (!isfinite(mitreLimit)) {
+mitreLimit = 2.0;
+}
+
+// Requirement: mitreLimit should be non-negative for mitre joins.
+if (joinStyle == GEOSBUF_JOIN_MITRE && mitreLimit < 0) {
+mitreLimit = 0.0;
+}
+
+// Requirement: leftSide should be 0 or 1.
+leftSide = abs(leftSide) % 2;
+
+GEOSGeometry *result = GEOSSingleSidedBuffer_r(g_geos_context, g1, width, quadsegs, joinStyle, mitreLimit, leftSide);
+
+if (result != NULL) {
+GEOSGeom_destroy_r(g_geos_context, result);
+}
+GEOSGeom_destroy_r(g_geos_context, g1);
+}
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: geos
+function signature: Geometry * GEOSSingleSidedBuffer(const Geometry *, double, int, int, double, int)
+</input>
+
+<description>
+The `GEOSSingleSidedBuffer` function computes a buffer area along one side of a given geometry. The side for the buffer is determined by the `leftSide` parameter. The shape and characteristics of the buffer are controlled by the `width`, `quadsegs`, `joinStyle`, and `mitreLimit` parameters. This function is essentially a wrapper around `GEOSSingleSidedBuffer_r`, which in turn utilizes an `execute` function to manage the GEOS context and handle any exceptions that may arise. The `execute` function plays a crucial role in ensuring that the GEOS context is properly initialized before any geometric operations are performed. The callers of `GEOSSingleSidedBuffer`, as seen in the test suite, typically create the input geometry from WKT (Well-Known Text) strings and use predefined constants for specifying the join style.
+</description>
+
+<requirements>
+
+<requirement>
+The first argument, `g`, must be a pointer to a valid `GEOSGeometry` object. This is because the function's primary purpose is to operate on this geometry to compute the buffer, so a valid geometry is essential for its correct execution.
+</requirement>
+<requirement>
+The `joinStyle` parameter must be one of the following integer values: `GEOSBUF_JOIN_ROUND` (1), `GEOSBUF_JOIN_MITRE` (2), or `GEOSBUF_JOIN_BEVEL` (3). Providing any other value will result in undefined behavior because these are the only supported join styles.
+</requirement>
+<requirement>
+The `leftSide` parameter should be either 0 or 1. This parameter acts as a boolean flag to determine which side of the geometry the buffer should be created on, and any other value would be invalid.
+</requirement>
+<requirement>
+The `quadsegs` parameter must be a positive integer. This parameter defines the number of segments used to approximate a quarter circle in the buffer, so a non-positive value would be nonsensical and could lead to errors.
+</requirement>
+<requirement>
+When the `joinStyle` is `GEOSBUF_JOIN_MITRE`, the `mitreLimit` parameter should be a non-negative number. A negative mitre limit is not a valid input for mitre joins and can cause incorrect geometric constructions.
+</requirement>
+<requirement>
+The `initGEOS()` function must be called before any calls to `GEOSSingleSidedBuffer`. This is a necessary prerequisite to initialize the GEOS context handle that the function uses internally to manage state and handle errors.
+</requirement>
+<requirement>
+The `width` parameter can be a positive or negative double value. A positive width will create the buffer on the side specified by `leftSide`, while a negative width will create the buffer on the opposite side.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 319536 byte(s) in 1902 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ab06a4 in geos::operation::buffer::BufferBuilder::getNoder(geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:593:27
+#2 0x559082aab3f6 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:202:20
+#3 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#4 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#5 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#6 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#7 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--geos::operation::buffer::BufferBuilder::getNoder(geos::geom::PrecisionModel const*)--geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool)
+Direct leak of 35840 byte(s) in 320 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ab1579 in geos::operation::buffer::BufferBuilder::createSubgraphs(geos::geomgraph::PlanarGraph*, std::__1::vector<geos::operation::buffer::BufferSubgraph*, std::__1::allocator<geos::operation::buffer::BufferSubgraph*>>&) /src/geos/src/operation/buffer/BufferBuilder.cpp:732:40
+#2 0x559082aaebda in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:446:9
+#3 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#4 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#5 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#6 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#7 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#8 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--geos::operation::buffer::BufferBuilder::createSubgraphs(geos::geomgraph::PlanarGraph*, std::__1::vector<geos::operation::buffer::BufferSubgraph*, std::__1::allocator<geos::operation::buffer::BufferSubgraph*>>&)--geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double)
+Direct leak of 1848 byte(s) in 11 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ab06a4 in geos::operation::buffer::BufferBuilder::getNoder(geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:593:27
+#2 0x559082ab0d2a in geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:618:20
+#3 0x559082aaeaeb in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:426:9
+#4 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#5 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#6 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#7 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#8 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#9 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--geos::operation::buffer::BufferBuilder::getNoder(geos::geom::PrecisionModel const*)--geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*)
+Direct leak of 304 byte(s) in 2 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ab0fb9 in geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:659:22
+#2 0x559082aaeaeb in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:426:9
+#3 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#4 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#5 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#6 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#7 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#8 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*)--geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double)
+Indirect leak of 422592 byte(s) in 1077 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082d6be13 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082d6be13 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082d6be13 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082d6be13 in __allocate_at_least<std::__1::allocator<geos::index::chain::MonotoneChain> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082d6be13 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082d6be13 in geos::index::chain::MonotoneChain* std::__1::vector<geos::index::chain::MonotoneChain, std::__1::allocator<geos::index::chain::MonotoneChain>>::__emplace_back_slow_path<geos::geom::CoordinateSequence const&, unsigned long&, unsigned long&, void*&>(geos::geom::CoordinateSequence const&, unsigned long&, unsigned long&, void*&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082d6ac77 in emplace_back<const geos::geom::CoordinateSequence &, unsigned long &, unsigned long &, void *&> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082d6ac77 in finishChain /src/geos/src/index/chain/MonotoneChainBuilder.cpp:75:16
+#9 0x559082d6ac77 in finish /src/geos/src/index/chain/MonotoneChainBuilder.cpp:68:9
+#10 0x559082d6ac77 in geos::index::chain::MonotoneChainBuilder::getChains(geos::geom::CoordinateSequence const*, void*, std::__1::vector<geos::index::chain::MonotoneChain, std::__1::allocator<geos::index::chain::MonotoneChain>>&) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:112:13
+#11 0x559082a8fa17 in add /src/geos/src/noding/MCIndexNoder.cpp:87:5
+#12 0x559082a8fa17 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:49:9
+#13 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#14 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#15 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#16 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#17 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#18 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#19 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#20 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#21 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#22 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#23 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#24 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 378288 byte(s) in 1060 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082a7e101 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082a7e101 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082a7e101 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082a7e101 in __allocate_at_least<std::__1::allocator<geos::index::strtree::TemplateSTRNode<const geos::index::chain::MonotoneChain *, geos::index::strtree::EnvelopeTraits> > > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082a7e101 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082a7e101 in geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>* std::__1::vector<geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>, std::__1::allocator<geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>>>::__emplace_back_slow_path<geos::index::chain::MonotoneChain const*, geos::geom::Envelope const&>(geos::index::chain::MonotoneChain const*&&, geos::geom::Envelope const&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a8fc25 in emplace_back<const geos::index::chain::MonotoneChain *, const geos::geom::Envelope &> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a8fc25 in createLeafNode /src/geos/include/geos/index/strtree/TemplateSTRtree.h:426:15
+#9 0x559082a8fc25 in insert /src/geos/include/geos/index/strtree/TemplateSTRtree.h:189:13
+#10 0x559082a8fc25 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:54:19
+#11 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#12 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#13 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#14 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#15 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#16 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#17 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#18 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#19 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#20 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#21 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#22 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 321792 byte(s) in 796 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082d6be13 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082d6be13 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082d6be13 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082d6be13 in __allocate_at_least<std::__1::allocator<geos::index::chain::MonotoneChain> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082d6be13 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082d6be13 in geos::index::chain::MonotoneChain* std::__1::vector<geos::index::chain::MonotoneChain, std::__1::allocator<geos::index::chain::MonotoneChain>>::__emplace_back_slow_path<geos::geom::CoordinateSequence const&, unsigned long&, unsigned long&, void*&>(geos::geom::CoordinateSequence const&, unsigned long&, unsigned long&, void*&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082d6b8e2 in emplace_back<const geos::geom::CoordinateSequence &, unsigned long &, unsigned long &, void *&> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082d6b8e2 in finishChain /src/geos/src/index/chain/MonotoneChainBuilder.cpp:75:16
+#9 0x559082d6b8e2 in geos::index::chain::ChainBuilder::process(geos::geom::CoordinateXY const*) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:91:13
+#10 0x559082d6b63e in geos::index::chain::ChainBuilder::filter_ro(geos::geom::CoordinateXY const*) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:61:9
+#11 0x559082d6b48d in void geos::geom::CoordinateSequence::apply_ro<geos::index::chain::ChainBuilder>(geos::index::chain::ChainBuilder*) const /src/geos/include/geos/geom/CoordinateSequence.h:664:29
+#12 0x559082d6abbf in geos::index::chain::MonotoneChainBuilder::getChains(geos::geom::CoordinateSequence const*, void*, std::__1::vector<geos::index::chain::MonotoneChain, std::__1::allocator<geos::index::chain::MonotoneChain>>&) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:111:10
+#13 0x559082a8fa17 in add /src/geos/src/noding/MCIndexNoder.cpp:87:5
+#14 0x559082a8fa17 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:49:9
+#15 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#16 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#17 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#18 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#19 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#20 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#21 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#22 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#23 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#24 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#25 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#26 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 181872 byte(s) in 785 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082a7f6ca in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082a7f6ca in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082a7f6ca in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082a7f6ca in __allocate_at_least<std::__1::allocator<geos::index::strtree::TemplateSTRNode<const geos::index::chain::MonotoneChain *, geos::index::strtree::EnvelopeTraits> > > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082a7f6ca in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082a7f6ca in std::__1::vector<geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>, std::__1::allocator<geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>>>::reserve(unsigned long) /usr/local/bin/../include/c++/v1/vector:1425:49
+#7 0x559082a7ef74 in geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::build() /src/geos/include/geos/index/strtree/TemplateSTRtree.h:398:15
+#8 0x559082a8fe06 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:301:13
+#9 0x559082a8fe06 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#10 0x559082a8fe06 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#11 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#12 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#13 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#14 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#15 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#16 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#17 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#18 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#19 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#20 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#21 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#22 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 147456 byte(s) in 6 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082aa45c9 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082aa45c9 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082aa45c9 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082aa45c9 in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082aa45c9 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082aa45c9 in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a986db in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::CoordinateXYZM &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a986db in void geos::noding::SegmentNodeList::add<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x559082d9b4cb in void geos::noding::NodedSegmentString::addIntersection<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x559082d9ad8e in addIntersection /src/geos/include/geos/noding/NodedSegmentString.h:156:9
+#11 0x559082d9ad8e in addIntersections /src/geos/include/geos/noding/NodedSegmentString.h:138:13
+#12 0x559082d9ad8e in geos::noding::IntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/IntersectionAdder.cpp:101:14
+#13 0x559082d69cf5 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#14 0x559082d69cf5 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#15 0x559082d69eae in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#16 0x559082a90a7f in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#17 0x559082a90a7f in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#18 0x559082a90a7f in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#19 0x559082a8fea7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#20 0x559082a8fea7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#21 0x559082a8fea7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#22 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#23 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#24 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#25 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#26 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#27 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#28 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#29 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#30 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#31 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#32 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#33 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 77184 byte(s) in 64 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae3fca in geos::operation::buffer::OffsetSegmentGenerator::addDirectedFillet(geos::geom::Coordinate const&, double, double, int, double) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:285:17
+#13 0x559082ae41c3 in geos::operation::buffer::OffsetSegmentGenerator::addDirectedFillet(geos::geom::Coordinate const&, geos::geom::Coordinate const&, geos::geom::Coordinate const&, int, double) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:261:5
+#14 0x559082ae3376 in geos::operation::buffer::OffsetSegmentGenerator::addOutsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:385:9
+#15 0x559082ad6dab in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:289:20
+#16 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#17 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#18 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#19 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#20 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#21 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#22 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#23 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#24 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#25 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#26 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#27 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 34752 byte(s) in 117 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad3f80 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad3f80 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad3f80 in closeRing /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:171:17
+#12 0x559082ad3f80 in getCoordinates /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:185:9
+#13 0x559082ad3f80 in geos::operation::buffer::OffsetSegmentGenerator::getCoordinates(std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&) /src/geos/include/geos/operation/buffer/OffsetSegmentGenerator.h:106:30
+#14 0x559082ad6ec3 in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:294:12
+#15 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#16 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#17 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#18 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#19 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#20 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#21 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#22 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#23 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#24 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#25 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#26 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 32064 byte(s) in 501 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082aab0a7 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:195:29
+#2 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#3 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#4 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#5 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#6 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool)--operator()
+Indirect leak of 24864 byte(s) in 130 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ad6de4 in addLastSegment /src/geos/include/geos/operation/buffer/OffsetSegmentGenerator.h:138:17
+#13 0x559082ad6de4 in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:291:16
+#14 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#15 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#16 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#17 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#18 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#19 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#20 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#21 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#22 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#23 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#24 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#25 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 12416 byte(s) in 388 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ae19f3 in OffsetSegmentString /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:87:16
+#2 0x559082ae19f3 in geos::operation::buffer::OffsetSegmentGenerator::OffsetSegmentGenerator(geos::geom::PrecisionModel const*, geos::operation::buffer::BufferParameters const&, double) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:60:5
+#3 0x559082ad692d in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:252:28
+#4 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#5 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#6 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#7 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#8 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#9 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--OffsetSegmentString--geos::operation::buffer::OffsetSegmentGenerator::OffsetSegmentGenerator(geos::geom::PrecisionModel const*, geos::operation::buffer::BufferParameters const&, double)
+Indirect leak of 7680 byte(s) in 11 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082d6be13 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082d6be13 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082d6be13 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082d6be13 in __allocate_at_least<std::__1::allocator<geos::index::chain::MonotoneChain> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082d6be13 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082d6be13 in geos::index::chain::MonotoneChain* std::__1::vector<geos::index::chain::MonotoneChain, std::__1::allocator<geos::index::chain::MonotoneChain>>::__emplace_back_slow_path<geos::geom::CoordinateSequence const&, unsigned long&, unsigned long&, void*&>(geos::geom::CoordinateSequence const&, unsigned long&, unsigned long&, void*&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082d6b8e2 in emplace_back<const geos::geom::CoordinateSequence &, unsigned long &, unsigned long &, void *&> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082d6b8e2 in finishChain /src/geos/src/index/chain/MonotoneChainBuilder.cpp:75:16
+#9 0x559082d6b8e2 in geos::index::chain::ChainBuilder::process(geos::geom::CoordinateXY const*) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:91:13
+#10 0x559082d6b63e in geos::index::chain::ChainBuilder::filter_ro(geos::geom::CoordinateXY const*) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:61:9
+#11 0x559082d6b48d in void geos::geom::CoordinateSequence::apply_ro<geos::index::chain::ChainBuilder>(geos::index::chain::ChainBuilder*) const /src/geos/include/geos/geom/CoordinateSequence.h:664:29
+#12 0x559082d6abbf in geos::index::chain::MonotoneChainBuilder::getChains(geos::geom::CoordinateSequence const*, void*, std::__1::vector<geos::index::chain::MonotoneChain, std::__1::allocator<geos::index::chain::MonotoneChain>>&) /src/geos/src/index/chain/MonotoneChainBuilder.cpp:111:10
+#13 0x559082a8fa17 in add /src/geos/src/noding/MCIndexNoder.cpp:87:5
+#14 0x559082a8fa17 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:49:9
+#15 0x559082ab0d70 in geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:629:12
+#16 0x559082aaeaeb in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:426:9
+#17 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#18 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#19 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#20 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#21 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#22 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#23 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#24 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#25 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#26 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#27 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#28 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 6624 byte(s) in 37 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ad6b2e in addLastSegment /src/geos/include/geos/operation/buffer/OffsetSegmentGenerator.h:138:17
+#13 0x559082ad6b2e in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:271:16
+#14 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#15 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#16 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#17 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#18 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#19 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#20 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#21 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#22 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#23 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#24 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#25 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 6336 byte(s) in 66 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082aa45c9 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082aa45c9 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082aa45c9 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082aa45c9 in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082aa45c9 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082aa45c9 in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a986db in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::CoordinateXYZM &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a986db in void geos::noding::SegmentNodeList::add<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x559082d9b4cb in void geos::noding::NodedSegmentString::addIntersection<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x559082d9ae0d in addIntersection /src/geos/include/geos/noding/NodedSegmentString.h:156:9
+#11 0x559082d9ae0d in addIntersections /src/geos/include/geos/noding/NodedSegmentString.h:138:13
+#12 0x559082d9ae0d in geos::noding::IntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/IntersectionAdder.cpp:102:14
+#13 0x559082d69eae in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#14 0x559082a90a7f in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#15 0x559082a90a7f in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#16 0x559082a90a7f in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#17 0x559082a8fea7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x559082a8fea7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x559082a8fea7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#21 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#22 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#23 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#24 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#25 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#26 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#27 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#28 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#29 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#30 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#31 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 5760 byte(s) in 11 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082a7e101 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082a7e101 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082a7e101 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082a7e101 in __allocate_at_least<std::__1::allocator<geos::index::strtree::TemplateSTRNode<const geos::index::chain::MonotoneChain *, geos::index::strtree::EnvelopeTraits> > > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082a7e101 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082a7e101 in geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>* std::__1::vector<geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>, std::__1::allocator<geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>>>::__emplace_back_slow_path<geos::index::chain::MonotoneChain const*, geos::geom::Envelope const&>(geos::index::chain::MonotoneChain const*&&, geos::geom::Envelope const&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a8fc25 in emplace_back<const geos::index::chain::MonotoneChain *, const geos::geom::Envelope &> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a8fc25 in createLeafNode /src/geos/include/geos/index/strtree/TemplateSTRtree.h:426:15
+#9 0x559082a8fc25 in insert /src/geos/include/geos/index/strtree/TemplateSTRtree.h:189:13
+#10 0x559082a8fc25 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:54:19
+#11 0x559082ab0d70 in geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:629:12
+#12 0x559082aaeaeb in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:426:9
+#13 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#14 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#15 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#16 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#17 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#18 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#19 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#20 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#21 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#22 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#23 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#24 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 3456 byte(s) in 14 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ad6dab in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:289:20
+#13 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#14 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#15 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#16 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#17 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#18 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#19 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#20 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#21 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#22 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#23 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#24 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 2560 byte(s) in 320 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ac8f9c in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082ac8f9c in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082ac8f9c in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082ac8f9c in __allocate_at_least<std::__1::allocator<geos::geomgraph::Node *> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082ac8f9c in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082ac8f9c in geos::geomgraph::Node** std::__1::vector<geos::geomgraph::Node*, std::__1::allocator<geos::geomgraph::Node*>>::__push_back_slow_path<geos::geomgraph::Node* const&>(geos::geomgraph::Node* const&) /usr/local/bin/../include/c++/v1/vector:1451:47
+#7 0x559082ac4276 in push_back /usr/local/bin/../include/c++/v1/vector:1467:13
+#8 0x559082ac4276 in geos::operation::buffer::BufferSubgraph::add(geos::geomgraph::Node*, std::__1::vector<geos::geomgraph::Node*, std::__1::allocator<geos::geomgraph::Node*>>*) /src/geos/src/operation/buffer/BufferSubgraph.cpp:102:11
+#9 0x559082ac3ff3 in geos::operation::buffer::BufferSubgraph::addReachable(geos::geomgraph::Node*) /src/geos/src/operation/buffer/BufferSubgraph.cpp:93:9
+#10 0x559082ac3e67 in geos::operation::buffer::BufferSubgraph::create(geos::geomgraph::Node*) /src/geos/src/operation/buffer/BufferSubgraph.cpp:71:5
+#11 0x559082ab1599 in geos::operation::buffer::BufferBuilder::createSubgraphs(geos::geomgraph::PlanarGraph*, std::__1::vector<geos::operation::buffer::BufferSubgraph*, std::__1::allocator<geos::operation::buffer::BufferSubgraph*>>&) /src/geos/src/operation/buffer/BufferBuilder.cpp:733:23
+#12 0x559082aaebda in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:446:9
+#13 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#14 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#15 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#16 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#17 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#18 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#19 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#20 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#21 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#22 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#23 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#24 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 2560 byte(s) in 320 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082ac98ec in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082ac98ec in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082ac98ec in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082ac98ec in __allocate_at_least<std::__1::allocator<geos::geomgraph::DirectedEdge *> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082ac98ec in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082ac98ec in geos::geomgraph::DirectedEdge** std::__1::vector<geos::geomgraph::DirectedEdge*, std::__1::allocator<geos::geomgraph::DirectedEdge*>>::__push_back_slow_path<geos::geomgraph::DirectedEdge* const&>(geos::geomgraph::DirectedEdge* const&) /usr/local/bin/../include/c++/v1/vector:1451:47
+#7 0x559082ac43e2 in push_back /usr/local/bin/../include/c++/v1/vector:1467:13
+#8 0x559082ac43e2 in geos::operation::buffer::BufferSubgraph::add(geos::geomgraph::Node*, std::__1::vector<geos::geomgraph::Node*, std::__1::allocator<geos::geomgraph::Node*>>*) /src/geos/src/operation/buffer/BufferSubgraph.cpp:108:21
+#9 0x559082ac3ff3 in geos::operation::buffer::BufferSubgraph::addReachable(geos::geomgraph::Node*) /src/geos/src/operation/buffer/BufferSubgraph.cpp:93:9
+#10 0x559082ac3e67 in geos::operation::buffer::BufferSubgraph::create(geos::geomgraph::Node*) /src/geos/src/operation/buffer/BufferSubgraph.cpp:71:5
+#11 0x559082ab1599 in geos::operation::buffer::BufferBuilder::createSubgraphs(geos::geomgraph::PlanarGraph*, std::__1::vector<geos::operation::buffer::BufferSubgraph*, std::__1::allocator<geos::operation::buffer::BufferSubgraph*>>&) /src/geos/src/operation/buffer/BufferBuilder.cpp:733:23
+#12 0x559082aaebda in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:446:9
+#13 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#14 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#15 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#16 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#17 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#18 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#19 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#20 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#21 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#22 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#23 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#24 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1920 byte(s) in 3 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae3fca in geos::operation::buffer::OffsetSegmentGenerator::addDirectedFillet(geos::geom::Coordinate const&, double, double, int, double) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:285:17
+#13 0x559082ae41c3 in geos::operation::buffer::OffsetSegmentGenerator::addDirectedFillet(geos::geom::Coordinate const&, geos::geom::Coordinate const&, geos::geom::Coordinate const&, int, double) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:261:5
+#14 0x559082ae3376 in geos::operation::buffer::OffsetSegmentGenerator::addOutsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:385:9
+#15 0x559082ad6ae0 in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:269:20
+#16 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#17 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#18 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#19 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#20 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#21 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#22 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#23 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#24 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#25 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#26 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#27 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1248 byte(s) in 13 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082aa45c9 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082aa45c9 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082aa45c9 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082aa45c9 in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082aa45c9 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082aa45c9 in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a986db in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::CoordinateXYZM &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a986db in void geos::noding::SegmentNodeList::add<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x559082d9b4cb in void geos::noding::NodedSegmentString::addIntersection<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x559082d9ae0d in addIntersection /src/geos/include/geos/noding/NodedSegmentString.h:156:9
+#11 0x559082d9ae0d in addIntersections /src/geos/include/geos/noding/NodedSegmentString.h:138:13
+#12 0x559082d9ae0d in geos::noding::IntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/IntersectionAdder.cpp:102:14
+#13 0x559082d69d55 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#14 0x559082d69eae in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#15 0x559082a90a7f in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#16 0x559082a90a7f in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#17 0x559082a90a7f in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#18 0x559082a8fea7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#19 0x559082a8fea7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#20 0x559082a8fea7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#21 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#22 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#23 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#24 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#25 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#26 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#27 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#28 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#29 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#30 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#31 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#32 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1152 byte(s) in 6 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae36fa in geos::operation::buffer::OffsetSegmentGenerator::addInsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:463:17
+#13 0x559082ad6ae0 in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:269:20
+#14 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#15 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#16 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#17 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#18 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#19 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#20 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#21 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#22 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#23 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#24 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#25 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 960 byte(s) in 5 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ad6ae0 in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:269:20
+#13 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#14 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#15 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#16 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#17 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#18 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#19 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#20 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#21 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#22 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#23 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#24 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 768 byte(s) in 4 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae36fa in geos::operation::buffer::OffsetSegmentGenerator::addInsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:463:17
+#13 0x559082ad6dab in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:289:20
+#14 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#15 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#16 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#17 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#18 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#19 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#20 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#21 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#22 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#23 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#24 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#25 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 576 byte(s) in 4 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082aa45c9 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082aa45c9 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082aa45c9 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082aa45c9 in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082aa45c9 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082aa45c9 in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a986db in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::CoordinateXYZM &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a986db in void geos::noding::SegmentNodeList::add<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x559082d9b4cb in void geos::noding::NodedSegmentString::addIntersection<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x559082d9ae0d in addIntersection /src/geos/include/geos/noding/NodedSegmentString.h:156:9
+#11 0x559082d9ae0d in addIntersections /src/geos/include/geos/noding/NodedSegmentString.h:138:13
+#12 0x559082d9ae0d in geos::noding::IntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/IntersectionAdder.cpp:102:14
+#13 0x559082d69cf5 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#14 0x559082d69cf5 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#15 0x559082d69eae in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#16 0x559082a90a7f in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#17 0x559082a90a7f in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#18 0x559082a90a7f in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#19 0x559082a8fea7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#20 0x559082a8fea7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#21 0x559082a8fea7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#22 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#23 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#24 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#25 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#26 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#27 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#28 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#29 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#30 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#31 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#32 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#33 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 576 byte(s) in 2 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae365a in geos::operation::buffer::OffsetSegmentGenerator::addInsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:445:21
+#13 0x559082ad6dab in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:289:20
+#14 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#15 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#16 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#17 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#18 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#19 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#20 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#21 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#22 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#23 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#24 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#25 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 576 byte(s) in 3 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae3376 in geos::operation::buffer::OffsetSegmentGenerator::addOutsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:385:9
+#13 0x559082ad6dab in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:289:20
+#14 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#15 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#16 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#17 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#18 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#19 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#20 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#21 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#22 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#23 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#24 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#25 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 576 byte(s) in 3 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5590828594a3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5590828594a3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5590828594a3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5590828594a3 in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5590828594a3 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x5590828594a3 in std::__1::vector<double, std::__1::allocator<double>>::insert(std::__1::__wrap_iter<double const*>, unsigned long, double const&) /usr/local/bin/../include/c++/v1/vector:1651:51
+#7 0x5590828a3d16 in make_space /src/geos/include/geos/geom/CoordinateSequence.h:798:16
+#8 0x5590828a3d16 in void geos::geom::CoordinateSequence::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/geom/CoordinateSequence.h:455:13
+#9 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:413:9
+#10 0x559082ad8c84 in add<geos::geom::Coordinate> /src/geos/include/geos/geom/CoordinateSequence.h:432:9
+#11 0x559082ad8c84 in geos::operation::buffer::OffsetSegmentString::addPt(geos::geom::Coordinate const&) /src/geos/include/geos/operation/buffer/OffsetSegmentString.h:138:17
+#12 0x559082ae3323 in addBevelJoin /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:573:13
+#13 0x559082ae3323 in geos::operation::buffer::OffsetSegmentGenerator::addOutsideTurn(int, bool) /src/geos/src/operation/buffer/OffsetSegmentGenerator.cpp:375:9
+#14 0x559082ad6dab in geos::operation::buffer::OffsetCurveBuilder::getSingleSidedLineCurve(geos::geom::CoordinateSequence const*, double, std::__1::vector<geos::geom::CoordinateSequence*, std::__1::allocator<geos::geom::CoordinateSequence*>>&, bool, bool) /src/geos/src/operation/buffer/OffsetCurveBuilder.cpp:289:20
+#15 0x559082aaaec2 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:184:22
+#16 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#17 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#18 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#19 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#20 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#21 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#22 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#23 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#24 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#25 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#26 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 312 byte(s) in 2 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55908294282a in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55908294282a in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55908294282a in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55908294282a in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55908294282a in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55908294282a in std::__1::vector<double, std::__1::allocator<double>>::reserve(unsigned long) /usr/local/bin/../include/c++/v1/vector:1425:49
+#7 0x559082bd9ea2 in reserve /src/geos/include/geos/geom/CoordinateSequence.h:536:16
+#8 0x559082bd9ea2 in geos::operation::valid::RepeatedPointRemover::removeRepeatedPoints(geos::geom::CoordinateSequence const*, double) /src/geos/src/operation/valid/RepeatedPointRemover.cpp:84:14
+#9 0x559082ab0e95 in geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:650:19
+#10 0x559082aaeaeb in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:426:9
+#11 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#12 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#13 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#14 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#15 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#16 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#17 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#18 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#19 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#20 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#21 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#22 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 192 byte(s) in 1 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082aa45c9 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x559082aa45c9 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x559082aa45c9 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x559082aa45c9 in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x559082aa45c9 in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x559082aa45c9 in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::CoordinateXYZM const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x559082a986db in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::CoordinateXYZM &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x559082a986db in void geos::noding::SegmentNodeList::add<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x559082d9b4cb in void geos::noding::NodedSegmentString::addIntersection<geos::geom::CoordinateXYZM>(geos::geom::CoordinateXYZM const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x559082d9ad8e in addIntersection /src/geos/include/geos/noding/NodedSegmentString.h:156:9
+#11 0x559082d9ad8e in addIntersections /src/geos/include/geos/noding/NodedSegmentString.h:138:13
+#12 0x559082d9ad8e in geos::noding::IntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/IntersectionAdder.cpp:101:14
+#13 0x559082d69d55 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#14 0x559082d69eae in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#15 0x559082a90a7f in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#16 0x559082a90a7f in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#17 0x559082a90a7f in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#18 0x559082a8fea7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#19 0x559082a8fea7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#20 0x559082a8fea7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#21 0x559082aab445 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:203:12
+#22 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#23 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#24 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#25 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#26 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#27 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#28 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#29 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#30 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#31 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#32 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 64 byte(s) in 2 object(s) allocated from:
+#0 0x5590827fc37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x559082bd9d04 in make_unique<geos::geom::CoordinateSequence, unsigned int, bool, bool> /usr/local/bin/../include/c++/v1/__memory/unique_ptr.h:597:26
+#2 0x559082bd9d04 in geos::operation::valid::RepeatedPointRemover::removeRepeatedPoints(geos::geom::CoordinateSequence const*, double) /src/geos/src/operation/valid/RepeatedPointRemover.cpp:83:20
+#3 0x559082ab0e95 in geos::operation::buffer::BufferBuilder::computeNodedEdges(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, geos::geom::PrecisionModel const*) /src/geos/src/operation/buffer/BufferBuilder.cpp:650:19
+#4 0x559082aaeaeb in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:426:9
+#5 0x559082aaad64 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#6 0x559082811739 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#7 0x559082811739 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#8 0x559082811739 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#9 0x5590827fed9e in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:124:32
+#10 0x5590826b31e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x5590826b2a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x5590826b41e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x5590826b4f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x5590826a3dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x5590826cf192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7f6cbb4c9082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--make_unique<geos::geom::CoordinateSequence, unsigned int, bool, bool>--geos::operation::valid::RepeatedPointRemover::removeRepeatedPoints(geos::geom::CoordinateSequence const*, double)
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a memory leak, which is a bug in the GEOS library.
+
+The fuzz driver correctly frees the `result` geometry returned by `GEOSSingleSidedBuffer_r`. However, the crash log shows numerous leaks originating from within the `geos::operation::buffer::BufferBuilder` class, specifically in the `bufferLineSingleSided` and `buffer` methods.
+
+Looking at the `BufferBuilder.cpp` source code, it's clear that there are many complex memory allocations and deallocations happening. For example, in `bufferLineSingleSided`, `nodedEdges` is a raw pointer to a vector of `SegmentString` pointers. The code iterates through this vector, creates new `LineString` geometries, and then deletes the `SegmentString` pointers. It's plausible that there are execution paths where some of these allocations are not properly freed, leading to the observed memory leaks.
+
+The fact that the fuzz driver is correctly managing the memory it's responsible for, and the leaks are all traced back to internal GEOS library functions, strongly indicates a bug within the GEOS project.
+
+To fix this, a thorough audit of the memory management within the `BufferBuilder` class is needed. Specifically, all `new` allocations should be matched with a corresponding `delete`, and the ownership of all raw pointers should be carefully tracked. Using smart pointers like `std::unique_ptr` and `std::shared_ptr` would help to prevent such memory leaks in the future.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/geos/tests/fuzz/fuzz_geo2.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/geos/tests/fuzz/fuzz_geo2.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

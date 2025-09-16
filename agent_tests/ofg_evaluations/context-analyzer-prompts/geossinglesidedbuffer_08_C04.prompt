@@ -1,0 +1,447 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project geos.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/geos/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#include "/src/geos/build/capi/geos_c.h"
+
+static int initialized = 0;
+FILE *flogOut;
+
+void notice(const char *fmt, ...) {
+va_list ap;
+fprintf(flogOut, "NOTICE: ");
+va_start(ap, fmt);
+vfprintf(flogOut, fmt, ap);
+va_end(ap);
+fprintf(flogOut, "\n");
+}
+
+void log_and_exit(const char *fmt, ...) {
+va_list ap;
+fprintf(flogOut, "ERROR: ");
+va_start(ap, fmt);
+vfprintf(flogOut, fmt, ap);
+va_end(ap);
+fprintf(flogOut, "\n");
+}
+
+typedef struct {
+double width;
+int quadsegs;
+uint8_t joinStyle;
+double mitreLimit;
+uint8_t leftSide;
+} FuzzParams;
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+// Add a size limit to prevent OOM errors.
+if (Size > 8192) {
+return 0;
+}
+
+if (initialized == 0) {
+flogOut = fopen("/dev/null", "wb");
+initGEOS(notice, log_and_exit);
+initialized = 1;
+}
+
+// Need at least FuzzParams and 2 points for a line.
+// 2 points = 2 * (x, y) = 4 doubles.
+if (Size <= sizeof(FuzzParams) + 4 * sizeof(double)) {
+return 0;
+}
+
+const FuzzParams* params = (const FuzzParams*)Data;
+const uint8_t* coord_data = Data + sizeof(FuzzParams);
+size_t coord_size = Size - sizeof(FuzzParams);
+
+// Calculate the number of points we can create from the data.
+// Each point requires two doubles (x, y).
+size_t n_points = coord_size / (2 * sizeof(double));
+if (n_points < 2) {
+return 0;
+}
+
+const double* coords = (const double*)coord_data;
+
+// Create a coordinate sequence
+GEOSCoordSequence* seq = GEOSCoordSeq_create(n_points, 2);
+if (seq == NULL) {
+return 0;
+}
+
+for (size_t i = 0; i < n_points; ++i) {
+double x = coords[i * 2];
+double y = coords[i * 2 + 1];
+// Avoid non-finite values which can cause issues
+if (!isfinite(x) || !isfinite(y)) {
+x = 0.0;
+y = 0.0;
+}
+GEOSCoordSeq_setX(seq, i, x);
+GEOSCoordSeq_setY(seq, i, y);
+}
+
+// Create a LineString from the coordinate sequence.
+// The sequence is cloned, so we can destroy our copy.
+GEOSGeometry* g1 = GEOSGeom_createLineString(seq);
+GEOSCoordSeq_destroy(seq); // Clean up the sequence
+
+if (g1 == NULL) {
+return 0;
+}
+
+double width = params->width;
+if (!isfinite(width)) {
+width = 1.0;
+}
+
+// quadsegs must be positive
+int quadsegs = params->quadsegs;
+if (quadsegs <= 0) {
+quadsegs = 1;
+}
+
+// Constrain joinStyle to be one of the valid enum values:
+// 1=round, 2=mitre, 3=bevel
+int joinStyle = (params->joinStyle % 3) + 1;
+
+double mitreLimit = params->mitreLimit;
+if (!isfinite(mitreLimit) || mitreLimit < 0) {
+mitreLimit = 1.0;
+}
+
+// Constrain leftSide to be 0 or 1
+int leftSide = params->leftSide % 2;
+
+GEOSGeometry *result = GEOSSingleSidedBuffer(g1, width, quadsegs, joinStyle, mitreLimit, leftSide);
+
+if (result != NULL) {
+GEOSGeom_destroy(result);
+}
+
+GEOSGeom_destroy(g1);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: geos
+function signature: Geometry * GEOSSingleSidedBuffer(const Geometry *, double, int, int, double, int)
+</input>
+
+<description>
+The GEOSSingleSidedBuffer function computes a buffer on one side of a geometry. The side is determined by the `leftSide` parameter and the buffer width is controlled by the `width` parameter. The style of the buffer is controlled by the `quadsegs`, `joinStyle` and `mitreLimit` parameters.
+</description>
+
+<requirements>
+
+<requirement>
+The `g` parameter, a `Geometry` pointer, must be a valid geometry object. It can be created from a Well-Known Text (WKT) or Well-Known Binary (WKB) representation using `fromWKT` or `GEOSGeomFromHEX_buf` respectively. This is necessary to prevent null pointer dereferences and other crashes related to invalid geometries.
+</requirement>
+<requirement>
+The `joinStyle` parameter must be one of `GEOSBUF_JOIN_ROUND` (1), `GEOSBUF_JOIN_MITRE` (2), or `GEOSBUF_JOIN_BEVEL` (3). The implementation will throw an exception if an invalid value is provided, so it is important to adhere to these values.
+</requirement>
+<requirement>
+The `quadsegs` parameter must be a positive integer. This parameter controls the number of segments used to approximate a quarter-circle in the buffer, and a non-positive value would lead to incorrect behavior.
+</requirement>
+<requirement>
+The `leftSide` parameter should be either 0 or 1. This parameter is used as a boolean to determine which side of the geometry to buffer, with 0 representing the right side and 1 representing the left.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-use-after-free on address 0x503000000370 at pc 0x5574c18fe38a bp 0x7ffd9abf76a0 sp 0x7ffd9abf7698
+READ of size 8 at 0x503000000370 thread T0
+SCARINESS: 51 (8-byte-read-heap-use-after-free)
+#0 0x5574c18fe389 in empty /usr/local/bin/../include/c++/v1/vector:601:18
+#1 0x5574c18fe389 in isEmpty /src/geos/include/geos/geom/CoordinateSequence.h:197:23
+#2 0x5574c18fe389 in geos::geom::SimpleCurve::isEmpty() const /src/geos/src/geom/SimpleCurve.cpp:308:20
+#3 0x5574c1a089b7 in geos::operation::buffer::BufferCurveSetBuilder::add(geos::geom::Geometry const&) /src/geos/src/operation/buffer/BufferCurveSetBuilder.cpp:131:10
+#4 0x5574c1a0888f in geos::operation::buffer::BufferCurveSetBuilder::getCurves() /src/geos/src/operation/buffer/BufferCurveSetBuilder.cpp:82:5
+#5 0x5574c19fe46a in geos::operation::buffer::BufferBuilder::buffer(geos::geom::Geometry const*, double) /src/geos/src/operation/buffer/BufferBuilder.cpp:411:73
+#6 0x5574c19fa734 in geos::operation::buffer::BufferBuilder::bufferLineSingleSided(geos::geom::Geometry const*, double, bool) /src/geos/src/operation/buffer/BufferBuilder.cpp:168:41
+#7 0x5574c1761109 in operator() /src/geos/capi/geos_ts_c.cpp:1423:55
+#8 0x5574c1761109 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:1408:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#9 0x5574c1761109 in GEOSSingleSidedBuffer_r /src/geos/capi/geos_ts_c.cpp:1408:16
+#10 0x5574c174ad5b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:120:26
+#11 0x5574c15ff1e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x5574c15fea05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x5574c16001e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x5574c1600f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x5574c15efdbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x5574c161b192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f923cd49082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#18 0x5574c15e263d in _start (out/libfuzzer-address-x86_64/fuzz_geo2+0x2a263d)
+
+DEDUP_TOKEN: empty--isEmpty--geos::geom::SimpleCurve::isEmpty() const
+0x503000000370 is located 0 bytes inside of 32-byte region [0x503000000370,0x503000000390)
+freed by thread T0 here:
+#0 0x5574c1748bdd in operator delete(void*) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:143:3
+#1 0x5574c174abf6 in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:91:3
+#2 0x5574c15ff1e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x5574c15fea05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x5574c16001e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x5574c1600f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x5574c15efdbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x5574c161b192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f923cd49082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator delete(void*)--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+previously allocated by thread T0 here:
+#0 0x5574c174837d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5574c177da81 in operator() /src/geos/capi/geos_ts_c.cpp:2758:20
+#2 0x5574c177da81 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2757:35), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#3 0x5574c177da81 in GEOSCoordSeq_create_r /src/geos/capi/geos_ts_c.cpp:2757:16
+#4 0x5574c174aafc in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:71:28
+#5 0x5574c15ff1e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x5574c15fea05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x5574c16001e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x5574c1600f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x5574c15efdbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x5574c161b192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f923cd49082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--operator()--execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2757:35), nullptr>
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a heap-use-after-free caused by a bug in the GEOS library, not the fuzz driver.
+
+1.  The fuzz driver allocates a `GEOSCoordSequence` (`seq`) and passes it to `GEOSGeom_createLineString` to create a `LineString` geometry (`g1`).
+2.  The GEOS C-API's documentation and source code comments for `GEOSGeom_createLineString` explicitly state that the input `GEOSCoordSequence` is cloned. This implies the caller retains ownership of the original sequence and is responsible for its cleanup.
+3.  Adhering to this API contract, the fuzz driver correctly calls `GEOSCoordSeq_destroy(seq)` to free the memory it allocated.
+4.  However, GDB analysis reveals that the `LineString` object created by the library did not use a clone but instead stored a pointer to the original `seq`.
+5.  When a subsequent operation (`GEOSSingleSidedBuffer`) is performed on the `LineString`, it attempts to access this coordinate sequence via the stored pointer, which now dangles because the memory has been freed. This results in the observed heap-use-after-free.
+
+The bug lies in the GEOS library's implementation of `GEOSGeom_createLineString`, which violates its own API contract by not cloning the coordinate sequence.
+
+**Suggestion:**
+The bug should be fixed within the `geos` project. The implementation of `GEOSGeom_createLineString` (and its underlying C++ counterparts) must be corrected to ensure it creates a deep copy (clone) of the input `GEOSCoordSequence`. The resulting `GEOSGeometry` object must use this new copy, not the original pointer. The fuzz driver's code is correct based on the documented behavior of the library's API and should not be modified.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/geos/tests/fuzz/fuzz_geo2.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/geos/tests/fuzz/fuzz_geo2.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

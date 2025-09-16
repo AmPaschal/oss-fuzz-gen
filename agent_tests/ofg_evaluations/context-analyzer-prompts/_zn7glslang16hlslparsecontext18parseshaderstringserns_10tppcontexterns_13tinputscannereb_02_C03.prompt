@@ -1,0 +1,449 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project glslang.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/glslang/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include "glslang/Public/ResourceLimits.h"
+#include "glslang/Public/ShaderLang.h"
+#include <string>
+#include <vector>
+
+// Dictionary of HLSL keywords, types, and simple expressions for body generation
+// Use a C-style array to be compatible with FuzzedDataProvider::PickValueInArray
+const char* const hlsl_tokens[] = {
+"if (true) ", "{", "}", "else ", "for (int i = 0; i < 1; ++i) ", "while (false) ",
+"do ", "switch (0) ", "case 0:", "default:", "break;", "continue;", "return;",
+"float ", "float2 ", "float3 ", "float4 ", "int ", "int2 ", "int3 ", "int4 ",
+"uint ", "uint2 ", "uint3 ", "uint4 ", "bool ",
+"struct S { float a; int b; };",
+"cbuffer CB { float4x4 proj; };",
+"Texture2D tex;", "SamplerState samp;", "StructuredBuffer<float> g_sbuf;",
+"float x = 1.0;", "int y = 2;", "bool z = true;", "x = y * 2.0;",
+"float4 main(float4 pos : P) : SV_POSITION { return pos; }", // A simple function
+};
+
+// Function to generate a more structured, albeit simple, shader body
+std::string GenerateShaderBody(FuzzedDataProvider &provider, size_t max_len) {
+std::string body;
+size_t num_tokens = provider.ConsumeIntegralInRange<size_t>(5, 50);
+for (size_t i = 0; i < num_tokens; ++i) {
+body += provider.PickValueInArray(hlsl_tokens);
+body += " ";
+if (body.length() > max_len) {
+break;
+}
+}
+return body;
+}
+
+// Function to create a shader skeleton based on the stage
+std::string CreateShaderSkeleton(EShLanguage stage, FuzzedDataProvider &provider) {
+std::string body = GenerateShaderBody(provider, 1024);
+std::string entry_point_name = "main"; // Use a consistent entry point name
+
+switch (stage) {
+case EShLangVertex:
+return "struct VS_INPUT { float4 pos : POSITION; };\n"
+"struct VS_OUTPUT { float4 pos : SV_POSITION; };\n"
+"VS_OUTPUT " + entry_point_name + "(VS_INPUT input) {\n"
+"    VS_OUTPUT output;\n"
+"    " + body + ";\n"
+"    output.pos = input.pos;\n"
+"    return output;\n"
+"}";
+case EShLangTessControl:
+return "[domain(\"quad\")]\n"
+"[partitioning(\"integer\")]\n"
+"[outputtopology(\"triangle_cw\")]\n"
+"[outputcontrolpoints(4)]\n"
+"[patchconstantfunc(\"PCF\")]\n"
+"struct HS_CONSTANT_DATA_OUTPUT { float TessLevel[2] : SV_TessFactor; };\n"
+"struct HS_OUTPUT { float4 pos : P; };\n"
+"HS_CONSTANT_DATA_OUTPUT PCF() { \n"
+"    HS_CONSTANT_DATA_OUTPUT output;\n"
+"    output.TessLevel[0] = output.TessLevel[1] = 1;\n"
+"    return output;\n"
+"}\n"
+"[maxtessfactor(1)]\n"
+"HS_OUTPUT " + entry_point_name + "() {\n"
+"    HS_OUTPUT output; output.pos = float4(0,0,0,0);\n"
+"    " + body + ";\n"
+"    return output;\n"
+"}";
+case EShLangTessEvaluation:
+return "[domain(\"quad\")]\n"
+"struct HS_CONSTANT_DATA_OUTPUT { float TessLevel[4] : SV_TessFactor; float InsideTessFactor : SV_InsideTessFactor; };\n"
+"struct HS_CONTROL_POINT_OUTPUT { float3 vPosition : POS; };\n"
+"struct DS_OUTPUT { float4 vPosition : SV_POSITION; };\n"
+"DS_OUTPUT " + entry_point_name + "(HS_CONSTANT_DATA_OUTPUT hsConstData, const OutputPatch<HS_CONTROL_POINT_OUTPUT, 4> patch, float2 uv : SV_DomainLocation) {\n"
+"    DS_OUTPUT dsOut; dsOut.vPosition = float4(0,0,0,0);\n"
+"    " + body + ";\n"
+"    return dsOut;\n"
+"}";
+case EShLangGeometry:
+return "[maxvertexcount(3)]\n"
+"void " + entry_point_name + "(triangle float4 input[3] : SV_POSITION, inout TriangleStream<float4> stream) {\n"
+"    " + body + ";\n"
+"    stream.Append(input[0]);\n"
+"}";
+case EShLangFragment:
+return "float4 " + entry_point_name + "() : SV_Target {\n"
+"    " + body + ";\n"
+"    return float4(1.0, 0.0, 0.0, 1.0);\n"
+"}";
+case EShLangCompute:
+return "[numthreads(8, 8, 1)]\n"
+"void " + entry_point_name + "(uint3 id : SV_DispatchThreadID) {\n"
+"    " + body + ";\n"
+"}";
+default:
+return body;
+}
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+glslang::InitializeProcess();
+
+FuzzedDataProvider provider(data, size);
+
+EShLanguage stage = provider.PickValueInArray(
+{EShLangVertex, EShLangTessControl, EShLangTessEvaluation, EShLangGeometry,
+EShLangFragment, EShLangCompute});
+
+glslang::TShader shader(stage);
+
+std::string shader_string = CreateShaderSkeleton(stage, provider);
+const char *shader_strings[] = {shader_string.c_str()};
+const int shader_lengths[] = {(int)shader_string.length()};
+
+shader.setStringsWithLengths(shader_strings, shader_lengths, 1);
+shader.setEntryPoint("main");
+shader.setSourceEntryPoint("main");
+
+// Fuzz additional TShader configurations
+if (provider.ConsumeBool()) {
+shader.setHlslIoMapping(true);
+}
+if (provider.ConsumeBool()) {
+shader.setEnvTargetHlslFunctionality1();
+}
+
+TBuiltInResource resources = *GetDefaultResources();
+resources.maxLights = provider.ConsumeIntegralInRange<int>(0, 32);
+resources.maxClipPlanes = provider.ConsumeIntegralInRange<int>(0, 16);
+resources.maxTextureUnits = provider.ConsumeIntegralInRange<int>(0, 32);
+resources.maxVertexAttribs = provider.ConsumeIntegralInRange<int>(0, 64);
+resources.maxVertexUniformComponents = provider.ConsumeIntegralInRange<int>(0, 4096);
+resources.maxVaryingFloats = provider.ConsumeIntegralInRange<int>(0, 128);
+resources.maxTextureCoords = provider.ConsumeIntegralInRange<int>(0, 32);
+resources.maxCombinedTextureImageUnits = provider.ConsumeIntegralInRange<int>(0, 128);
+
+EShMessages messages = (EShMessages)(EShMsgDefault | EShMsgReadHlsl);
+if (provider.ConsumeBool()) {
+messages = (EShMessages)(messages | EShMsgVulkanRules);
+}
+if (provider.ConsumeBool()) {
+messages = (EShMessages)(messages | EShMsgSpvRules);
+}
+if (provider.ConsumeBool()) {
+messages = (EShMessages)(messages | EShMsgHlslLegalization);
+}
+
+int version = provider.ConsumeIntegralInRange<int>(100, 450);
+bool forward_compatible = provider.ConsumeBool();
+
+shader.parse(&resources, version, ENoProfile, false, forward_compatible, messages);
+
+glslang::FinalizeProcess();
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: glslang
+function signature: bool glslang::HlslParseContext::parseShaderStrings(TPpContext &, TInputScanner &, bool)
+</input>
+
+<description>
+The function `parseShaderStrings` is responsible for parsing HLSL shader strings. It takes a `TPpContext` and a `TInputScanner` as input. The `TPpContext` is used to manage the preprocessing of the shader, and the `TInputScanner` is used to read the shader source code. The function returns `true` if the parsing is successful and `false` otherwise.
+</description>
+
+<requirements>
+<requirement>
+The `ppContext` argument must be initialized with a valid `TParseContext` object. This is because the `TPpContext` constructor uses the `TParseContext` to initialize its own state.
+</requirement>
+<requirement>
+The `input` argument must be a valid `TInputScanner` object. This is because the `TInputScanner` is used to read the shader source code, and an invalid object will cause a crash.
+</requirement>
+<requirement>
+The `TInputScanner` should be initialized with a non-empty array of strings. This is because the parser expects to have some source code to parse, and an empty input will cause it to fail without exercising any of the parsing logic.
+</requirement>
+<requirement>
+The `versionWillBeError` argument should be set to `false`. In the callers, this is usually set to `false`, which allows the parser to handle different versions of the shader language gracefully. Setting it to `true` may cause the parser to fail unnecessarily.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x000000000008 (pc 0x558bcd806f95 bp 0x7ffcbcd86610 sp 0x7ffcbcd86540 T0)
+==17==The signal is caused by a READ memory access.
+==17==Hint: address points to the zero page.
+SCARINESS: 10 (null-deref)
+#0 0x558bcd806f95 in size /usr/local/bin/../include/c++/v1/vector:595
+#1 0x558bcd806f95 in glslang::HlslParseContext::wrapupSwitchSubsequence(glslang::TIntermAggregate*, TIntermNode*) /src/glslang/glslang/HLSL/hlslParseHelper.cpp:9370:54
+#2 0x558bcd84b90e in glslang::HlslGrammar::acceptCompoundStatement(TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:3715:26
+#3 0x558bcd848e2b in glslang::HlslGrammar::acceptFunctionBody(glslang::TFunctionDeclarator&, TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:2988:11
+#4 0x558bcd831cd5 in acceptFunctionDefinition /src/glslang/glslang/HLSL/hlslGrammar.cpp:2974:16
+#5 0x558bcd831cd5 in glslang::HlslGrammar::acceptDeclaration(TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:434:24
+#6 0x558bcd82f310 in acceptDeclarationList /src/glslang/glslang/HLSL/hlslGrammar.cpp:165:15
+#7 0x558bcd82f310 in glslang::HlslGrammar::acceptCompilationUnit() /src/glslang/glslang/HLSL/hlslGrammar.cpp:130:11
+#8 0x558bcd75ff16 in glslang::HlslParseContext::parseShaderStrings(glslang::TPpContext&, glslang::TInputScanner&, bool) /src/glslang/glslang/HLSL/hlslParseHelper.cpp:132:18
+#9 0x558bcd6433c2 in operator() /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1233:28
+#10 0x558bcd6433c2 in ProcessDeferred<(anonymous namespace)::DoFullParse> /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1008:20
+#11 0x558bcd6433c2 in (anonymous namespace)::CompileDeferred(TCompiler*, char const* const*, int, int const*, char const* const*, char const*, EShOptimizationLevel, TBuiltInResource const*, int, EProfile, bool, int, bool, EShMessages, glslang::TIntermediate&, glslang::TShader::Includer&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, glslang::TEnvironment*, bool) /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1321:12
+#12 0x558bcd64a4e3 in glslang::TShader::parse(TBuiltInResource const*, int, EProfile, bool, bool, EShMessages, glslang::TShader::Includer&) /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1893:12
+#13 0x558bcd63d73a in parse /src/glslang/glslang/../glslang/Public/ShaderLang.h:676:16
+#14 0x558bcd63d73a in LLVMFuzzerTestOneInput /src/compile_fuzzer.cc:152:12
+#15 0x558bcd4ef880 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#16 0x558bcd4ef0a5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#17 0x558bcd4f0885 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#18 0x558bcd4f1615 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#19 0x558bcd4e045b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#20 0x558bcd50b832 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#21 0x7f6f5b8cb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#22 0x558bcd4d2cdd in _start (out/libfuzzer-address-x86_64/compile_fuzzer+0x285cdd)
+
+DEDUP_TOKEN: size--glslang::HlslParseContext::wrapupSwitchSubsequence(glslang::TIntermAggregate*, TIntermNode*)--glslang::HlslGrammar::acceptCompoundStatement(TIntermNode*&)
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is caused by a null pointer dereference in `glslang::HlslParseContext::wrapupSwitchSubsequence`. The `switchSequence` pointer is null when `switchSequence->size()` is called. This indicates a bug in the glslang library's handling of `switch` statements, likely due to an unexpected or malformed input shader generated by the fuzzer.
+
+A null check should be added before dereferencing `switchSequence` in `/src/glslang/glslang/HLSL/hlslParseHelper.cpp:9370`.
+
+```cpp
+// In /src/glslang/glslang/HLSL/hlslParseHelper.cpp:9370
+if (switchSequence) { // Add this null check
+for (unsigned int s = 0; s < switchSequence->size(); ++s) {
+...
+}
+}
+```
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/compile_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/compile_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

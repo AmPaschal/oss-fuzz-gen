@@ -1,0 +1,466 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project muparser.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/muparser/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <cmath>
+#include <array>
+
+#include "muParser.h"
+
+// Forward declaration
+std::string generate_expression(FuzzedDataProvider& provider, int depth, const std::vector<std::string>& custom_funcs);
+
+// Generates a terminal: a variable, a number, or a custom constant
+std::string generate_terminal(FuzzedDataProvider& provider) {
+return provider.PickValueInArray<std::string>({
+"x", "y", "fuzz_c1",
+std::to_string(provider.ConsumeFloatingPoint<double>())
+});
+}
+
+// Generates an expression, which can be a terminal, a unary op, a binary op, or a function call.
+std::string generate_expression(FuzzedDataProvider& provider, int depth, const std::vector<std::string>& custom_funcs) {
+if (depth <= 0 || provider.remaining_bytes() < 20) {
+return generate_terminal(provider);
+}
+
+// All possible choices for generation
+enum ExprType {
+kTerminal, kUnary, kBinary, kFunction, kIif
+};
+
+// Give a higher chance to terminals to ensure expressions terminate
+const auto choice = provider.PickValueInArray<ExprType>({
+kTerminal, kTerminal, kTerminal, kTerminal,
+kUnary, kBinary, kBinary, kFunction, kIif
+});
+
+switch (choice) {
+case kUnary: {
+auto op = provider.PickValueInArray<std::string>({"-", "!"}); // Logical not is often a prefix op
+return op + "(" + generate_expression(provider, depth - 1, custom_funcs) + ")";
+}
+case kBinary: {
+auto op = provider.PickValueInArray<std::string>({
+"+", "-", "*", "/", "^", "&&", "||", "==", "!=", "<", ">", "<=", ">=", "=", "fuzz_op"
+});
+return "(" + generate_expression(provider, depth - 1, custom_funcs) + ") " + op + " (" + generate_expression(provider, depth - 1, custom_funcs) + ")";
+}
+case kFunction: {
+std::vector<std::string> functions = {
+"sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+"asinh", "acosh", "atanh", "log2", "log10", "log", "ln", "exp",
+"sqrt", "sign", "rint", "abs", "min", "max", "sum", "avg"
+};
+// Add any custom functions that were defined
+functions.insert(functions.end(), custom_funcs.begin(), custom_funcs.end());
+
+std::string func_name = functions[provider.ConsumeIntegralInRange<size_t>(0, functions.size() - 1)];
+// Determine arity based on function name to generate correct arguments
+if (func_name == "min" || func_name == "max" || func_name == "sum" || func_name == "avg" || func_name == "fuzz_f_multi") {
+int num_args = provider.ConsumeIntegralInRange(2, 4);
+std::string args;
+for (int i = 0; i < num_args; ++i) {
+args += generate_expression(provider, depth - 1, custom_funcs) + (i == num_args - 1 ? "" : ", ");
+}
+return func_name + "(" + args + ")";
+} else if (func_name == "atan2" || func_name == "fuzz_f2") {
+return func_name + "(" + generate_expression(provider, depth - 1, custom_funcs) + ", " + generate_expression(provider, depth - 1, custom_funcs) + ")";
+} else { // 1-argument functions
+return func_name + "(" + generate_expression(provider, depth - 1, custom_funcs) + ")";
+}
+}
+case kIif: { // Ternary if: iif(cond, true_expr, false_expr)
+std::string cond = generate_expression(provider, depth - 1, custom_funcs);
+std::string true_expr = generate_expression(provider, depth - 1, custom_funcs);
+std::string false_expr = generate_expression(provider, depth - 1, custom_funcs);
+return "iif(" + cond + ", " + true_expr + ", " + false_expr + ")";
+}
+case kTerminal:
+default:
+return generate_terminal(provider);
+}
+}
+
+// Dummy custom functions for the parser
+mu::value_type fuzz_fun1(mu::value_type v) { return v * v; }
+mu::value_type fuzz_fun2(mu::value_type v1, mu::value_type v2) { return v1 + v2; }
+mu::value_type fuzz_bop(mu::value_type v1, mu::value_type v2) { return v1 - v2 * 2; }
+
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 1) {
+return 0;
+}
+FuzzedDataProvider provider(data, size);
+mu::Parser parser;
+std::vector<std::string> custom_funcs;
+
+// With some probability, define custom functions, operators, and constants
+if (provider.ConsumeBool()) {
+parser.DefineFun("fuzz_f1", fuzz_fun1);
+custom_funcs.push_back("fuzz_f1");
+}
+if (provider.ConsumeBool()) {
+parser.DefineFun("fuzz_f2", fuzz_fun2);
+custom_funcs.push_back("fuzz_f2");
+}
+if (provider.ConsumeBool()) {
+parser.DefineOprt("fuzz_op", fuzz_bop, 1);
+}
+if (provider.ConsumeBool()) {
+parser.DefineConst("fuzz_c1", provider.ConsumeFloatingPoint<double>());
+}
+
+std::string expression = generate_expression(provider, provider.ConsumeIntegralInRange(2, 5), custom_funcs);
+if (expression.empty()) {
+return 0;
+}
+
+int nBulkSize = provider.ConsumeIntegralInRange<int>(1, 256);
+
+std::vector<mu::value_type> var_x_data(nBulkSize);
+std::vector<mu::value_type> var_y_data(nBulkSize);
+
+// Ensure we have enough data to fill buffers, otherwise reduce nBulkSize
+if (provider.remaining_bytes() < (sizeof(mu::value_type) * 2 * nBulkSize)) {
+size_t remaining_elements = provider.remaining_bytes() / (sizeof(mu::value_type) * 2);
+if (remaining_elements == 0) return 0;
+nBulkSize = std::min(nBulkSize, (int)remaining_elements);
+var_x_data.resize(nBulkSize);
+var_y_data.resize(nBulkSize);
+}
+
+for (int i = 0; i < nBulkSize; ++i) {
+var_x_data[i] = provider.ConsumeFloatingPoint<mu::value_type>();
+var_y_data[i] = provider.ConsumeFloatingPoint<mu::value_type>();
+}
+
+try {
+parser.DefineVar("x", var_x_data.data());
+parser.DefineVar("y", var_y_data.data());
+parser.SetExpr(expression);
+
+std::vector<mu::value_type> results(nBulkSize);
+parser.Eval(results.data(), nBulkSize);
+} catch (mu::Parser::exception_type &) {
+// Expected exceptions
+} catch (...) {
+// Unexpected exceptions
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: muparser
+function signature: void mu::ParserBase::Eval(value_type* results, int nBulkSize)
+</input>
+
+<description>
+The `Eval` function performs a bulk evaluation of a mathematical expression. It evaluates the expression `nBulkSize` times, using corresponding values from any defined variables for each evaluation, and stores the results in the `results` array. Before calling this function, a parser object must be instantiated, and an expression must be set using `SetExpr()`. If the expression contains variables, they must be defined using `DefineVar` and point to arrays of `value_type` with a size equal to `nBulkSize`.
+</description>
+
+<requirements>
+<requirement>
+A `mu::Parser` object must be created before calling the `Eval` function. This is because the `Eval` function is a member of this class and depends on its internal state.
+</requirement>
+<requirement>
+The `SetExpr()` function must be called before `Eval()` to set the expression string. The `CreateRPN()` function, called by `Eval()`, requires an expression to parse.
+</requirement>
+<requirement>
+The first argument, `results`, must be a pointer to a valid and allocated buffer of `value_type`. This buffer is used to store the results of the bulk evaluation and must be large enough to hold `nBulkSize` elements to avoid a buffer overflow.
+</requirement>
+<requirement>
+The second argument, `nBulkSize`, must be a positive integer representing the number of evaluations to perform. It must not be greater than the allocated size of the `results` buffer and any variable buffers defined with `DefineVar`.
+</requirement>
+<requirement>
+If the expression set by `SetExpr()` contains variables, the `DefineVar()` function must be called for each variable. The variable should be backed by an array of `value_type` of size `nBulkSize` to provide the input values for the bulk evaluation.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-buffer-overflow on address 0x51400000cdf0 at pc 0x556f7b792cd4 bp 0x7ffc27648c30 sp 0x7ffc27648c28
+READ of size 1 at 0x51400000cdf0 thread T0
+SCARINESS: 12 (1-byte-read-heap-buffer-overflow)
+#0 0x556f7b792cd3 in assign /usr/local/bin/../include/c++/v1/__string/char_traits.h:190:12
+#1 0x556f7b792cd3 in __init_with_size<const char *, const char *> /usr/local/bin/../include/c++/v1/string:2337:7
+#2 0x556f7b792cd3 in __init<const char *, 0> /usr/local/bin/../include/c++/v1/string:2306:3
+#3 0x556f7b792cd3 in basic_string<const char *, 0> /usr/local/bin/../include/c++/v1/string:1067:5
+#4 0x556f7b792cd3 in mu::ParserTokenReader::IsOprt(mu::ParserToken<double, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>&) /src/muparser/src/muParserTokenReader.cpp:676:15
+#5 0x556f7b78febb in mu::ParserTokenReader::ReadNextToken() /src/muparser/src/muParserTokenReader.cpp:286:7
+#6 0x556f7b7440b1 in mu::ParserBase::CreateRPN() const /src/muparser/src/muParserBase.cpp:1303:26
+#7 0x556f7b7598e5 in mu::ParserBase::Eval(double*, int) /src/muparser/src/muParserBase.cpp:1887:3
+#8 0x556f7b72eb8c in LLVMFuzzerTestOneInput /src/set_eval_fuzzer.cc:145:16
+#9 0x556f7b5dd5f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x556f7b5dce15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x556f7b5de5f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x556f7b5df385 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x556f7b5ce1cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x556f7b5f95a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7ff13954a082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#16 0x556f7b5c0a4d in _start (out/libfuzzer-address-x86_64/set_eval_fuzzer+0x7ea4d)
+
+DEDUP_TOKEN: assign--__init_with_size<const char *, const char *>--__init<const char *, 0>
+0x51400000cdf0 is located 0 bytes after 432-byte region [0x51400000cc40,0x51400000cdf0)
+allocated by thread T0 here:
+#0 0x556f7b72678d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x556f7b75b410 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x556f7b75b410 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x556f7b75b410 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x556f7b75b410 in __allocate_at_least<std::__1::allocator<char> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x556f7b75b410 in __grow_by_and_replace /usr/local/bin/../include/c++/v1/string:2365:23
+#6 0x556f7b75b410 in std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>& std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::__assign_no_alias<true>(char const*, unsigned long) /usr/local/bin/../include/c++/v1/string:2458:5
+#7 0x556f7b78f2ae in operator= /usr/local/bin/../include/c++/v1/string:2539:16
+#8 0x556f7b78f2ae in mu::ParserTokenReader::SetFormula(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) /src/muparser/src/muParserTokenReader.cpp:225:16
+#9 0x556f7b73f8d4 in mu::ParserBase::SetExpr(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&) /src/muparser/src/muParserBase.cpp:451:19
+#10 0x556f7b72eb5c in LLVMFuzzerTestOneInput /src/set_eval_fuzzer.cc:142:16
+#11 0x556f7b5dd5f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x556f7b5dce15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x556f7b5de5f5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x556f7b5df385 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x556f7b5ce1cb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x556f7b5f95a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7ff13954a082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a heap-buffer-overflow read, occurring during the creation of a `std::string`. The AddressSanitizer report indicates the read happens just beyond the end of a heap buffer allocated for the expression string (`m_strFormula`).
+
+The GDB analysis reveals the following call sequence leading to the crash: `LLVMFuzzerTestOneInput` -> `parser.Eval()` -> `CreateRPN()` -> `ReadNextToken()` -> `IsOprt()`. Inside `IsOprt`, a potential operator token is extracted from the full expression string into a local `std::string` variable `strTok`. This `strTok` is then used to look up a corresponding operator definition in a map, e.g., `m_pParser->GetOprtDef(strTok)`.
+
+The crash happens inside this lookup process. The map's key is `string_type`, and the lookup is performed with `strTok.c_str()`. This requires creating a temporary `string_type` from the `const char*`. The `std::string` constructor for a `const char*` relies on the string being null-terminated to determine its length (via `strlen`).
+
+The crash log shows the out-of-bounds read happens on the buffer belonging to the main expression string (`m_strFormula`), not the local `strTok`'s buffer. This indicates that somewhere in the call chain, a pointer into `m_strFormula`'s buffer is being treated as a null-terminated C-style string, but it isn't. When `strlen` is called on this pointer, it reads past the end of the allocated heap buffer, causing the crash.
+
+This is a classic bug when handling substrings. The code extracts a substring but then uses a pointer to its beginning as if it were a standalone, null-terminated string. The fuzzer, by generating a long expression, has exposed this latent bug. The issue lies within the `muparser` library, not the fuzzer code.
+
+**Suggestion:**
+
+The project code should be reviewed to ensure that whenever a substring is processed, it is handled correctly. Instead of passing raw `const char*` pointers from substrings to functions expecting null-terminated strings, the code should use string constructors that take a pointer and a length, or iterators, to prevent reading past the intended end of the substring.
+
+Specifically, the `GetOprtDef`, `GetBinOprtDef`, and `GetInfixOprtDef` functions and their use of `find` on maps with `const char*` keys are suspicious. While the `std::string` overload is safe, the `const char*` overload is dangerous if the input is not guaranteed to be null-terminated. The library should consistently use `std::string` objects to represent tokens to avoid such issues.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/set_eval_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/set_eval_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

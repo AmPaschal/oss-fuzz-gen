@@ -1,0 +1,481 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project quickjs.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/quickjs/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include <stdio.h>
+
+#include "/src/quickjs/quickjs.h"
+#include "/src/quickjs/quickjs-libc.h"
+#include "/src/quickjs/cutils.h"
+
+static JSRuntime *rt = NULL;
+static JSContext *ctx = NULL;
+static int opaque_dummy_data = 123;
+
+// Dummy implementations for shared array buffer functions
+static void *sab_alloc(void *opaque, size_t size) {
+return malloc(size);
+}
+
+static void sab_free(void *opaque, void *ptr) {
+free(ptr);
+}
+
+static void sab_dup(void *opaque, void *ptr) {
+// Not needed for this fuzz target
+}
+
+static void my_free_func(JSRuntime *rt, void *opaque, void *ptr) {
+free(ptr);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (rt == NULL) {
+rt = JS_NewRuntime();
+if (!rt)
+return 0;
+JS_SetMemoryLimit(rt, 128 * 1024 * 1024);
+
+JSSharedArrayBufferFunctions sf;
+memset(&sf, 0, sizeof(sf));
+sf.sab_alloc = sab_alloc;
+sf.sab_free = sab_free;
+sf.sab_dup = sab_dup;
+JS_SetSharedArrayBufferFunctions(rt, &sf);
+
+ctx = JS_NewContext(rt);
+if (!ctx) {
+JS_FreeRuntime(rt);
+rt = NULL;
+return 0;
+}
+}
+
+if (size < 1) {
+return 0;
+}
+
+uint8_t mode = data[0];
+data++;
+size--;
+
+JSValue val = JS_UNDEFINED;
+uint8_t *allocated_buf = NULL;
+BOOL free_func_is_null = FALSE;
+
+switch (mode % 4) {
+case 0: { // Refined test case for JS_NewArrayBuffer
+if (size < 2) return 0;
+
+BOOL is_shared = (data[0] & 1);
+BOOL use_null_buf = (data[0] & 2);
+free_func_is_null = (data[1] & 1);
+BOOL use_null_opaque = (data[1] & 2);
+
+data += 2;
+size -= 2;
+
+size_t buf_size = size;
+if (buf_size > INT32_MAX) {
+buf_size = INT32_MAX;
+}
+
+uint8_t *fuzz_buf = NULL;
+if (!use_null_buf) {
+fuzz_buf = malloc(buf_size);
+if (!fuzz_buf) return 0;
+memcpy(fuzz_buf, data, buf_size);
+allocated_buf = fuzz_buf;
+}
+
+JSFreeArrayBufferDataFunc *free_func = free_func_is_null ? NULL : my_free_func;
+void *opaque = (free_func_is_null || use_null_opaque) ? NULL : &opaque_dummy_data;
+
+val = JS_NewArrayBuffer(ctx, fuzz_buf, buf_size, free_func, opaque, is_shared);
+break;
+}
+
+case 1: { // Test case: JS_NewArrayBufferCopy
+size_t buf_size = size;
+if (buf_size > INT32_MAX) {
+buf_size = INT32_MAX;
+}
+val = JS_NewArrayBufferCopy(ctx, data, buf_size);
+break;
+}
+
+case 2:
+case 3: { // Test case: JS_Eval("new ArrayBuffer(len)") or "new SharedArrayBuffer(len)"
+size_t len = 0;
+if (size >= sizeof(size_t)) {
+memcpy(&len, data, sizeof(size_t));
+} else if (size > 0) {
+len = data[0];
+}
+
+len = len % (1024 * 1024);
+if (len > INT32_MAX) {
+len = INT32_MAX;
+}
+
+char eval_buf[128];
+const char* constructor = ((mode % 4) == 2) ? "ArrayBuffer" : "SharedArrayBuffer";
+snprintf(eval_buf, sizeof(eval_buf), "new %s(%zu)", constructor, len);
+
+val = JS_Eval(ctx, eval_buf, strlen(eval_buf), "<fuzz>", JS_EVAL_TYPE_GLOBAL);
+break;
+}
+}
+
+if (JS_IsException(val)) {
+JSValue ex = JS_GetException(ctx);
+JS_FreeValue(ctx, ex);
+} else {
+JS_FreeValue(ctx, val);
+}
+
+// If we allocated a buffer and did NOT pass ownership to QuickJS
+// (by passing a NULL free_func), we are responsible for freeing it.
+// This applies whether the JSValue creation succeeded or failed, as
+// QuickJS will call the free_func on failure if one was provided.
+if (allocated_buf && free_func_is_null) {
+free(allocated_buf);
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: quickjs
+function signature: JSValue JS_NewArrayBuffer(JSContext *, uint8_t *, size_t, JSFreeArrayBufferDataFunc *, void *, BOOL)
+</input>
+
+<description>
+The `JS_NewArrayBuffer` function is a C API function in QuickJS used to create a JavaScript `ArrayBuffer` object from a C buffer. It is a wrapper around the internal `js_array_buffer_constructor3` function. It takes a `JSContext`, a pointer to a byte buffer, the buffer's length, a function pointer to a custom deallocator for the buffer, an opaque pointer that will be passed to the deallocator, and a boolean flag to indicate if the array buffer is shared.
+
+The function is used in the test262 runner (`run-test262.c`) to create a shared `ArrayBuffer` for inter-thread communication. In this usage, the buffer is obtained from an existing `ArrayBuffer` and the deallocation function is `NULL`, as the buffer's lifetime is managed by the original `ArrayBuffer`.
+
+The analysis of the function and its callees reveals several requirements for its inputs to ensure correct execution and avoid crashes. The most important one is the size of the buffer, which must not exceed `INT32_MAX`. Also, the relationship between the buffer and its size must be consistent. The custom deallocator, if provided, must be able to handle the provided buffer. Finally, to properly test the shared array buffer functionality, the runtime must be configured with the appropriate shared array buffer functions.
+</description>
+
+<requirements>
+<requirement>
+The `ctx` argument must be a valid `JSContext` created by `JS_NewContext`.
+This is a fundamental requirement for most QuickJS API functions, as the context holds the state of the JavaScript engine.
+</requirement>
+<requirement>
+The `len` argument must be less than or equal to `INT32_MAX`.
+The underlying function `js_array_buffer_constructor3` has a check that throws a `RangeError` if the length is greater than `INT32_MAX`.
+</requirement>
+<requirement>
+The `buf` and `len` arguments must be consistent.
+The `len` argument must represent the actual allocated size of the `buf` buffer to avoid out-of-bounds memory accesses.
+</requirement>
+<requirement>
+The `free_func` argument can be `NULL`. If not `NULL`, it must be a valid function that can deallocate the buffer passed as the `buf` argument.
+This is important for proper memory management and to avoid memory leaks or double frees.
+</requirement>
+<requirement>
+To test the shared `ArrayBuffer` functionality, `JS_SetSharedArrayBufferFunctions` should be called on the runtime associated with the context.
+If the `sab_dup` function is not set, the shared buffer duplication logic will be skipped, leading to incomplete testing of the shared array buffer functionality.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: attempting double-free on 0x5060000029c0 in thread T0:
+SCARINESS: 42 (double-free)
+#0 0x55a17c52d016 in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:52:3
+#1 0x55a17c56cf48 in LLVMFuzzerTestOneInput /src/quickjs/fuzz/fuzz_regexp.c:142:9
+#2 0x55a17c4214e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a17c420d05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a17c4224e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55a17c423275 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55a17c4120bb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a17c43d492 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f54fa99b082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#9 0x55a17c40493d in _start (out/libfuzzer-address-x86_64/fuzz_regexp+0x11193d)
+
+DEDUP_TOKEN: __interceptor_free--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+0x5060000029c0 is located 0 bytes inside of 62-byte region [0x5060000029c0,0x5060000029fe)
+freed by thread T0 here:
+#0 0x55a17c52d016 in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:52:3
+#1 0x55a17c609761 in js_array_buffer_finalizer /src/quickjs/quickjs.c:52689:13
+#2 0x55a17c60e379 in free_object /src/quickjs/quickjs.c:5763:9
+#3 0x55a17c588396 in free_gc_object /src/quickjs/quickjs.c:5794:9
+#4 0x55a17c588396 in free_zero_refcount /src/quickjs/quickjs.c:5822:9
+#5 0x55a17c588396 in __JS_FreeValueRT /src/quickjs/quickjs.c:5877:21
+#6 0x55a17c56ceff in JS_FreeValue /src/quickjs/quickjs.h:684:13
+#7 0x55a17c56ceff in LLVMFuzzerTestOneInput /src/quickjs/fuzz/fuzz_regexp.c:134:9
+#8 0x55a17c4214e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55a17c420d05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55a17c4224e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55a17c423275 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55a17c4120bb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55a17c43d492 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f54fa99b082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_free--js_array_buffer_finalizer--free_object
+previously allocated by thread T0 here:
+#0 0x55a17c52d2af in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55a17c56cfa2 in LLVMFuzzerTestOneInput /src/quickjs/fuzz/fuzz_regexp.c:85:28
+#2 0x55a17c4214e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a17c420d05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a17c4224e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55a17c423275 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55a17c4120bb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a17c43d492 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f54fa99b082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a double-free, but the root cause is a bug in the QuickJS library, not the fuzz driver.
+
+1.  The fuzz driver's `case 0` allocates a buffer, `allocated_buf`.
+2.  The crashing input causes `free_func_is_null` to be set to `TRUE`. Consequently, `JS_NewArrayBuffer` is called with a `NULL` `free_func`. This is a signal to the QuickJS engine that the caller (the fuzz driver) retains ownership of the buffer and will be responsible for freeing it.
+3.  The driver later calls `JS_FreeValue()`. The ASan stack trace shows that this triggers the `js_array_buffer_finalizer` inside QuickJS, which proceeds to `free` the buffer. This is incorrect behavior; QuickJS should not free a buffer for which it was not given a `free_func`.
+4.  Execution returns to the fuzz driver, which reaches its cleanup section. The condition `if (allocated_buf && free_func_is_null)` is evaluated. GDB inspection confirms that at this point, `allocated_buf` is a non-NULL pointer and `free_func_is_null` is `TRUE` (1).
+5.  The condition is met, and the driver correctly attempts to free the buffer it owns by calling `free(allocated_buf)`. This is the second `free`, which triggers the crash.
+
+The logic in the fuzz driver is correct: it only attempts to free the buffer when it explicitly told QuickJS not to. The bug is in QuickJS for freeing a buffer it does not own. This likely happens under a specific combination of parameters passed to `JS_NewArrayBuffer`, possibly related to the `is_shared` flag.
+
+**Suggestion:**
+The QuickJS project code needs to be patched. The `js_array_buffer_finalizer` function in `quickjs.c` (and any related finalizers for shared array buffers) must be modified to honor the contract of `JS_NewArrayBuffer`. It must check if a `free_func` was provided before attempting to free the buffer's data pointer.
+
+A potential fix would involve adding a check within the finalizer:
+```c
+// In js_array_buffer_finalizer or similar function
+JSArrayBuffer *abuf = JS_GetOpaque(val, JS_CLASS_ARRAY_BUFFER);
+if (abuf) {
+// This check is crucial and appears to be missing or bypassed.
+if (abuf->free_func) {
+abuf->free_func(rt, abuf->opaque, abuf->data);
+}
+js_free_rt(rt, abuf); // Free the JSArrayBuffer struct itself.
+}
+```
+The logic that frees the external data buffer must be strictly conditional on a non-NULL `free_func`.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/quickjs/fuzz/fuzz_regexp.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/quickjs/fuzz/fuzz_regexp.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

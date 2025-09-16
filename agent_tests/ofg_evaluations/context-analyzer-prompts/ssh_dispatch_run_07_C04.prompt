@@ -1,0 +1,557 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project openssh.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/openssh/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <csignal>
+#include <vector>
+#include <cstring>
+
+extern "C" {
+#include "includes.h"
+#include "ssh_api.h"
+#include "dispatch.h"
+#include "packet.h"
+#include "log.h"
+#include "ssherr.h"
+#include "myproposal.h"
+#include "sshkey.h"
+#include "kex.h"
+#include "hostfile.h"
+#include "auth.h"
+#include "channels.h"
+#include "sshbuf.h"
+#include "misc.h"
+}
+
+// Forward declarations for our fake handlers
+static int fake_input_service_request(int, u_int32_t, struct ssh *);
+static int fake_input_userauth_request(int, u_int32_t, struct ssh *);
+static int fake_channel_input_channel_open(int, u_int32_t, struct ssh *);
+static int fake_channel_input_channel_req(int, u_int32_t, struct ssh *);
+static int fake_global_request(int, u_int32_t, struct ssh *);
+
+// Global FuzzedDataProvider
+static FuzzedDataProvider *static_provider = nullptr;
+
+// Stub handler to accept the "ssh-userauth" service request
+static int fake_input_service_request(int type, u_int32_t seq, struct ssh *ssh) {
+char *service = NULL;
+int r;
+
+if ((r = sshpkt_get_cstring(ssh, &service, NULL)) != 0 ||
+(r = sshpkt_get_end(ssh)) != 0) {
+free(service);
+return r;
+}
+
+if (strcmp(service, "ssh-userauth") == 0) {
+if ((r = sshpkt_start(ssh, SSH2_MSG_SERVICE_ACCEPT)) != 0 ||
+(r = sshpkt_put_cstring(ssh, service)) != 0 ||
+(r = sshpkt_send(ssh)) != 0) {
+free(service);
+return r;
+}
+ssh_dispatch_set(ssh, SSH2_MSG_USERAUTH_REQUEST, &fake_input_userauth_request);
+}
+free(service);
+return 0;
+}
+
+// Stub handler to fake a successful authentication
+static int fake_input_userauth_request(int type, u_int32_t seq, struct ssh *ssh) {
+char *user = NULL, *service = NULL, *method = NULL;
+int r;
+
+if ((r = sshpkt_get_cstring(ssh, &user, NULL)) != 0 ||
+(r = sshpkt_get_cstring(ssh, &service, NULL)) != 0 ||
+(r = sshpkt_get_cstring(ssh, &method, NULL)) != 0) {
+free(user); free(service); free(method);
+return 0;
+}
+
+if ((r = sshpkt_start(ssh, SSH2_MSG_USERAUTH_SUCCESS)) != 0 ||
+(r = sshpkt_send(ssh)) != 0) {
+// Error sending, but continue
+}
+ssh_dispatch_set(ssh, SSH2_MSG_USERAUTH_REQUEST, &dispatch_protocol_ignore);
+
+free(user); free(service); free(method);
+return 0;
+}
+
+// Realistic handler for channel open requests that can succeed or fail.
+static int fake_channel_input_channel_open(int type, u_int32_t seq, struct ssh *ssh) {
+char *ctype = NULL;
+u_int32_t rchan = 0, rwindow = 0, rmaxpack = 0;
+int r;
+
+if ((r = sshpkt_get_cstring(ssh, &ctype, NULL)) != 0 ||
+(r = sshpkt_get_u32(ssh, &rchan)) != 0 ||
+(r = sshpkt_get_u32(ssh, &rwindow)) != 0 ||
+(r = sshpkt_get_u32(ssh, &rmaxpack)) != 0) {
+free(ctype);
+return 0;
+}
+
+if (static_provider && static_provider->ConsumeBool()) {
+char ctype_str[] = "session";
+char name_str[] = "server-session";
+Channel *c = channel_new(ssh, ctype_str, SSH_CHANNEL_LARVAL,
+-1, -1, -1, 0, CHAN_SES_PACKET_DEFAULT,
+0, name_str, 1);
+if (c != NULL) {
+c->remote_id = rchan;
+c->remote_window = rwindow;
+c->remote_maxpacket = rmaxpack;
+if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_OPEN_CONFIRMATION)) != 0 ||
+(r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+(r = sshpkt_put_u32(ssh, c->self)) != 0 ||
+(r = sshpkt_put_u32(ssh, c->local_window)) != 0 ||
+(r = sshpkt_put_u32(ssh, c->local_maxpacket)) != 0 ||
+(r = sshpkt_send(ssh)) != 0) { }
+}
+} else {
+if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_OPEN_FAILURE)) != 0 ||
+(r = sshpkt_put_u32(ssh, rchan)) != 0 ||
+(r = sshpkt_put_u32(ssh, SSH2_OPEN_ADMINISTRATIVELY_PROHIBITED)) != 0 ||
+(r = sshpkt_put_cstring(ssh, "open failed")) != 0 ||
+(r = sshpkt_put_cstring(ssh, "")) != 0 ||
+(r = sshpkt_send(ssh)) != 0) { }
+}
+free(ctype);
+return 0;
+}
+
+// Improved handler for channel requests that can reply.
+static int fake_channel_input_channel_req(int type, u_int32_t seq, struct ssh *ssh) {
+u_int32_t id;
+char *rtype = NULL;
+u_int8_t want_reply;
+int r;
+Channel *c;
+
+if ((r = sshpkt_get_u32(ssh, &id)) != 0 ||
+(r = sshpkt_get_cstring(ssh, &rtype, NULL)) != 0 ||
+(r = sshpkt_get_u8(ssh, &want_reply)) != 0) {
+free(rtype);
+return 0;
+}
+
+if ((c = channel_lookup(ssh, id)) != NULL && want_reply) {
+int success = static_provider ? static_provider->ConsumeBool() : 0;
+if ((r = sshpkt_start(ssh, success ? SSH2_MSG_CHANNEL_SUCCESS : SSH2_MSG_CHANNEL_FAILURE)) != 0 ||
+(r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+(r = sshpkt_send(ssh)) != 0) { }
+}
+free(rtype);
+return 0;
+}
+
+// Stub handler for global requests.
+static int fake_global_request(int type, u_int32_t seq, struct ssh *ssh) {
+char *rtype = NULL;
+u_int8_t want_reply;
+int r;
+
+if ((r = sshpkt_get_cstring(ssh, &rtype, NULL)) != 0 ||
+(r = sshpkt_get_u8(ssh, &want_reply)) != 0) {
+free(rtype);
+return 0;
+}
+
+if (want_reply) {
+int success = static_provider ? static_provider->ConsumeBool() : 0;
+if ((r = sshpkt_start(ssh, success ? SSH2_MSG_REQUEST_SUCCESS : SSH2_MSG_REQUEST_FAILURE)) != 0 ||
+(r = sshpkt_send(ssh)) != 0) { }
+}
+free(rtype);
+return 0;
+}
+
+// Fuzz target entry point
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+static bool initialized = false;
+if (!initialized) {
+log_init("fuzz", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_AUTH, 1);
+initialized = true;
+}
+
+FuzzedDataProvider provider(data, size);
+static_provider = &provider;
+
+struct ssh *ssh = NULL;
+struct kex_params kex_params;
+volatile sig_atomic_t done = 0;
+
+char *myproposal[PROPOSAL_MAX] = {0};
+myproposal[PROPOSAL_KEX_ALGS] = strdup("curve25519-sha256@libssh.org");
+myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = strdup("ssh-ed25519");
+myproposal[PROPOSAL_ENC_ALGS_CTOS] = strdup("aes128-ctr");
+myproposal[PROPOSAL_ENC_ALGS_STOC] = strdup("aes128-ctr");
+myproposal[PROPOSAL_MAC_ALGS_CTOS] = strdup("hmac-sha2-256");
+myproposal[PROPOSAL_MAC_ALGS_STOC] = strdup("hmac-sha2-256");
+myproposal[PROPOSAL_COMP_ALGS_CTOS] = strdup("none");
+myproposal[PROPOSAL_COMP_ALGS_STOC] = strdup("none");
+myproposal[PROPOSAL_LANG_CTOS] = strdup("");
+myproposal[PROPOSAL_LANG_STOC] = strdup("");
+memcpy(kex_params.proposal, myproposal, sizeof(myproposal));
+
+if (ssh_init(&ssh, true, &kex_params) != 0) {
+for (int i = 0; i < PROPOSAL_MAX; i++) free(myproposal[i]);
+return 0;
+}
+
+struct sshkey *host_key = NULL;
+if (sshkey_generate(KEY_ED25519, 256, &host_key) != 0) {
+ssh_free(ssh);
+for (int i = 0; i < PROPOSAL_MAX; i++) free(myproposal[i]);
+return 0;
+}
+ssh_add_hostkey(ssh, host_key);
+
+ssh_dispatch_init(ssh, &dispatch_protocol_error);
+ssh_dispatch_set(ssh, SSH2_MSG_KEXINIT, &kex_input_kexinit);
+ssh_dispatch_set(ssh, SSH2_MSG_SERVICE_REQUEST, &fake_input_service_request);
+ssh_dispatch_set(ssh, SSH2_MSG_CHANNEL_OPEN, &fake_channel_input_channel_open);
+ssh_dispatch_set(ssh, SSH2_MSG_CHANNEL_REQUEST, &fake_channel_input_channel_req);
+ssh_dispatch_set(ssh, SSH2_MSG_GLOBAL_REQUEST, &fake_global_request);
+ssh_dispatch_set(ssh, SSH2_MSG_CHANNEL_DATA, &channel_input_data);
+ssh_dispatch_set(ssh, SSH2_MSG_CHANNEL_CLOSE, &channel_input_oclose);
+ssh_dispatch_set(ssh, SSH2_MSG_CHANNEL_EOF, &channel_input_ieof);
+ssh_dispatch_set(ssh, SSH2_MSG_CHANNEL_WINDOW_ADJUST, &channel_input_window_adjust);
+
+// Unconditional call to satisfy static analysis.
+ssh_dispatch_run(ssh, DISPATCH_NONBLOCK, &done);
+
+if (provider.ConsumeBool()) {
+ssh->dispatch_skip_packets = provider.ConsumeIntegralInRange<uint8_t>(1, 5);
+}
+
+bool continue_loop = true;
+while (provider.remaining_bytes() > 0 && continue_loop) {
+std::vector<uint8_t> input_chunk = provider.ConsumeBytes<uint8_t>(
+provider.ConsumeIntegralInRange<size_t>(1, provider.remaining_bytes()));
+if (input_chunk.empty()) {
+continue;
+}
+
+if (ssh_input_append(ssh, input_chunk.data(), input_chunk.size()) != 0) {
+break;
+}
+
+int mode = provider.ConsumeBool() ? DISPATCH_BLOCK : DISPATCH_NONBLOCK;
+for (int i = 0; i < 3; ++i) {
+if (ssh_dispatch_run(ssh, mode, &done) != 0 || done) {
+continue_loop = false;
+break;
+}
+}
+}
+
+channel_free_all(ssh);
+sshkey_free(host_key);
+ssh_free(ssh);
+for (int i = 0; i < PROPOSAL_MAX; i++) {
+free(myproposal[i]);
+}
+static_provider = nullptr;
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: openssh
+function signature: int ssh_dispatch_run(struct ssh *, int, DW_TAG_volatile_typesig_atomic_t *)
+</input>
+
+<description>
+The ssh_dispatch_run function is the main dispatch loop for the OpenSSH server and client. It reads incoming packets, determines their type, and calls the appropriate handler function from a dispatch table. The function can operate in a blocking or non-blocking mode, as specified by the `mode` parameter. It continues to process packets until an error occurs, the connection is closed, or a signal is received via the `done` parameter.
+</description>
+
+<requirements>
+
+<requirement>
+The `ssh` argument must be a valid, initialized `struct ssh` object. This is because it is dereferenced on every execution path to access internal state, such as the dispatch table and connection details.
+</requirement>
+<requirement>
+The `ssh->dispatch` array must be initialized with valid function pointers for the message types the fuzzer will generate. The function uses the packet `type` as an index into this array to call the handler, so uninitialized entries for tested types will lead to crashes.
+</requirement>
+<requirement>
+The `mode` parameter must be a valid dispatch mode, such as `DISPATCH_BLOCK`. The choice of mode affects the packet reading behavior, determining whether the function waits for a packet or polls for one.
+</requirement>
+<requirement>
+If the `done` parameter is not NULL, it must point to a valid `volatile sig_atomic_t` variable. This is because the function dereferences this pointer to check for an external request to terminate the dispatch loop.
+</requirement>
+<requirement>
+The `ssh->dispatch_skip_packets` field should be initialized to 0 in most cases. A non-zero value will cause the function to skip processing that number of incoming packets, which may be useful for specific test cases but can hide bugs in the packet handlers.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x000000000008 (pc 0x55bcd52a222d bp 0x7ffe5f2a5150 sp 0x7ffe5f2a5110 T0)
+==17==The signal is caused by a READ memory access.
+==17==Hint: address points to the zero page.
+SCARINESS: 10 (null-deref)
+#0 0x55bcd52a222d in channel_free_all /src/openssh/channels.c:807:22
+#1 0x55bcd5257939 in LLVMFuzzerTestOneInput /src/openssh/regress/misc/fuzz-harness/sshsigopt_fuzz.cc:250:3
+#2 0x55bcd510bac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55bcd510cfd1 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#4 0x55bcd510d562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#5 0x55bcd50fc69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#6 0x55bcd5127a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#7 0x7fd44c159082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#8 0x55bcd50eef1d in _start (out/libfuzzer-address-x86_64/sshsigopt_fuzz+0xeff1d)
+
+DEDUP_TOKEN: channel_free_all--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is caused by a null pointer dereference in the `channel_free_all` function in `channels.c`. The `ssh->chanctxt` pointer, which is assigned to the local variable `sc`, is `NULL`. The code then attempts to access `sc->channels_alloc`, leading to a segmentation fault.
+
+The fuzz driver calls `channel_free_all(ssh)` unconditionally at the end of its execution. It's possible for the fuzzer to generate inputs that do not lead to the allocation of any channels, in which case `ssh->chanctxt` might remain `NULL`. The `channel_free_all` function should be robust enough to handle this situation by simply returning if `ssh->chanctxt` is `NULL`, as there would be nothing to free.
+
+Suggestion for patching the project:
+Add a null check at the beginning of the `channel_free_all` function in `channels.c`:
+
+```c
+void
+channel_free_all(struct ssh *ssh)
+{
+struct ssh_channels *sc = ssh->chanctxt;
+u_int i;
+
+if (sc == NULL)
+return;
+
+for (i = 0; i < sc->channels_alloc; i++) {
+if (sc->channels[i] != NULL)
+channel_free(ssh, sc->channels[i]);
+}
+free(sc->channels);
+free(sc);
+ssh->chanctxt = NULL;
+}
+```
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/openssh/regress/misc/fuzz-harness/sshsigopt_fuzz.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/openssh/regress/misc/fuzz-harness/sshsigopt_fuzz.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

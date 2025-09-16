@@ -1,0 +1,482 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project glslang.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/glslang/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include "glslang/Public/ResourceLimits.h"
+#include "glslang/Public/ShaderLang.h"
+#include "glslang/HLSL/hlslGrammar.h"
+#include <string>
+#include <vector>
+#include <cctype>
+#include <set>
+
+// Helper to generate a simple, plausible body for a member function.
+std::string generate_function_body(FuzzedDataProvider& provider) {
+if (provider.ConsumeBool()) {
+return "{}";
+}
+return "{ float x = 1.0; return x; }";
+}
+
+// Helper to generate an optional attribute.
+std::string generate_attribute(FuzzedDataProvider& provider) {
+if (provider.ConsumeBool()) {
+const char* attributes[] = {"[fastopt]", "[unroll]", "[allow_uav_condition]"};
+return std::string(provider.PickValueInArray(attributes)) + " ";
+}
+return "";
+}
+
+// Helper to generate a data or function member declaration.
+std::string generate_member(FuzzedDataProvider& provider, const std::string& struct_name, bool is_class, const std::vector<std::string>& known_structs) {
+std::vector<const char*> types = {"void", "int", "float", "float2", "float3", "float4", "bool"};
+// With some probability, use a previously defined struct as a member type
+if (!known_structs.empty() && provider.ConsumeBool()) {
+size_t index = provider.ConsumeIntegralInRange<size_t>(0, known_structs.size() - 1);
+types.push_back(known_structs[index].c_str());
+}
+
+const char* member_type = types[provider.ConsumeIntegralInRange<size_t>(0, types.size() - 1)];
+std::string member_name = provider.ConsumeRandomLengthString(10);
+if (member_name.empty() || !isalpha(member_name[0])) {
+member_name = "m" + member_name;
+}
+// Sanitize name
+for (char& c : member_name) {
+if (!isalnum(c)) c = '_';
+}
+
+
+// Decide whether to generate a function or a data member.
+if (provider.ConsumeBool()) {
+// Generate a function member.
+// With some probability, generate a constructor or destructor for classes
+if (is_class && provider.ConsumeBool()) {
+if (provider.ConsumeBool()) {
+member_name = struct_name; // Constructor
+} else {
+member_name = "~" + struct_name; // Destructor
+}
+}
+
+std::string params = "()";
+if (provider.ConsumeBool()) {
+const char* param_type = types[provider.ConsumeIntegralInRange<size_t>(0, types.size() - 1)];
+if (strcmp(param_type, "void") != 0) {
+params = "(" + std::string(param_type) + " p)";
+}
+}
+return generate_attribute(provider) + std::string(member_type) + " " + member_name + params + " " + generate_function_body(provider);
+} else {
+// Generate a data member.
+if (strcmp(member_type, "void") == 0) {
+member_type = "float";
+}
+std::string member_decl = generate_attribute(provider) + std::string(member_type) + " " + member_name;
+if (provider.ConsumeBool()) {
+member_decl += "[" + std::to_string(provider.ConsumeIntegralInRange<int>(1, 16)) + "]";
+}
+// Optionally add an initializer
+if (provider.ConsumeBool() && strcmp(member_type, "int") == 0) {
+member_decl += " = " + std::to_string(provider.ConsumeIntegral<int>());
+}
+return member_decl + ";";
+}
+}
+
+// Generates a struct/class/cbuffer/tbuffer definition
+std::string generate_struct_definition(FuzzedDataProvider& provider, const std::string& struct_name, const std::vector<std::string>& known_structs) {
+const char* keywords[] = {"struct", "class", "cbuffer", "tbuffer"};
+const char* keyword = provider.PickValueInArray(keywords);
+bool is_class = (strcmp(keyword, "class") == 0);
+
+std::string fuzzed_body;
+int num_members = provider.ConsumeIntegralInRange<int>(0, 5);
+for (int i = 0; i < num_members; ++i) {
+fuzzed_body += generate_member(provider, struct_name, is_class, known_structs) + " ";
+}
+
+return generate_attribute(provider) + std::string(keyword) + " " + struct_name + " { " + fuzzed_body + " };";
+}
+
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+glslang::InitializeProcess();
+
+FuzzedDataProvider provider(data, size);
+std::string shader_code;
+
+// To hit the `if (! acceptTokenClass(EHTokLeftBrace))` path, we need to generate
+// a struct definition first, and then a separate declaration using that struct type.
+// We'll use a bool to switch between two generation strategies.
+if (provider.ConsumeBool()) {
+// STRATEGY 1: Define a struct and then declare a variable of that type.
+// This targets the missed branch.
+std::vector<std::string> preamble_struct_names;
+int num_preamble_structs = provider.ConsumeIntegralInRange(1, 3);
+for (int i = 0; i < num_preamble_structs; ++i) {
+std::string name = "PreambleStruct" + std::to_string(i);
+shader_code += generate_struct_definition(provider, name, preamble_struct_names);
+preamble_struct_names.push_back(name);
+}
+
+// Now, declare a variable of one of the defined struct types.
+std::string chosen_struct = preamble_struct_names[provider.ConsumeIntegralInRange<size_t>(0, preamble_struct_names.size() - 1)];
+std::string var_name = "g_" + provider.ConsumeRandomLengthString(8);
+shader_code += "struct " + chosen_struct + " " + var_name + ";";
+
+} else {
+// STRATEGY 2: The original approach, but enhanced.
+// Define a single struct, potentially with an instance and post-decls.
+const char* keywords[] = {"struct", "class", "cbuffer", "tbuffer"};
+const char* keyword = provider.PickValueInArray(keywords);
+bool is_class = (strcmp(keyword, "class") == 0);
+
+std::string struct_name = "S";
+std::string fuzzed_body;
+int num_members = provider.ConsumeIntegralInRange<int>(0, 5);
+for (int i = 0; i < num_members; ++i) {
+fuzzed_body += generate_member(provider, struct_name, is_class, {});
+}
+
+std::string post_decl_part;
+if (provider.ConsumeBool()) {
+const char* semantics[] = {
+": SV_Position", ": COLOR0", ": TEXCOORD0",
+": register(b0)", ": register(t1, space1)", ": register(u2, space3)",
+": packoffset(c0)", ": packoffset(c1.y)", // For packoffset coverage
+"layout(row_major)", "layout(column_major)" // For layout coverage
+};
+post_decl_part = " " + std::string(provider.PickValueInArray(semantics));
+}
+
+std::string post_struct_decl;
+if (provider.ConsumeBool()) {
+std::string var_name = provider.ConsumeRandomLengthString(8);
+if (var_name.empty() || !isalpha(var_name[0])) {
+var_name = "g_" + var_name;
+}
+post_struct_decl = " " + var_name;
+}
+
+shader_code = generate_attribute(provider) + std::string(keyword) + " " + struct_name +
+" { " + fuzzed_body + " }" + post_struct_decl + post_decl_part + ";";
+}
+
+// Add a simple entry point to make the shader more valid.
+shader_code += " void main() {}";
+
+const char* code_c_str = shader_code.c_str();
+const int code_len = static_cast<int>(shader_code.length());
+const EShMessages messages = EShMsgReadHlsl;
+
+glslang::TShader shader(EShLangVertex);
+shader.setStringsWithLengths(&code_c_str, &code_len, 1);
+shader.setEntryPoint("main");
+
+shader.parse(GetDefaultResources(), 100, false, messages);
+
+glslang::TProgram program;
+program.addShader(&shader);
+program.link(messages);
+
+glslang::FinalizeProcess();
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: glslang
+function signature: bool glslang::HlslGrammar::acceptStruct(TType &, TIntermNode *&)
+</input>
+
+<description>
+The function `acceptStruct` is a component of a recursive descent parser responsible for parsing HLSL struct, class, cbuffer, and tbuffer definitions. It consumes tokens from a token stream, builds a `TType` representation of the structure, and generates an abstract syntax tree (AST) in the form of a `TIntermNode` list for member functions. The function is called when the parser encounters one of the keywords 'struct', 'class', 'cbuffer', or 'tbuffer'. It handles parsing the structure's name, its members (including member functions), and any associated qualifiers. For member functions, it performs deferred parsing after the enclosing structure type is fully defined to correctly handle the implicit 'this' parameter.
+</description>
+
+<requirements>
+<requirement>
+The `HlslGrammar` object must be initialized with a valid token stream before calling `acceptStruct`. This is because the function relies on the `peek()` and `advanceToken()` methods to process the input source code.
+</requirement>
+<requirement>
+The `type` argument, a reference to a `TType` object, must point to a valid memory location of at least `sizeof(TType)`. The function uses placement new to construct a `TType` object in this memory, so the initial content of the memory is not important.
+</requirement>
+<requirement>
+The `nodeList` argument, a reference to a `TIntermNode*`, should be initialized to `nullptr`. This is because the function will allocate and link AST nodes for member functions and assign the head of the list to this pointer.
+</requirement>
+<requirement>
+The `parseContext` member of the `HlslGrammar` object must be in a valid, initialized state. This is because the function uses the `parseContext` to manage the symbol table and other parsing-related state.
+</requirement>
+<requirement>
+The token stream should begin with one of the keywords 'struct', 'class', 'cbuffer', or 'tbuffer', followed by a syntactically valid structure definition. This is because the function's logic is predicated on the presence of one of these keywords, and it will fail to parse correctly otherwise.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address (pc 0x55c79a9fbf57 bp 0x7ffe58c52c50 sp 0x7ffe58c52c00 T0)
+==17==The signal is caused by a READ memory access.
+==17==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+SCARINESS: 20 (wild-addr-read)
+#0 0x55c79a9fbf57 in getStructBufferContentType /src/glslang/glslang/HLSL/hlslParseHelper.cpp:7007:61
+#1 0x55c79a9fbf57 in isStructBufferType /src/glslang/glslang/HLSL/hlslParseHelper.h:309:63
+#2 0x55c79a9fbf57 in isReference /src/glslang/glslang/HLSL/hlslParseHelper.h:318:56
+#3 0x55c79a9fbf57 in glslang::HlslParseContext::remapNonEntryPointIO(glslang::TFunction&) /src/glslang/glslang/HLSL/hlslParseHelper.cpp:2439:14
+#4 0x55c79a9f2138 in glslang::HlslParseContext::transformEntryPoint(glslang::TSourceLoc const&, glslang::TFunction&, glslang::TList<glslang::TAttributeArgs> const&) /src/glslang/glslang/HLSL/hlslParseHelper.cpp:2076:9
+#5 0x55c79a9efe38 in glslang::HlslParseContext::handleFunctionDefinition(glslang::TSourceLoc const&, glslang::TFunction&, glslang::TList<glslang::TAttributeArgs> const&, TIntermNode*&) /src/glslang/glslang/HLSL/hlslParseHelper.cpp:1675:22
+#6 0x55c79aab3003 in glslang::HlslGrammar::acceptFunctionBody(glslang::TFunctionDeclarator&, TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:2983:46
+#7 0x55c79aab0f7e in glslang::HlslGrammar::acceptStruct(glslang::TType&, TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:2486:15
+#8 0x55c79aaa53c3 in glslang::HlslGrammar::acceptType(glslang::TType&, TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:1608:16
+#9 0x55c79aa9eea7 in glslang::HlslGrammar::acceptFullySpecifiedType(glslang::TType&, TIntermNode*&, glslang::TList<glslang::TAttributeArgs> const&, bool) /src/glslang/glslang/HLSL/hlslGrammar.cpp:616:11
+#10 0x55c79aa9a7ae in glslang::HlslGrammar::acceptDeclaration(TIntermNode*&) /src/glslang/glslang/HLSL/hlslGrammar.cpp:380:11
+#11 0x55c79aa99510 in acceptDeclarationList /src/glslang/glslang/HLSL/hlslGrammar.cpp:165:15
+#12 0x55c79aa99510 in glslang::HlslGrammar::acceptCompilationUnit() /src/glslang/glslang/HLSL/hlslGrammar.cpp:130:11
+#13 0x55c79a9ca116 in glslang::HlslParseContext::parseShaderStrings(glslang::TPpContext&, glslang::TInputScanner&, bool) /src/glslang/glslang/HLSL/hlslParseHelper.cpp:132:18
+#14 0x55c79a8adcb2 in operator() /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1233:28
+#15 0x55c79a8adcb2 in ProcessDeferred<(anonymous namespace)::DoFullParse> /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1008:20
+#16 0x55c79a8adcb2 in (anonymous namespace)::CompileDeferred(TCompiler*, char const* const*, int, int const*, char const* const*, char const*, EShOptimizationLevel, TBuiltInResource const*, int, EProfile, bool, int, bool, EShMessages, glslang::TIntermediate&, glslang::TShader::Includer&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, glslang::TEnvironment*, bool) /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1321:12
+#17 0x55c79a8b4dd3 in glslang::TShader::parse(TBuiltInResource const*, int, EProfile, bool, bool, EShMessages, glslang::TShader::Includer&) /src/glslang/glslang/MachineIndependent/ShaderLang.cpp:1893:12
+#18 0x55c79a8a575f in parse /src/glslang/glslang/../glslang/Public/ShaderLang.h:676:16
+#19 0x55c79a8a575f in parse /src/glslang/glslang/../glslang/Public/ShaderLang.h:682:16
+#20 0x55c79a8a575f in LLVMFuzzerTestOneInput /src/compile_fuzzer.cc:174:12
+#21 0x55c79a752880 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#22 0x55c79a7520a5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#23 0x55c79a753885 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#24 0x55c79a754615 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#25 0x55c79a74345b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#26 0x55c79a76e832 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#27 0x7fa58d9e5082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#28 0x55c79a735cdd in _start (out/libfuzzer-address-x86_64/compile_fuzzer+0x288cdd)
+
+DEDUP_TOKEN: getStructBufferContentType--isStructBufferType--isReference
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The root cause of the crash is an infinite recursion bug within the glslang project's source code. The investigation revealed the following:
+1.  The function `isStructBufferType` calls `getStructBufferContentType`.
+2.  The function `getStructBufferContentType` contains an `assert` that, in turn, calls `isStructBufferType`.
+This creates a circular dependency, leading to unbounded recursion that exhausts the call stack and causes a segmentation fault.
+
+The fuzz driver is not at fault. Its purpose is to generate a wide variety of inputs, including syntactically valid but complex cases that may expose latent bugs in the target library. The fuzzer correctly uses the glslang API to parse the generated shader code. The crash is a result of the glslang library's inability to handle this specific, fuzzer-generated input without crashing, which indicates a bug in the library itself.
+
+**Suggestion:**
+The bug in the glslang project should be fixed by removing the circular dependency. The `assert(isStructBufferType(type));` on line 7006 of `/src/glslang/glslang/HLSL/hlslParseHelper.cpp` is the direct cause of the infinite recursion and should be removed. The function's documentation implies that it should only be called on types that are already known to be struct buffers, making the assert redundant and, in this case, harmful. Removing the assert will break the recursive loop and resolve the crash.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/compile_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/compile_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

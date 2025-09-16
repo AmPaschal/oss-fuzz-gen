@@ -1,0 +1,486 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project cmake.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/CMake/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+#include <numeric>
+
+// Define C-specific calling convention macros to be empty to allow compilation
+// in C++. These are used inside the Expat internal headers.
+#define PTRCALL
+#define PTRFASTCALL
+#define FASTCALL
+
+extern "C" {
+// These headers are required for the definitions used in xmltok.h
+#include "/src/CMake/build-dir/Utilities/cmexpat/expat_config.h"
+#include "/src/CMake/Utilities/cmexpat/lib/expat_external.h"
+#include "/src/CMake/Utilities/cmexpat/lib/xmltok.h"
+
+// This function is not in a public header but is required to get the
+// allocation size. It is exported by the library.
+int XmlSizeOfUnknownEncoding(void);
+}
+
+// A simple converter function to satisfy the CONVERTER function pointer type.
+static int dummy_converter(void* userData, const char* p) {
+(void)userData;
+if (!p) {
+return -1;
+}
+// Simply interpret the byte as a character code.
+return static_cast<int>(static_cast<unsigned char>(*p));
+}
+
+// Generates a character code that is valid for XmlInitUnknownEncoding.
+// Avoids surrogates (0xD800-0xDFFF) and 0xFFFE, 0xFFFF.
+int GenerateValidChar(FuzzedDataProvider& stream) {
+int c = stream.ConsumeIntegralInRange<int>(0, 0xFFFD - (0xDFFF - 0xD800));
+if (c >= 0xD800) {
+c += (0xDFFF - 0xD800 + 1);
+}
+return c;
+}
+
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+FuzzedDataProvider stream(data, size);
+
+int table[256];
+void* user_data = nullptr;
+
+// Requirement: The first 128 table entries for non-BT_OTHER/BT_NONXML
+// characters must map i to i. To satisfy this while still allowing fuzzing,
+// we initialize the first 128 entries to be identity-mapped, which is a
+// valid configuration. We will fuzz the upper 128 entries.
+for (int i = 0; i < 128; ++i) {
+table[i] = i;
+}
+
+// Fuzz the upper 128 entries of the table with values in the valid range.
+bool multi_byte_char_present = false;
+for (int i = 128; i < 256; ++i) {
+// There are 3 main paths to choose from:
+// 1. A valid single-byte char (c >= 0)
+// 2. A malformed sequence (c == -1)
+// 3. A multi-byte sequence (c < -1)
+switch (stream.ConsumeIntegralInRange<int>(0, 2)) {
+case 0:
+table[i] = GenerateValidChar(stream);
+break;
+case 1:
+table[i] = -1; // BT_MALFORM
+break;
+case 2:
+table[i] = stream.ConsumeIntegralInRange<int>(-4, -2); // BT_LEAD
+multi_byte_char_present = true;
+break;
+}
+}
+
+CONVERTER convert_func = &dummy_converter;
+// The function must return NULL if a multi-byte char is present but the
+// converter is NULL. We need to fuzz this path. The old logic prevented this.
+if (multi_byte_char_present) {
+if (stream.ConsumeBool()) {
+convert_func = nullptr;
+}
+}
+
+// Requirement: The `mem` parameter must be a pointer to a memory block of at
+// least `sizeof(struct unknown_encoding)`.
+size_t mem_size = XmlSizeOfUnknownEncoding();
+if (mem_size == 0) {
+return 0;
+}
+std::vector<uint8_t> mem_buffer(mem_size);
+
+// Call the function under test.
+ENCODING* enc =
+XmlInitUnknownEncoding(mem_buffer.data(), table, convert_func, user_data);
+
+// If the encoding was created successfully, use it to parse some data.
+// This will exercise the function pointers set up in the ENCODING struct
+// and improve session coverage.
+if (enc) {
+std::vector<char> source_data = stream.ConsumeRemainingBytes<char>();
+if (!source_data.empty()) {
+// Test utf8Convert
+const char* from = source_data.data();
+const char* from_lim = from + source_data.size();
+std::vector<char> utf8_dest(source_data.size() * 4 + 4);
+char* to = utf8_dest.data();
+const char* to_lim = to + utf8_dest.size();
+if (enc->utf8Convert) {
+enc->utf8Convert(enc, &from, from_lim, &to, to_lim);
+}
+
+// Test utf16Convert
+from = source_data.data(); // Reset source pointer
+from_lim = from + source_data.size();
+std::vector<unsigned short> utf16_dest(source_data.size() + 2);
+unsigned short* to16 = utf16_dest.data();
+const unsigned short* to16_lim = to16 + utf16_dest.size();
+if (enc->utf16Convert) {
+enc->utf16Convert(enc, &from, from_lim, &to16, to16_lim);
+}
+}
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: cmake
+function signature: ENCODING * XmlInitUnknownEncoding(void *, int *, CONVERTER, void *)
+</input>
+
+<description>
+The `XmlInitUnknownEncoding` function initializes a custom encoding structure for the Expat XML parser. This function is called when the parser encounters an encoding that it does not know how to handle internally. It takes a pre-allocated memory block `mem`, a 256-integer mapping `table`, a `CONVERTER` function pointer `convert`, and a `userData` pointer to be passed to the converter. The function populates the `mem` block, which is treated as a `struct unknown_encoding`, based on the provided `table`. The `table` maps single-byte values to Unicode character codes. If a mapping indicates a multi-byte character, the `convert` function is required to perform the conversion. The function returns a pointer to the initialized `ENCODING` structure within the `unknown_encoding` struct, or `NULL` if the configuration is invalid.
+</description>
+
+<requirements>
+<requirement>
+The `mem` parameter must be a pointer to a memory block of at least `sizeof(struct unknown_encoding)`. This is because the function casts `mem` to a `struct unknown_encoding` pointer and writes to it.
+</requirement>
+<requirement>
+The `table` parameter must be a pointer to an integer array of at least 256 elements. The function iterates from 0 to 255, accessing `table[i]` in each iteration.
+</requirement>
+<requirement>
+Values in the `table` array must be in the range [-4, 0xFFFF] or be equal to -1. Values outside this range will cause the function to return `NULL` immediately.
+</requirement>
+<requirement>
+If any value in the `table` array is less than -1, the `convert` function pointer must not be `NULL`. The function checks for this condition and returns `NULL` if the converter is missing for multi-byte sequences.
+</requirement>
+<requirement>
+The `convert` parameter is a function pointer of type `int (*)(void *, const char *)`. If not `NULL`, it must point to a function that takes `userData` and a character pointer, and returns the corresponding integer character code.
+</requirement>
+<requirement>
+The `userData` parameter is passed as the first argument to the `convert` function. Its type and value are dependent on the implementation of the `convert` function.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-buffer-overflow on address 0x515000007ccb at pc 0x5629cc344dd8 bp 0x7ffeb62ad7d0 sp 0x7ffeb62ad7c8
+READ of size 1 at 0x515000007ccb thread T0
+SCARINESS: 12 (1-byte-read-heap-buffer-overflow)
+#0 0x5629cc344dd7 in unknown_toUtf8 /src/CMake/Utilities/cmexpat/lib/xmltok.c:1359:38
+#1 0x5629cc303f24 in LLVMFuzzerTestOneInput /src/CMake/Tests/Fuzzing/xml_parser_fuzzer.cc:114:9
+#2 0x5629cc1b81c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x5629cc1b79e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x5629cc1b91c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x5629cc1b9f55 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x5629cc1a8d9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x5629cc1d4172 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f7b94496082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#9 0x5629cc19b61d in _start (out/libfuzzer-address-x86_64/xml_parser_fuzzer+0x7c61d)
+
+DEDUP_TOKEN: unknown_toUtf8--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+0x515000007ccb is located 1 bytes after 458-byte region [0x515000007b00,0x515000007cca)
+allocated by thread T0 here:
+#0 0x5629cc30135d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x5629cc304532 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x5629cc304532 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x5629cc304532 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x5629cc304532 in __allocate_at_least<std::__1::allocator<char> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x5629cc304532 in __vallocate /usr/local/bin/../include/c++/v1/vector:741:25
+#6 0x5629cc304532 in std::__1::vector<char, std::__1::allocator<char>>::vector(unsigned long) /usr/local/bin/../include/c++/v1/vector:1121:5
+#7 0x5629cc303e15 in ConsumeBytes<char> /usr/local/lib/clang/18/include/fuzzer/FuzzedDataProvider.h:361:18
+#8 0x5629cc303e15 in ConsumeBytes<char> /usr/local/lib/clang/18/include/fuzzer/FuzzedDataProvider.h:110:10
+#9 0x5629cc303e15 in ConsumeRemainingBytes<char> /usr/local/lib/clang/18/include/fuzzer/FuzzedDataProvider.h:129:10
+#10 0x5629cc303e15 in LLVMFuzzerTestOneInput /src/CMake/Tests/Fuzzing/xml_parser_fuzzer.cc:105:44
+#11 0x5629cc1b81c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x5629cc1b79e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x5629cc1b91c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x5629cc1b9f55 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x5629cc1a8d9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x5629cc1d4172 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f7b94496082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+
+</crash-stacktrace>
+
+<crash-analysis>
+### Analysis
+
+The crash is a heap-buffer-overflow, a read of one byte past the end of the `source_data` buffer provided by the fuzzer. The crash occurs inside the `unknown_toUtf8` function in `xmltok.c` at the line: `utf8 = uenc->utf8[(unsigned char)**fromP];`. This line reads a byte from the input buffer by dereferencing `fromP` twice.
+
+The investigation with GDB revealed a logical contradiction. The crashing instruction is inside a `while` loop that has the condition `while (*fromP < fromLim && *toP < toLim)`. This condition should prevent any read where the source pointer `*fromP` is greater than or equal to the limit pointer `fromLim`. However, by inspecting the program state at the moment of the crash, it was determined that `*fromP` was indeed greater than `fromLim`.
+
+Specifically, GDB showed that at the time of the crash, `*fromP` pointed to an address one byte beyond `fromLim`. This means the loop's boundary check failed to prevent the out-of-bounds access.
+
+The fuzz driver correctly allocates the `source_data` buffer and calculates the `from_lim` pointer as `source_data.data() + source_data.size()`. It passes these pointers correctly to the `unknown_toUtf8` function. The logic in the fuzz driver appears sound.
+
+The failure of the simple pointer comparison `*fromP < fromLim` to prevent the out-of-bounds read indicates a subtle bug within the project's C code. This is likely due to some form of undefined behavior being triggered by the fuzzer-generated input (specifically, the custom encoding table). When compiled with optimizations, this undefined behavior can lead to the compiler generating code that does not behave as the source code would suggest, causing the boundary check to fail under specific circumstances.
+
+### Suggestion
+
+The bug lies in the `unknown_toUtf8` function. The loop condition `while (*fromP < fromLim && *toP < toLim)` is correct in principle, but its implementation or interaction with the rest of the code is flawed.
+
+A potential fix is to make the loop more robust by using a local variable for the source pointer, which can sometimes help optimizers reason about the code more effectively and avoid issues with pointer aliasing.
+
+**Patch Suggestion:**
+
+Modify the `unknown_toUtf8` function in `/src/CMake/Utilities/cmexpat/lib/xmltok.c` to use local variables for the pointers within the loop.
+
+```c
+// In /src/CMake/Utilities/cmexpat/lib/xmltok.c
+
+static enum XML_Convert_Result PTRCALL
+unknown_toUtf8(const ENCODING *enc,
+const char **fromP, const char *fromLim,
+char **toP, const char *toLim)
+{
+const struct unknown_encoding *uenc = (const struct unknown_encoding *)enc;
+// Use local variables for pointers
+const char *from = *fromP;
+char *to = *toP;
+
+while (from < fromLim && to < toLim) {
+const struct utf8_sequence *utf8;
+
+utf8 = uenc->utf8[(unsigned char)*from]; // Read from local 'from'
+if (utf8->len == 0) {
+from += 1;
+// Update output pointer before returning
+*fromP = from;
+*toP = to;
+return XML_CONVERT_ILLEGAL;
+}
+if (to + utf8->len > toLim) {
+// Break instead of returning to ensure pointers are updated at the end.
+break;
+}
+memcpy(to, utf8->s, utf8->len);
+to += utf8->len;
+from += 1;
+}
+// Update the caller's pointers with the final values.
+*fromP = from;
+*toP = to;
+
+return (from < fromLim) ? XML_CONVERT_OUTPUT_EXHAUSTED : XML_CONVERT_COMPLETED;
+}
+```
+This refactoring isolates the pointer arithmetic within the function, potentially preventing the optimizer from making incorrect assumptions that lead to the crash. It also simplifies the logic by updating the output pointers in a single place at the end of the function.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/CMake/Tests/Fuzzing/xml_parser_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/CMake/Tests/Fuzzing/xml_parser_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

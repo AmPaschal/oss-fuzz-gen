@@ -1,0 +1,431 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project speex.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/speex/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#define FIXED_POINT 1 // Define this before including any speex headers
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+// Wrap C headers in extern "C" to prevent C++ name mangling.
+// Use explicit relative paths for internal headers and manually declare symbols
+// from public headers that are proving difficult to include.
+extern "C" {
+#include <speex/speex_bits.h>
+#include <speex/speex_types.h>
+#include "../../libspeex/ltp.h"
+#include "../../libspeex/arch.h"
+#include "../../libspeex/modes.h"
+#include "../../libspeex/quant_lsp.h" // For lsp_quant_lbr
+
+// Manually declare the speex_nb_mode symbol to avoid including speex_nb.h
+extern const SpeexMode speex_nb_mode;
+}
+
+// From ltp.h, NB_PITCH_CONTOUR is the size of the arrays that were overflowing.
+#define FUZZ_NB_PITCH_CONTOUR 3
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+FuzzedDataProvider provider(data, size);
+
+// Get the narrowband mode parameters via the official API
+const SpeexMode *mode = &speex_nb_mode;
+const SpeexNBMode *nb_mode = (const SpeexNBMode *)mode->mode;
+
+// A submode needs to be selected to get the ltp_params.
+int submodeID = provider.ConsumeIntegralInRange<int>(0, NB_SUBMODES - 1);
+const SpeexSubmode *submode = nb_mode->submodes[submodeID];
+
+// This submode might not be implemented (is NULL in the array) or doesn't have LTP.
+if (!submode || !submode->ltp_params) {
+return 0;
+}
+
+// The function under test is part of the LTP module. It is only safe to call
+// it with valid LTP parameters. Cast the void pointer to the concrete type
+// and check if the codebook pointer is valid.
+const ltp_params *params = (const ltp_params *)submode->ltp_params;
+if (!params->gain_cdbk) {
+return 0;
+}
+
+const void *ltp_params = submode->ltp_params;
+
+// Constrain parameters to typical and valid ranges
+const int nsf = nb_mode->frameSize;
+const int p = nb_mode->lpcSize;
+const int start = provider.ConsumeIntegralInRange<int>(17, 144);
+const int end = provider.ConsumeIntegralInRange<int>(start, 250);
+if (start >= end) {
+return 0;
+}
+
+// The complexity parameter must be clamped to avoid a stack buffer overflow.
+// The internal arrays are of size NB_PITCH_CONTOUR (3).
+const int complexity = provider.ConsumeIntegralInRange<int>(1, FUZZ_NB_PITCH_CONTOUR);
+
+// The cdbk_offset parameter is always 0 in the legitimate call sites
+// of pitch_search_3tap within the Speex encoder. Setting it to a non-zero
+// value can trigger an infeasible out-of-bounds read.
+const int cdbk_offset = 0;
+
+const int plc_tuning = provider.ConsumeIntegral<int>();
+spx_word16_t pitch_coef = provider.ConsumeIntegral<spx_int16_t>();
+spx_word32_t cumul_gain = provider.ConsumeIntegral<spx_uint32_t>();
+
+// Allocate and fill buffers with fuzz data using ConsumeData.
+std::vector<spx_word16_t> target(nsf);
+if (provider.ConsumeData(target.data(), target.size() * sizeof(spx_word16_t)) != target.size() * sizeof(spx_word16_t)) return 0;
+
+std::vector<spx_word16_t> sw_buf(nsf + end);
+if (provider.ConsumeData(sw_buf.data(), sw_buf.size() * sizeof(spx_word16_t)) != sw_buf.size() * sizeof(spx_word16_t)) return 0;
+spx_word16_t* sw = sw_buf.data() + end;
+
+std::vector<spx_coef_t> ak(p);
+if (provider.ConsumeData(ak.data(), ak.size() * sizeof(spx_coef_t)) != ak.size() * sizeof(spx_coef_t)) return 0;
+std::vector<spx_coef_t> awk1(p);
+if (provider.ConsumeData(awk1.data(), awk1.size() * sizeof(spx_coef_t)) != awk1.size() * sizeof(spx_coef_t)) return 0;
+std::vector<spx_coef_t> awk2(p);
+if (provider.ConsumeData(awk2.data(), awk2.size() * sizeof(spx_coef_t)) != awk2.size() * sizeof(spx_coef_t)) return 0;
+
+std::vector<spx_sig_t> exc(nsf);
+if (provider.ConsumeData(exc.data(), exc.size() * sizeof(spx_sig_t)) != exc.size() * sizeof(spx_sig_t)) return 0;
+
+std::vector<spx_word16_t> exc2_buf(nsf + end);
+if (provider.ConsumeData(exc2_buf.data(), exc2_buf.size() * sizeof(spx_word16_t)) != exc2_buf.size() * sizeof(spx_word16_t)) return 0;
+spx_word16_t* exc2 = exc2_buf.data() + end;
+
+std::vector<spx_word16_t> r(nsf);
+if (provider.ConsumeData(r.data(), r.size() * sizeof(spx_word16_t)) != r.size() * sizeof(spx_word16_t)) return 0;
+
+std::vector<char> stack(30000);
+SpeexBits bits;
+std::vector<char> bit_buffer(200);
+speex_bits_init_buffer(&bits, bit_buffer.data(), bit_buffer.size());
+
+// Call the function under test using the parameters from the mode.
+pitch_search_3tap(target.data(), sw, ak.data(), awk1.data(), awk2.data(),
+exc.data(), ltp_params, start, end, pitch_coef, p, nsf, &bits,
+stack.data(), exc2, r.data(), complexity, cdbk_offset,
+plc_tuning, &cumul_gain);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: speex
+function signature: int pitch_search_3tap(spx_word16_t *, spx_word16_t *, spx_coef_t *, spx_coef_t *, spx_coef_t *, spx_sig_t *, const void *, int, int, spx_word16_t, int, int, SpeexBits *, char *, spx_word16_t *, spx_word16_t *, int, int, int, spx_word32_t *)
+</input>
+
+<description>
+The function `pitch_search_3tap` is a core component of the Speex audio codec, responsible for finding the optimal pitch lag and gain for long-term prediction (LTP) in the encoding process. It operates on a subframe of audio data, searching a range of possible pitch values to identify the one that minimizes the error between the original and synthesized signals. The function is highly dependent on the encoder state and various parameters passed to it, including LPC coefficients, perceptual weighting factors, and the excitation signal from previous subframes.
+</description>
+
+<requirements>
+<requirement>
+The `par` argument must be a valid pointer to an `ltp_params` struct. This is because the function casts `par` to an `ltp_params` pointer and accesses its members, so a NULL or invalid pointer would lead to a crash.
+</requirement>
+<requirement>
+The `gain_cdbk` member of the `ltp_params` struct must point to a valid, initialized codebook. An invalid pointer can cause a crash when the function attempts to access the codebook data.
+</requirement>
+<requirement>
+The `start` and `end` arguments, which define the pitch search range, must satisfy `start <= end`. If `end < start`, the function returns early, but valid input should have `start <= end` to perform the pitch search.
+</requirement>
+<requirement>
+The `nsf` argument, representing the number of samples in a subframe, must be a positive integer. It's used for memory allocation and as a loop bound, so a non-positive value would lead to memory errors or crashes.
+</requirement>
+<requirement>
+The `p` argument, the number of LPC coefficients, must be a non-negative integer. This is because `p` is used as an array size and loop bound, so a negative value would cause memory corruption.
+</requirement>
+<requirement>
+The `complexity` argument should be an integer between 1 and 10. The function clamps this value to the range [1, 10], so any value outside this range will be adjusted internally.
+</requirement>
+<requirement>
+The `cdbk_offset` argument must be a non-negative integer. It is used as an offset into the `gain_cdbk` array, so a negative value would result in an out-of-bounds memory access.
+</requirement>
+<requirement>
+The `cumul_gain` argument must be a valid pointer to a `spx_word32_t` variable. The function dereferences this pointer to read and write the cumulative gain, so a NULL pointer would cause a crash.
+</requirement>
+<requirement>
+The `bits` argument must be a valid pointer to a `SpeexBits` struct. This struct is used for packing the resulting pitch and gain information into the bitstream, so a NULL pointer would lead to a crash.
+</requirement>
+<requirement>
+The `stack` argument must be a valid pointer to a memory region of sufficient size. The required size depends on the `complexity` parameter, with larger complexity values requiring more stack space.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-buffer-overflow on address 0x51600000277e at pc 0x561925d73e79 bp 0x7fffa5e1c670 sp 0x7fffa5e1c668
+READ of size 2 at 0x51600000277e thread T0
+SCARINESS: 14 (2-byte-read-heap-buffer-overflow)
+#0 0x561925d73e78 in pitch_gain_search_3tap /src/speex/libspeex/ltp.c:433:23
+#1 0x561925d71eb2 in pitch_search_3tap /src/speex/libspeex/ltp.c:626:11
+#2 0x561925d6e626 in LLVMFuzzerTestOneInput /src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc:105:3
+#3 0x561925c22370 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#4 0x561925c21b95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#5 0x561925c23b22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#6 0x561925c23e12 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#7 0x561925c12f4b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#8 0x561925c3e322 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#9 0x7f3b5bbde082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#10 0x561925c057cd in _start (out/libfuzzer-address-x86_64/speex_decode_fuzzer_fixed+0x527cd)
+
+DEDUP_TOKEN: pitch_gain_search_3tap--pitch_search_3tap--LLVMFuzzerTestOneInput
+0x51600000277e is located 2 bytes before 534-byte region [0x516000002780,0x516000002996)
+allocated by thread T0 here:
+#0 0x561925d6b50d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x561925d6eab3 in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x561925d6eab3 in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x561925d6eab3 in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x561925d6eab3 in __allocate_at_least<std::__1::allocator<short> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x561925d6eab3 in __vallocate /usr/local/bin/../include/c++/v1/vector:741:25
+#6 0x561925d6eab3 in std::__1::vector<short, std::__1::allocator<short>>::vector(unsigned long) /usr/local/bin/../include/c++/v1/vector:1121:5
+#7 0x561925d6e3fe in LLVMFuzzerTestOneInput /src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc:92:29
+#8 0x561925c22370 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x561925c21b95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x561925c23b22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#11 0x561925c23e12 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#12 0x561925c12f4b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x561925c3e322 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f3b5bbde082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a heap-buffer-overflow in the `pitch_gain_search_3tap` function in `ltp.c`.
+1. The fuzz driver calls `pitch_search_3tap` with a pitch search range of `[start, end]`.
+2. Inside `pitch_search_3tap`, the function `open_loop_nbest_pitch` is called, which can select a `pitch` value equal to `end`.
+3. `pitch_search_3tap` then calls `pitch_gain_search_3tap` with this selected `pitch` value.
+4. In `pitch_gain_search_3tap`, there is a loop: `for (i=1; i>=0; i--)`. Inside this loop, the code accesses `exc2[-pitch-1+i]`.
+5. The `exc2` pointer is set up by the fuzzer to point to `exc2_buf.data() + end`, effectively creating a history buffer of size `end`. This allows negative indexing from `exc2[-1]` down to `exc2[-end]`.
+6. When `pitch` is equal to `end` (a valid value from the search range) and the loop variable `i` is `0`, the memory access becomes `exc2[-end-1+0]`, which is `exc2[-end-1]`.
+7. This access is one element before the start of the intended history buffer (`exc2_buf`), causing a heap-buffer-overflow, as correctly identified by ASan.
+
+The root cause is that `pitch_gain_search_3tap` makes an invalid assumption that `pitch` will always be less than the size of the history buffer it can access. The calling convention established by `pitch_search_3tap` does not guarantee this.
+
+**Suggestion:**
+The project code in `ltp.c` should be fixed. A potential fix is to ensure the history buffer is large enough to handle the maximum possible pitch value. In `pitch_gain_search_3tap`, the access to `exc2` should be guarded.
+
+A simple fix would be to adjust the loop range or add a check to prevent the out-of-bounds access. For example, ensuring that `-pitch-1+i` is always greater than or equal to `-end`. However, the most correct fix would be in the allocation of the history buffer in the calling functions (like the encoder itself, and by extension, the fuzzer) to account for this off-by-one access pattern. The buffer `exc2_buf` should probably be allocated with size `nsf + end + 1` instead of `nsf + end`. Since the fuzzer is trying to mimic the real application, the bug lies in the real application's logic which the fuzzer is correctly exposing. The function `pitch_gain_search_3tap` should not be accessing `exc2[-pitch-1]` if `pitch` can be `end`.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

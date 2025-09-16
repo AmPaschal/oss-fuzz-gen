@@ -1,0 +1,575 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project hpn-ssh.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/hpn-ssh/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <signal.h>
+
+#include <openssl/dh.h>
+#include <openssl/ec.h>
+
+extern "C" {
+#include "includes.h"
+#include "authfile.h"
+#include "dh.h"
+#include "kex.h"
+#include "log.h"
+#include "myproposal.h"
+#include "packet.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "ssherr.h"
+#include "xmalloc.h"
+#include "dispatch.h"
+#include "sshkey.h"
+
+#include "fixed-keys.h"
+}
+
+struct shared_state {
+size_t nkeys;
+struct sshkey **privkeys, **pubkeys;
+};
+
+static void store_key(struct shared_state *st, struct sshkey *pubkey, struct sshkey *privkey) {
+if (st == NULL || pubkey->type < 0 || pubkey->type > INT_MAX || privkey->type != pubkey->type || ((size_t)pubkey->type < st->nkeys && st->pubkeys[pubkey->type] != NULL))
+abort();
+if ((size_t)pubkey->type >= st->nkeys) {
+st->pubkeys = (struct sshkey **)xrecallocarray(st->pubkeys, st->nkeys, pubkey->type + 1, sizeof(*st->pubkeys));
+st->privkeys = (struct sshkey **)xrecallocarray(st->privkeys, st->nkeys, privkey->type + 1, sizeof(*st->privkeys));
+st->nkeys = privkey->type + 1;
+}
+st->pubkeys[pubkey->type] = pubkey;
+st->privkeys[privkey->type] = privkey;
+}
+
+static int prepare_key(struct shared_state *st, int kt) {
+const char *pubstr = NULL;
+const char *privstr = NULL;
+char *tmp, *cp;
+struct sshkey *privkey = NULL, *pubkey = NULL;
+struct sshbuf *b = NULL;
+int r;
+
+switch (kt) {
+case KEY_RSA:
+pubstr = PUB_RSA;
+privstr = PRIV_RSA;
+break;
+case KEY_ECDSA:
+pubstr = PUB_ECDSA;
+privstr = PRIV_ECDSA;
+break;
+case KEY_ED25519:
+pubstr = PUB_ED25519;
+privstr = PRIV_ED25519;
+break;
+default:
+abort();
+}
+if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+abort();
+if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0) {
+sshbuf_free(b);
+return r;
+}
+sshbuf_free(b);
+tmp = cp = xstrdup(pubstr);
+if ((pubkey = sshkey_new(KEY_UNSPEC)) == NULL)
+abort();
+if ((r = sshkey_read(pubkey, &cp)) != 0) {
+free(tmp);
+sshkey_free(privkey);
+sshkey_free(pubkey);
+return r;
+}
+free(tmp);
+
+store_key(st, pubkey, privkey);
+return 0;
+}
+
+static int prepare_keys(struct shared_state *st) {
+if (prepare_key(st, KEY_RSA) != 0 || prepare_key(st, KEY_ECDSA) != 0 || prepare_key(st, KEY_ED25519) != 0) {
+return -1;
+}
+return 0;
+}
+
+static struct sshkey *get_privkey(struct shared_state *st, int keytype) {
+if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys || st->privkeys == NULL || st->privkeys[keytype] == NULL)
+return NULL;
+return st->privkeys[keytype];
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+static struct shared_state *st;
+struct ssh *server = NULL;
+struct sshkey *host_privkey = NULL;
+char *myproposal[PROPOSAL_MAX] = {(char *)KEX_SERVER};
+volatile sig_atomic_t done = 0;
+
+if (st == NULL) {
+log_init("kex_fuzz", SYSLOG_LEVEL_ERROR, SYSLOG_FACILITY_AUTH, 1);
+st = (struct shared_state *)xcalloc(1, sizeof(*st));
+if (prepare_keys(st) != 0) {
+return 0;
+}
+}
+
+FuzzedDataProvider provider(data, size);
+
+if (ssh_init(&server, 1, NULL) != 0) {
+return 0;
+}
+
+const int host_key_types[] = {KEY_RSA, KEY_ECDSA, KEY_ED25519};
+int host_key_type = provider.PickValueInArray(host_key_types);
+host_privkey = get_privkey(st, host_key_type);
+if (host_privkey == NULL) {
+ssh_free(server);
+return 0;
+}
+
+if (ssh_add_hostkey(server, host_privkey) != 0) {
+ssh_free(server);
+return 0;
+}
+
+if (kex_setup(server, myproposal) != 0) {
+ssh_free(server);
+return 0;
+}
+
+const int kex_algs[] = {KEX_DH_GRP14_SHA1, KEX_ECDH_SHA2, KEX_C25519_SHA256, KEX_KEM_SNTRUP761X25519_SHA512, KEX_KEM_MLKEM768X25519_SHA256};
+server->kex->kex_type = provider.PickValueInArray(kex_algs);
+
+struct sshbuf *packet = sshbuf_new();
+if (packet == NULL) {
+ssh_free(server);
+return 0;
+}
+
+int kex_nid = 0;
+DH *client_dh = NULL;
+EC_KEY *client_ec_key = NULL;
+u_char client_c25519_pub[CURVE25519_SIZE];
+u_char client_c25519_secret[CURVE25519_SIZE];
+int r = -1;
+
+switch (server->kex->kex_type) {
+case KEX_DH_GRP14_SHA1:
+server->kex->name = (char *)KEX_DH14_SHA1;
+sshbuf_put_u8(packet, SSH2_MSG_KEXDH_INIT);
+client_dh = dh_new_group14();
+if (client_dh && dh_gen_key(client_dh, 0) == 0) {
+const BIGNUM *pub_key;
+DH_get0_key(client_dh, &pub_key, NULL);
+r = sshbuf_put_bignum2(packet, pub_key);
+}
+break;
+case KEX_ECDH_SHA2:
+server->kex->name = (char *)KEX_ECDH_SHA2_NISTP256;
+sshbuf_put_u8(packet, SSH2_MSG_KEX_ECDH_INIT);
+kex_nid = kex_nid_from_name(server->kex->name);
+if (kex_nid > 0) {
+client_ec_key = EC_KEY_new_by_curve_name(kex_nid);
+if (client_ec_key != NULL && EC_KEY_generate_key(client_ec_key) == 1) {
+r = sshbuf_put_eckey(packet, client_ec_key);
+}
+}
+break;
+case KEX_C25519_SHA256:
+server->kex->name = (char *)KEX_CURVE25519_SHA256;
+sshbuf_put_u8(packet, SSH2_MSG_KEX_ECDH_INIT);
+kexc25519_keygen(client_c25519_secret, client_c25519_pub);
+r = sshbuf_put_string(packet, client_c25519_pub, sizeof(client_c25519_pub));
+break;
+case KEX_KEM_SNTRUP761X25519_SHA512:
+server->kex->name = (char *)KEX_SNTRUP761X25519_SHA512;
+sshbuf_put_u8(packet, SSH2_MSG_KEX_ECDH_INIT);
+kexc25519_keygen(client_c25519_secret, client_c25519_pub);
+r = sshbuf_put_string(packet, client_c25519_pub, sizeof(client_c25519_pub));
+break;
+case KEX_KEM_MLKEM768X25519_SHA256:
+server->kex->name = (char *)KEX_MLKEM768X25519_SHA256;
+sshbuf_put_u8(packet, SSH2_MSG_KEX_ECDH_INIT);
+kexc25519_keygen(client_c25519_secret, client_c25519_pub);
+r = sshbuf_put_string(packet, client_c25519_pub, sizeof(client_c25519_pub));
+break;
+}
+
+if (r != 0) {
+sshbuf_free(packet);
+ssh_free(server);
+EC_KEY_free(client_ec_key);
+DH_free(client_dh);
+return 0;
+}
+
+if (ssh_input_append(server, sshbuf_ptr(packet), sshbuf_len(packet)) != 0) {
+sshbuf_free(packet);
+ssh_free(server);
+EC_KEY_free(client_ec_key);
+DH_free(client_dh);
+return 0;
+}
+
+kex_gen_server(server);
+
+ssh_dispatch_run(server, DISPATCH_BLOCK, &done);
+
+sshbuf_free(packet);
+ssh_free(server);
+EC_KEY_free(client_ec_key);
+DH_free(client_dh);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: hpn-ssh
+function signature: int kex_gen_server(struct ssh *)
+</input>
+
+<description>
+The `kex_gen_server` function is a part of the server-side key exchange process. It registers the `input_kex_gen_init` function to handle the `SSH2_MSG_KEX_ECDH_INIT` message. The actual key exchange logic is within `input_kex_gen_init`, which is triggered upon receiving the client's key exchange message. Thus, the requirements for `kex_gen_server` are to ensure that the `ssh` object is in a valid state for the subsequent key exchange process handled by `input_kex_gen_init`.
+</description>
+
+<requirements>
+<requirement>
+The ssh object must be initialized by calling `ssh_new` and `kex_setup`. This is to ensure the `ssh` and `ssh->kex` structs are properly initialized before being used.
+</requirement>
+<requirement>
+An RSA host key must be generated and loaded for the ssh session. This is because `input_kex_gen_init` calls `kex_load_hostkey` to load the server's host key, and not having a key will cause a failure.
+</requirement>
+<requirement>
+The `ssh->kex->kex_type` must be set to a supported key exchange algorithm. This field determines which key exchange method to use within `input_kex_gen_init`, and an invalid type will cause an error.
+</requirement>
+<requirement>
+The `ssh` object's input buffer must be populated with a valid `SSH2_MSG_KEX_ECDH_INIT` message. The `input_kex_gen_init` function reads from the ssh packet buffer, so it must contain the expected message.
+</requirement>
+<requirement>
+The `ssh->kex->sign` function pointer must be initialized. This is used to sign the exchange hash and is critical for the key exchange to complete successfully.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x55715a258ab0 (pc 0x557159f0ebd2 bp 0x000000000000 sp 0x7fff04c7d530 T0)
+==18==The signal is caused by a WRITE memory access.
+SCARINESS: 30 (wild-addr-write)
+#0 0x557159f0ebd2 in atomic_compare_exchange_strong<__sanitizer::atomic_uint8_t> /src/llvm-project/compiler-rt/lib/asan/../sanitizer_common/sanitizer_atomic_clang.h:81:10
+#1 0x557159f0ebd2 in AtomicallySetQuarantineFlagIfAllocated /src/llvm-project/compiler-rt/lib/asan/asan_allocator.cpp:668:10
+#2 0x557159f0ebd2 in __asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType) /src/llvm-project/compiler-rt/lib/asan/asan_allocator.cpp:724:10
+#3 0x557159fa565b in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:53:3
+#4 0x55715a087472 in kex_free /src/hpn-ssh/kex.c:745:2
+#5 0x55715a0337a1 in ssh_packet_close_internal /src/hpn-ssh/packet.c:764:3
+#6 0x557159fedfff in ssh_free /src/hpn-ssh/ssh_api.c:185:2
+#7 0x557159fe59bc in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc
+#8 0x557159e99ac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557159e9afd1 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#10 0x557159e9b562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x557159e8a69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557159eb5a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f755c61c082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#14 0x557159e7cf1d in _start (out/libfuzzer-address-x86_64/authopt_fuzz+0xccf1d)
+
+DEDUP_TOKEN: atomic_compare_exchange_strong<__sanitizer::atomic_uint8_t>--AtomicallySetQuarantineFlagIfAllocated--__asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType)
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The crash is a segmentation fault occurring within the `free` function, as indicated by the AddressSanitizer report (`SEGV on unknown address`, `WRITE memory access`). The call stack shows that `free` is called from `kex_free` (`kex.c:745`), which is part of the project's cleanup logic initiated by `ssh_free` at the end of the fuzz driver's execution. This type of crash typically points to heap corruption, such as a double-free or a heap buffer overflow that corrupted memory metadata.
+
+The root cause of this heap corruption lies in the `kex_ready` function in `kex.c`. Let's examine the problematic code block:
+
+```c
+// kex.c in kex_ready()
+#ifdef WITH_OPENSSL
+char * orig_ctos = proposal[PROPOSAL_ENC_ALGS_CTOS];
+char * orig_stoc = proposal[PROPOSAL_ENC_ALGS_STOC];
+proposal[PROPOSAL_ENC_ALGS_CTOS] =
+patch_list(proposal[PROPOSAL_ENC_ALGS_CTOS]);
+proposal[PROPOSAL_ENC_ALGS_STOC] =
+patch_list(proposal[PROPOSAL_ENC_ALGS_STOC]);
+
+/*
+* TODO: Likely memory leak here. The original contents of
+* proposal[PROPOSAL_ENC_ALGS_CTOS] are no longer accessible or
+* freeable.
+*/
+#endif
+
+if ((r = kex_prop2buf(ssh->kex->my, proposal)) != 0)
+goto restoreProposal;
+//...
+restoreProposal:
+#ifdef WITH_OPENSSL
+free(proposal[PROPOSAL_ENC_ALGS_CTOS]);
+free(proposal[PROPOSAL_ENC_ALGS_STOC]);
+proposal[PROPOSAL_ENC_ALGS_CTOS] = orig_ctos;
+proposal[PROPOSAL_ENC_ALGS_STOC] = orig_stoc;
+#endif
+```
+
+The bug manifests when the same string is used for both client-to-server and server-to-client ciphers, which is the default configuration. In this case, `proposal[PROPOSAL_ENC_ALGS_CTOS]` and `proposal[PROPOSAL_ENC_ALGS_STOC]` point to the same memory address (a string literal).
+
+The logic error is in the `restoreProposal` block. While the code correctly allocates two new, distinct memory blocks via two calls to `patch_list`, the logic for freeing this temporary memory is flawed. The code was later patched in the project's repository, and the patch reveals the nature of the bug. The fix involved making the second pointer an alias of the first if the original pointers were the same, and then conditionally freeing the second pointer. The original, buggy code unconditionally frees both pointers. While my analysis of the provided code snippet does not reveal an immediate double-free, the subsequent patch to this exact block confirms it is the source of a memory management bug that leads to heap corruption under specific conditions (aliased proposal strings). The fuzz driver correctly uses the API, but the project's internal logic fails.
+
+**Suggestion:**
+
+The bug in `kex_ready` should be fixed. The logic needs to correctly handle the case where the cipher proposal strings are aliased. The correct fix, as seen in later versions of the project, is to avoid the second `patch_list` call and the second `free` call when the original pointers are identical.
+
+A correct implementation would look like this:
+
+```c
+#ifdef WITH_OPENSSL
+char * orig_ctos = proposal[PROPOSAL_ENC_ALGS_CTOS];
+char * orig_stoc = proposal[PROPOSAL_ENC_ALGS_STOC];
+
+proposal[PROPOSAL_ENC_ALGS_CTOS] =
+patch_list(proposal[PROPOSAL_ENC_ALGS_CTOS]);
+// If original pointers were the same, just alias the new patched pointer.
+// Otherwise, patch the second string independently.
+if (orig_stoc == orig_ctos) {
+proposal[PROPOSAL_ENC_ALGS_STOC] = proposal[PROPOSAL_ENC_ALGS_CTOS];
+} else {
+proposal[PROPOSAL_ENC_ALGS_STOC] = patch_list(orig_stoc);
+}
+//...
+restoreProposal:
+#ifdef WITH_OPENSSL
+free(proposal[PROPOSAL_ENC_ALGS_CTOS]);
+// Only free the second pointer if it was a separate allocation.
+if (orig_stoc != orig_ctos)
+free(proposal[PROPOSAL_ENC_ALGS_STOC]);
+proposal[PROPOSAL_ENC_ALGS_CTOS] = orig_ctos;
+proposal[PROPOSAL_ENC_ALGS_STOC] = orig_stoc;
+#endif
+```
+This ensures that if the pointers were originally the same, only one patched copy is made, and only one `free` is called, preventing the heap corruption.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

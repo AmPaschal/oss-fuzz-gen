@@ -1,0 +1,548 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libzip.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/libzip/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <zip.h>
+
+#ifdef __cplusplus
+extern "C"
+#endif
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 4) {
+return 0;
+}
+
+const char *path = "fuzz_replace.zip";
+// Use the first byte to decide which code path to test.
+uint8_t test_case = data[0];
+data++;
+size--;
+
+// Clean up any previous run's file.
+(void)remove(path);
+
+// Path 1: Test error handling for invalid arguments and read-only archives.
+if (test_case % 4 == 0) {
+int error = 0;
+zip_t *za = zip_open(path, ZIP_CREATE | ZIP_TRUNCATE, &error);
+if (za == NULL) {
+(void)remove(path);
+return 0;
+}
+
+zip_source_t *s = zip_source_buffer(za, "content", 7, 0);
+if (s == NULL) {
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+if (zip_file_add(za, "file", s, 0) < 0) {
+zip_source_free(s);
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+// Test with a NULL source and out-of-bounds index on a writable archive.
+zip_source_t *source_replace = zip_source_buffer(za, data, size, 0);
+if (source_replace != NULL) {
+zip_file_replace(za, zip_get_num_entries(za, 0), source_replace, 0);
+zip_source_free(source_replace);
+}
+zip_file_replace(za, 0, NULL, 0);
+
+// Close and re-open in read-only mode to test ZIP_IS_RDONLY path.
+if (zip_close(za) != 0) {
+(void)remove(path);
+return 0;
+}
+
+za = zip_open(path, 0, &error); // Open read-only
+if (za != NULL) {
+source_replace = zip_source_buffer(za, "readonly_test", 13, 0);
+if (source_replace != NULL) {
+// This call should fail because the archive is read-only.
+zip_file_replace(za, 0, source_replace, 0);
+zip_source_free(source_replace); // Must be freed as it's not consumed on failure.
+}
+zip_close(za);
+}
+(void)remove(path);
+}
+// Path 2: Test the state-dependent logic where `orig != NULL` and `changes == NULL`.
+else if (test_case % 4 == 1) {
+int error = 0;
+zip_t *za = zip_open(path, ZIP_CREATE | ZIP_TRUNCATE, &error);
+if (za == NULL) {
+(void)remove(path);
+return 0;
+}
+
+size_t initial_size = size / 2;
+zip_source_t *source_add = zip_source_buffer(za, data, initial_size, 0);
+if (source_add == NULL) {
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+if (zip_file_add(za, "initial_file", source_add, ZIP_FL_OVERWRITE) < 0) {
+zip_source_free(source_add);
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+if (zip_close(za) != 0) {
+(void)remove(path);
+return 0;
+}
+
+za = zip_open(path, 0, &error);
+if (za == NULL) {
+(void)remove(path);
+return 0;
+}
+
+const uint8_t *replace_data = data + initial_size;
+size_t replace_size = size - initial_size;
+
+zip_source_t *source_replace = zip_source_buffer(za, replace_data, replace_size, 0);
+if (source_replace == NULL) {
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+// This hits the path where `orig != NULL` and `changes == NULL`.
+if (zip_file_replace(za, 0, source_replace, 0) < 0) {
+zip_source_free(source_replace);
+}
+
+zip_close(za);
+(void)remove(path);
+}
+// Path 3: Original fuzzer logic (in-memory replacement where `orig == NULL`).
+else if (test_case % 4 == 2) {
+int error = 0;
+zip_t *za = zip_open(path, ZIP_CREATE, &error);
+if (za == NULL) {
+(void)remove(path);
+return 0;
+}
+
+size_t add_size = size / 2;
+const uint8_t *replace_data = data + add_size;
+size_t replace_size = size - add_size;
+
+zip_source_t *source_add = zip_source_buffer(za, data, add_size, 0);
+if (source_add == NULL) {
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+zip_int64_t idx = zip_file_add(za, "initial_file", source_add, ZIP_FL_OVERWRITE);
+if (idx < 0) {
+zip_source_free(source_add);
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+zip_source_t *source_replace = zip_source_buffer(za, replace_data, replace_size, 0);
+if (source_replace == NULL) {
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+// This hits the path where `orig == NULL`.
+if (zip_file_replace(za, (zip_uint64_t)idx, source_replace, 0) < 0) {
+zip_source_free(source_replace);
+}
+
+zip_close(za);
+(void)remove(path);
+}
+// Path 4: Test replacing a file that has been modified in memory (`changes != NULL`).
+else {
+int error = 0;
+zip_t *za = zip_open(path, ZIP_CREATE | ZIP_TRUNCATE, &error);
+if (za == NULL) {
+(void)remove(path);
+return 0;
+}
+
+zip_source_t *s = zip_source_buffer(za, "initial_content", 15, 0);
+if (s == NULL) {
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+zip_int64_t idx = zip_file_add(za, "test_file", s, 0);
+if (idx < 0) {
+zip_source_free(s);
+zip_discard(za);
+(void)remove(path);
+return 0;
+}
+
+if (zip_close(za) != 0) {
+(void)remove(path);
+return 0;
+}
+
+// Re-open for modification.
+za = zip_open(path, ZIP_CREATE, &error);
+if (za == NULL) {
+(void)remove(path);
+return 0;
+}
+
+// **IMPROVEMENT**: Modify the file comment. This creates the `changes` struct
+// without setting the `ZIP_DIRENT_COMP_METHOD` flag.
+zip_file_set_comment(za, 0, "a comment", 9, 0);
+
+// Now, replace the file. This will exercise the uncovered path where
+// `changes != NULL` and `(changes->changed & ZIP_DIRENT_COMP_METHOD) == 0`.
+zip_source_t *source_replace_modified = zip_source_buffer(za, "replace_modified", 16, 0);
+if (source_replace_modified != NULL) {
+if (zip_file_replace(za, 0, source_replace_modified, 0) < 0) {
+zip_source_free(source_replace_modified);
+}
+}
+
+zip_close(za);
+(void)remove(path);
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libzip
+function signature: int zip_file_replace(zip_t *, zip_uint64_t, zip_source_t *, zip_flags_t)
+</input>
+
+<description>
+The `zip_file_replace` function is used to replace a file in a zip archive at a specified index with new data from a given source. It first validates the index and source, then calls the internal function `_zip_file_replace` to perform the actual replacement. The callers of this function, such as the `ziptool` utility, typically open a zip archive, create a `zip_source_t` from a buffer or another file, and then call `zip_file_replace` to update the content of an existing file in the archive.
+</description>
+
+<requirements>
+
+<requirement>
+The `za` archive must be opened in a mode that allows modification. The underlying `_zip_file_replace` function checks if the archive is read-only and will fail if it is.
+</requirement>
+<requirement>
+The `idx` argument must be a valid index of an existing file in the archive. The function checks if `idx` is greater than or equal to the number of entries in the archive and fails if it is.
+</requirement>
+<requirement>
+The `source` argument must be a valid `zip_source_t` pointer. The function checks if `source` is NULL and fails if it is.
+</requirement>
+<requirement>
+A `zip_t` archive object should be created by calling `zip_open` with the `ZIP_CREATE` flag. This ensures the archive is writable, which is a necessary precondition for `zip_file_replace`.
+</requirement>
+<requirement>
+The `source` argument should be created using `zip_source_buffer`. This is the most common way `zip_source_t` objects are created in the callers of `zip_file_replace`.
+</requirement>
+<requirement>
+To ensure a valid `idx` is available, a file should be added to the archive before calling `zip_file_replace`. This can be done using `zip_file_add`, which returns the index of the newly added file.
+</requirement>
+<requirement>
+The `flags` argument can be set to 0. All observed callers of `zip_file_replace` pass 0 for the flags.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-use-after-free on address 0x508000000958 at pc 0x55fdcd6fbc0f bp 0x7ffe1da7e860 sp 0x7ffe1da7e858
+READ of size 1 at 0x508000000958 thread T0
+SCARINESS: 40 (1-byte-read-heap-use-after-free)
+#0 0x55fdcd6fbc0e in zip_source_stat /src/libzip/lib/zip_source_stat.c:40:14
+#1 0x55fdcd6d939a in add_data /src/libzip/lib/zip_close.c:317:9
+#2 0x55fdcd6d85c3 in zip_close /src/libzip/lib/zip_close.c:234:17
+#3 0x55fdcd6d7277 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:70:13
+#4 0x55fdcd58b670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55fdcd58ae95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55fdcd58ce22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#7 0x55fdcd58d112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#8 0x55fdcd57c24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55fdcd5a7622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7ff723bef082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#11 0x55fdcd56eacd in _start (out/libfuzzer-address-x86_64/zip_write_encrypt_pkware_file_fuzzer+0x54acd)
+
+DEDUP_TOKEN: zip_source_stat--add_data--zip_close
+0x508000000958 is located 56 bytes inside of 88-byte region [0x508000000920,0x508000000978)
+freed by thread T0 here:
+#0 0x55fdcd6971a6 in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:52:3
+#1 0x55fdcd6d70d0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:68:17
+#2 0x55fdcd58b670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55fdcd58ae95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55fdcd58ce22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#5 0x55fdcd58d112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#6 0x55fdcd57c24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55fdcd5a7622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7ff723bef082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_free--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+previously allocated by thread T0 here:
+#0 0x55fdcd69743f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55fdcd6f8017 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55fdcd6f8017 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55fdcd6f1e75 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55fdcd6f196e in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55fdcd6f196e in zip_source_buffer /src/libzip/lib/zip_source_buffer.c:92:12
+#6 0x55fdcd6d70a3 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:64:30
+#7 0x55fdcd58b670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55fdcd58ae95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55fdcd58ce22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55fdcd58d112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55fdcd57c24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55fdcd5a7622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7ff723bef082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a heap-use-after-free in `zip_source_stat`, which is called from `zip_close`.
+
+Here's the sequence of events:
+1. The fuzzer opens a zip archive in read-only mode.
+2. It creates a new `zip_source_t` called `source_replace` using `zip_source_buffer`.
+3. It calls `zip_file_replace` with the read-only archive and `source_replace`. This call correctly fails because the archive is read-only.
+4. Because `zip_file_replace` failed, it did not take ownership of `source_replace`. The fuzzer correctly calls `zip_source_free(source_replace)` to release the memory.
+5. The fuzzer then calls `zip_close(za)`.
+6. Inside `zip_close`, the code iterates through the archive's entries. It accesses `za->entry[0].source`, which still points to the memory location of the now-freed `source_replace` (`0x508000000420`).
+7. This leads to a use-after-free when `zip_source_stat` tries to read a member from this freed source.
+
+The bug is in `libzip`. The `zip_file_replace` function, upon failure, should not have left a dangling pointer to the source in the zip archive's internal structures (`za->entry[0].source`). Even though the call failed, it seems to have modified the internal state of the `zip_t` object.
+
+**Suggestion for patch:**
+The `zip_file_replace` function in `libzip` needs to be modified. If the replacement operation fails for any reason (like the archive being read-only), it must ensure that it does not store the pointer to the provided `zip_source_t` in the archive's internal entry structure. It should clean up and restore the state of the entry to what it was before the failed replacement attempt.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

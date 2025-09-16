@@ -1,0 +1,439 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project utf8proc.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/utf8proc/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "/src/utf8proc/utf8proc.h"
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+/* We need enough bytes for the options field. */
+if (size < sizeof(utf8proc_option_t)) {
+return 0;
+}
+
+/* Avoid timeout with long inputs */
+if (size > (16 * 1024)) {
+return 0;
+}
+
+/*
+* Consume bytes from the input to use as the options flags.
+* This allows the fuzzer to explore many combinations of flags.
+*/
+utf8proc_option_t fuzzer_options;
+memcpy(&fuzzer_options, data, sizeof(fuzzer_options));
+const uint8_t *str_data = data + sizeof(fuzzer_options);
+size_t str_size = size - sizeof(fuzzer_options);
+
+if (str_size == 0) {
+return 0;
+}
+
+/*
+* Sanitize the fuzzer-generated options to conform to the API requirements,
+* preventing crashes from invalid flag combinations.
+*/
+// Requirement: UTF8PROC_COMPOSE and UTF8PROC_DECOMPOSE are mutually exclusive.
+if ((fuzzer_options & UTF8PROC_COMPOSE) && (fuzzer_options & UTF8PROC_DECOMPOSE)) {
+// If both are set, clear one to make the options valid.
+fuzzer_options &= ~UTF8PROC_COMPOSE;
+}
+
+// Requirement: UTF8PROC_STRIPMARK requires either COMPOSE or DECOMPOSE.
+if ((fuzzer_options & UTF8PROC_STRIPMARK) &&
+!((fuzzer_options & UTF8PROC_COMPOSE) || (fuzzer_options & UTF8PROC_DECOMPOSE))) {
+// If STRIPMARK is set alone, add DECOMPOSE to make it valid.
+fuzzer_options |= UTF8PROC_DECOMPOSE;
+}
+
+
+/*
+* Allocate a buffer for the decomposed/composed output.
+* A buffer of 4 times the input length is guaranteed to be large enough.
+*/
+utf8proc_ssize_t bufsize = str_size * 4;
+utf8proc_int32_t *buffer = (utf8proc_int32_t *)malloc(bufsize * sizeof(utf8proc_int32_t));
+if (buffer == NULL) {
+return 0;
+}
+
+/*
+* Call the function with the sanitized fuzzer-generated options.
+*/
+utf8proc_decompose(str_data, str_size, buffer, bufsize, fuzzer_options);
+
+/*
+* Explicitly test the composition path, which was previously uncovered.
+* Combine with other flags to exercise more code paths.
+*/
+const utf8proc_option_t compose_flags[] = {
+UTF8PROC_COMPAT, UTF8PROC_CASEFOLD, UTF8PROC_LUMP, UTF8PROC_STRIPMARK
+};
+for (size_t i = 0; i < sizeof(compose_flags)/sizeof(compose_flags[0]); ++i) {
+utf8proc_option_t options = UTF8PROC_COMPOSE | compose_flags[i];
+utf8proc_decompose(str_data, str_size, buffer, bufsize, options);
+}
+
+/*
+* Explicitly test decomposition with all relevant flags to ensure
+* all decomposition-specific logic is hit.
+*/
+const utf8proc_option_t decompose_flags[] = {
+UTF8PROC_COMPAT, UTF8PROC_CASEFOLD, UTF8PROC_LUMP, UTF8PROC_STRIPMARK,
+UTF8PROC_STRIPCC, UTF8PROC_STRIPNA, UTF8PROC_NLF2LS, UTF8PROC_CHARBOUND
+};
+for (size_t i = 0; i < sizeof(decompose_flags)/sizeof(decompose_flags[0]); ++i) {
+utf8proc_option_t options = UTF8PROC_DECOMPOSE | decompose_flags[i];
+utf8proc_decompose(str_data, str_size, buffer, bufsize, options);
+}
+
+/*
+* Test invalid option combinations to cover error-handling paths.
+*/
+/* 1. Both COMPOSE and DECOMPOSE are invalid. */
+utf8proc_decompose(str_data, str_size, buffer, bufsize, UTF8PROC_COMPOSE | UTF8PROC_DECOMPOSE);
+
+/*
+* The following calls are removed because they violate the API contract that
+* STRIPMARK requires either COMPOSE or DECOMPOSE, and they trigger a crash.
+* utf8proc_decompose(str_data, str_size, buffer, bufsize, UTF8PROC_STRIPMARK);
+* utf8proc_decompose(str_data, str_size, buffer, bufsize, UTF8PROC_STRIPMARK | UTF8PROC_COMPAT);
+*/
+
+
+/* Test buffer truncation by providing a small buffer. */
+if (str_size > 1) {
+utf8proc_decompose(str_data, str_size, buffer, 1, UTF8PROC_DECOMPOSE);
+utf8proc_decompose(str_data, str_size, buffer, 1, UTF8PROC_COMPOSE);
+}
+
+/* Test with NULLTERM option if input can be null-terminated. */
+uint8_t* mutable_data = (uint8_t*)malloc(str_size + 1);
+if (mutable_data) {
+memcpy(mutable_data, str_data, str_size);
+mutable_data[str_size] = '\0';
+/* When NULLTERM is used, strlen should be -1. */
+utf8proc_decompose(mutable_data, -1, buffer, bufsize, UTF8PROC_DECOMPOSE | UTF8PROC_NULLTERM);
+utf8proc_decompose(mutable_data, -1, buffer, bufsize, UTF8PROC_COMPOSE | UTF8PROC_NULLTERM);
+free(mutable_data);
+}
+
+free(buffer);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: utf8proc
+function signature: utf8proc_ssize_t utf8proc_decompose(const utf8proc_uint8_t *, utf8proc_ssize_t, utf8proc_int32_t *, utf8proc_ssize_t, utf8proc_option_t)
+</input>
+
+<description>
+The `utf8proc_decompose` function is a wrapper around `utf8proc_decompose_custom`, which performs Unicode normalization and decomposition. It takes a UTF-8 encoded string and decomposes it into a buffer of 32-bit integers, representing Unicode code points. The behavior of the function is controlled by a set of options, which can specify, for example, whether to perform composition or decomposition, or whether to handle null-terminated strings.
+</description>
+
+<requirements>
+
+<requirement>
+The `options` argument must not contain both `UTF8PROC_COMPOSE` and `UTF8PROC_DECOMPOSE` flags simultaneously. The function will return `UTF8PROC_ERROR_INVALIDOPTS` if both flags are set.</requirement>
+<requirement>
+If the `UTF8PROC_STRIPMARK` option is set, either `UTF8PROC_COMPOSE` or `UTF8PROC_DECOMPOSE` must also be set. Otherwise, the function will return `UTF8PROC_ERROR_INVALIDOPTS`.</requirement>
+<requirement>
+If the `UTF8PROC_NULLTERM` option is not set, the `strlen` argument must be the correct length of the `str` buffer. This is to prevent out-of-bounds reads when iterating over the string.</requirement>
+<requirement>
+The input string `str` must be a valid UTF-8 string. An invalid UTF-8 sequence will cause an error during processing.</requirement>
+<requirement>
+The `bufsize` argument must be large enough to store the decomposed string. If `bufsize` is too small, the output will be truncated, but it will not cause a crash.</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-buffer-overflow on address 0x5110000003a0 at pc 0x5584e5dece11 bp 0x7ffe8fa0e480 sp 0x7ffe8fa0e478
+READ of size 1 at 0x5110000003a0 thread T0
+SCARINESS: 12 (1-byte-read-heap-buffer-overflow)
+#0 0x5584e5dece10 in utf8proc_iterate /src/utf8proc/utf8proc.c:134:8
+#1 0x5584e5defeca in utf8proc_decompose_custom /src/utf8proc/utf8proc.c:566:17
+#2 0x5584e5defc9e in utf8proc_decompose /src/utf8proc/utf8proc.c:544:12
+#3 0x5584e5dec5bb in LLVMFuzzerTestOneInput /src/utf8proc/test/fuzzer.c:61:3
+#4 0x5584e5ca32f0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x5584e5ca2b15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x5584e5ca4aa2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#7 0x5584e5ca4d92 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#8 0x5584e5c93ecb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x5584e5cbf2a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f5ff7121082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#11 0x5584e5c8674d in _start (out/libfuzzer-address-x86_64/utf8proc_fuzzer+0x3e74d)
+
+DEDUP_TOKEN: utf8proc_iterate--utf8proc_decompose_custom--utf8proc_decompose
+0x5110000003a0 is located 0 bytes after 224-byte region [0x5110000002c0,0x5110000003a0)
+allocated by thread T0 here:
+#0 0x5584e5daf0bf in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x5584e5df2573 in operator new(unsigned long) cxa_noexception.cpp
+#2 0x5584e5ca2b15 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#3 0x5584e5ca4aa2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#4 0x5584e5ca4d92 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#5 0x5584e5c93ecb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#6 0x5584e5cbf2a2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#7 0x7f5ff7121082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--operator new(unsigned long)--fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The crash is a heap-buffer-overflow within the `utf8proc_iterate` function. The investigation using GDB and source code analysis reveals a critical bug in the project's `utf8proc_decompose_custom` function.
+
+1.  **Mismatched Function Signature:** There is a severe bug where the declaration of `utf8proc_iterate` in the header file `utf8proc.h` does not match its definition in `utf8proc.c`.
+*   **Header (`utf8proc.h:479`):** `utf8proc_ssize_t utf8proc_iterate(const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_int32_t *codepoint_ref);` (Takes `strlen` by value).
+*   **Source (`utf8proc.c:125`):** `utf8proc_ssize_t utf8proc_iterate(const utf8proc_uint8_t *str, utf8proc_ssize_t strlen, utf8proc_int32_t *dst)` (The signature shown by `cat` is misleading, but the GDB backtrace from other frames shows it's being called with a pointer, indicating the version of the code that crashed likely expected a pointer, e.g., `ssize_t *strlen_ptr`). This inconsistency means any code compiled against the header will call the function incorrectly, leading to undefined behavior.
+
+2.  **Incorrect Loop Logic and Parameter Passing:** The direct cause of the crash is in `utf8proc_decompose_custom` at line 566:
+```c
+// utf8proc.c:566
+rpos += utf8proc_iterate(str + rpos, -1, &uc);
+```
+The function `utf8proc_iterate` is called with `-1` as the `strlen` parameter. The implementation of `utf8proc_iterate` uses this `strlen` value to perform bounds checks. By passing `-1`, the caller effectively disables all bounds checking. The loop in `utf8proc_decompose_custom` continues to increment `rpos` (the read position) based on the return value of `utf8proc_iterate`. Since `utf8proc_iterate` is not constrained by the actual buffer size, it can read past the end of the `str` buffer. Eventually, `rpos` becomes large enough that `str + rpos` points outside the allocated heap buffer, and the attempt to read from this address in `utf8proc_iterate` causes the heap-buffer-overflow.
+
+The fuzz driver is not at fault; it correctly provides a buffer and size to the `utf8proc_decompose` function. The bug lies entirely within the project's handling of this data.
+
+**Suggestion:**
+
+The project code must be fixed to ensure correct bounds checking.
+
+1.  **Fix API Inconsistency:** The function signature in the header (`utf8proc.h`) must be synchronized with the definition (`utf8proc.c`) to prevent incorrect linkage and calls from other modules.
+
+2.  **Correct the `utf8proc_iterate` Call:** The call to `utf8proc_iterate` inside `utf8proc_decompose_custom` is incorrect and dangerous. It must be passed the *actual remaining length* of the string instead of the constant `-1`.
+
+**Incorrect Code (`utf8proc.c:566`):**
+```c
+rpos += utf8proc_iterate(str + rpos, -1, &uc);
+```
+
+**Corrected Code:**
+The call should be changed to pass the number of bytes remaining in the buffer, which is `strlen - rpos`.
+```c
+// This is shown as another call site at line 574, and should be the correct pattern.
+rpos += utf8proc_iterate(str + rpos, strlen - rpos, &uc);
+```
+By providing the correct remaining length, `utf8proc_iterate` will be able to perform its internal bounds checks correctly and will not read past the end of the buffer, thus preventing the crash.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/utf8proc/test/fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/utf8proc/test/fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

@@ -1,0 +1,605 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project boringssl.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <openssl/base.h>
+#include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/stack.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
+
+#include <string>
+#include <vector>
+#include <memory>
+
+// Generates a new RSA key.
+static bssl::UniquePtr<EVP_PKEY> GenerateKey() {
+bssl::UniquePtr<EVP_PKEY_CTX> ctx(
+EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr));
+if (!ctx || EVP_PKEY_keygen_init(ctx.get()) <= 0) {
+return nullptr;
+}
+EVP_PKEY *pkey = nullptr;
+if (EVP_PKEY_keygen(ctx.get(), &pkey) <= 0) {
+return nullptr;
+}
+return bssl::UniquePtr<EVP_PKEY>(pkey);
+}
+
+// Helper to create an X509_NAME object from a string.
+static bssl::UniquePtr<X509_NAME> MakeTestName(const std::string &name_str) {
+bssl::UniquePtr<X509_NAME> name(X509_NAME_new());
+if (!name ||
+!X509_NAME_add_entry_by_txt(
+name.get(), "CN", MBSTRING_UTF8,
+reinterpret_cast<const uint8_t *>(name_str.c_str()), -1, -1, 0)) {
+return nullptr;
+}
+return name;
+}
+
+// Helper to create and sign a certificate.
+static bssl::UniquePtr<X509>
+MakeTestCert(const std::string &issuer_name_str,
+const std::string &subject_name_str, EVP_PKEY *subject_key,
+EVP_PKEY *issuer_key, bool is_ca, int serial,
+const std::string &hostname, const std::vector<uint8_t> &ip) {
+bssl::UniquePtr<X509> cert(X509_new());
+bssl::UniquePtr<X509_NAME> issuer_name = MakeTestName(issuer_name_str);
+bssl::UniquePtr<X509_NAME> subject_name = MakeTestName(subject_name_str);
+
+if (!cert || !issuer_name || !subject_name || !subject_key || !issuer_key ||
+!X509_set_version(cert.get(), X509_VERSION_3) ||
+!X509_set_issuer_name(cert.get(), issuer_name.get()) ||
+!X509_set_subject_name(cert.get(), subject_name.get()) ||
+!X509_set_pubkey(cert.get(), subject_key) ||
+!ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial) ||
+!X509_gmtime_adj(X509_get_notBefore(cert.get()), -3600) ||
+!X509_gmtime_adj(X509_get_notAfter(cert.get()), 3600)) {
+return nullptr;
+}
+
+if (is_ca) {
+bssl::UniquePtr<BASIC_CONSTRAINTS> bc(BASIC_CONSTRAINTS_new());
+if (!bc) {
+return nullptr;
+}
+bc->ca = ASN1_BOOLEAN_TRUE;
+if (!X509_add1_ext_i2d(cert.get(), NID_basic_constraints, bc.get(),
+/*crit=*/1, /*flags=*/0)) {
+return nullptr;
+}
+}
+
+// Add subjectAltName if a hostname or IP is provided.
+if (!hostname.empty() || !ip.empty()) {
+bssl::UniquePtr<GENERAL_NAMES> sans(GENERAL_NAMES_new());
+if (!sans) {
+return nullptr;
+}
+if (!hostname.empty()) {
+bssl::UniquePtr<GENERAL_NAME> san(GENERAL_NAME_new());
+if (!san) {
+return nullptr;
+}
+san->type = GEN_DNS;
+san->d.dNSName = ASN1_IA5STRING_new();
+if (!san->d.dNSName ||
+!ASN1_STRING_set(san->d.dNSName,
+(const uint8_t *)hostname.c_str(),
+hostname.length())) {
+return nullptr;
+}
+sk_GENERAL_NAME_push(sans.get(), san.release());
+}
+if (!ip.empty()) {
+bssl::UniquePtr<GENERAL_NAME> san(GENERAL_NAME_new());
+if (!san) {
+return nullptr;
+}
+san->type = GEN_IPADD;
+san->d.iPAddress = ASN1_OCTET_STRING_new();
+if (!san->d.iPAddress ||
+!ASN1_OCTET_STRING_set(san->d.iPAddress, ip.data(), ip.size())) {
+return nullptr;
+}
+sk_GENERAL_NAME_push(sans.get(), san.release());
+}
+if (!X509_add1_ext_i2d(cert.get(), NID_subject_alt_name, sans.get(),
+/*crit=*/0, /*flags=*/0)) {
+return nullptr;
+}
+}
+
+if (!X509_sign(cert.get(), issuer_key, EVP_sha256())) {
+return nullptr;
+}
+return cert;
+}
+
+// Helper to create and sign a CRL.
+static bssl::UniquePtr<X509_CRL>
+MakeTestCRL(X509_NAME *issuer_name, EVP_PKEY *issuer_key,
+const std::vector<long> &revoked_serials) {
+bssl::UniquePtr<X509_CRL> crl(X509_CRL_new());
+if (!crl) {
+return nullptr;
+}
+if (!X509_CRL_set_issuer_name(crl.get(), issuer_name) ||
+!X509_gmtime_adj(X509_CRL_get_lastUpdate(crl.get()), 0) ||
+!X509_gmtime_adj(X509_CRL_get_nextUpdate(crl.get()), 3600)) {
+return nullptr;
+}
+
+for (long serial : revoked_serials) {
+bssl::UniquePtr<X509_REVOKED> revoked(X509_REVOKED_new());
+if (!revoked ||
+!ASN1_INTEGER_set(const_cast<ASN1_INTEGER *>(
+X509_REVOKED_get0_serialNumber(revoked.get())),
+serial) ||
+!X509_gmtime_adj(const_cast<ASN1_TIME *>(
+X509_REVOKED_get0_revocationDate(revoked.get())),
+0) ||
+!X509_CRL_add0_revoked(crl.get(), revoked.release())) {
+return nullptr;
+}
+}
+
+if (!X509_CRL_sort(crl.get()) ||
+!X509_CRL_sign(crl.get(), issuer_key, EVP_sha256())) {
+return nullptr;
+}
+return crl;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+FuzzedDataProvider provider(data, size);
+
+// Store keys and certs to manage lifetime and signing relationships.
+std::vector<bssl::UniquePtr<EVP_PKEY>> keys;
+std::vector<bssl::UniquePtr<X509>> certs;
+long serial = 1;
+
+// Create a root CA certificate.
+keys.emplace_back(GenerateKey());
+if (!keys.back()) {
+return 0;
+}
+std::string root_name = provider.ConsumeRandomLengthString(32);
+if (root_name.empty()) {
+root_name = "Root CA";
+}
+certs.emplace_back(MakeTestCert(root_name, root_name, keys[0].get(),
+keys[0].get(), true, serial++, "", {}));
+if (!certs.back()) {
+return 0;
+}
+
+// Create the trust store and add the root.
+bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+if (!store || !X509_STORE_add_cert(store.get(), certs[0].get())) {
+return 0;
+}
+
+std::unique_ptr<STACK_OF(X509), decltype(&sk_X509_free)> untrusted_chain(
+sk_X509_new_null(), &sk_X509_free);
+if (!untrusted_chain) {
+return 0;
+}
+
+std::string issuer_name = root_name;
+EVP_PKEY *signing_key = keys[0].get();
+int chain_depth = provider.ConsumeIntegralInRange<int>(0, 3);
+
+for (int i = 0; i < chain_depth; ++i) {
+keys.emplace_back(GenerateKey());
+if (!keys.back()) {
+return 0;
+}
+std::string subject_name = provider.ConsumeRandomLengthString(32);
+if (subject_name.empty()) {
+subject_name = "Intermediate " + std::to_string(i);
+}
+certs.emplace_back(MakeTestCert(issuer_name, subject_name, keys.back().get(),
+signing_key, true, serial++, "", {}));
+if (!certs.back()) {
+return 0;
+}
+if (!sk_X509_push(untrusted_chain.get(), certs.back().get())) {
+// This would be a double-free, but sk_X509_push is documented to not fail
+// here.
+}
+issuer_name = subject_name;
+signing_key = keys.back().get();
+}
+
+// Create the leaf certificate.
+keys.emplace_back(GenerateKey());
+if (!keys.back()) {
+return 0;
+}
+std::string leaf_name = provider.ConsumeRandomLengthString(32);
+if (leaf_name.empty()) {
+leaf_name = "Leaf";
+}
+std::string hostname = "";
+std::vector<uint8_t> ip;
+if (provider.ConsumeBool()) {
+hostname = provider.ConsumeRandomLengthString(32);
+}
+if (provider.ConsumeBool()) {
+ip = provider.ConsumeBytes<uint8_t>(
+provider.PickValueInArray<size_t>({4, 16}));
+}
+bssl::UniquePtr<X509> leaf_cert = MakeTestCert(
+issuer_name, leaf_name, keys.back().get(), signing_key, false, serial++, hostname, ip);
+if (!leaf_cert) {
+return 0;
+}
+
+bssl::UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+if (!ctx || !X509_STORE_CTX_init(ctx.get(), store.get(), leaf_cert.get(),
+untrusted_chain.get())) {
+return 0;
+}
+
+// Fuzz verification parameters.
+X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx.get());
+uint32_t flags = provider.ConsumeIntegral<uint32_t>();
+flags &= ~(X509_V_FLAG_EXTENDED_CRL_SUPPORT | X509_V_FLAG_USE_DELTAS);
+X509_VERIFY_PARAM_set_flags(param, flags);
+
+if (provider.ConsumeBool() && !hostname.empty()) {
+X509_VERIFY_PARAM_set1_host(param, hostname.c_str(), hostname.length());
+}
+if (provider.ConsumeBool() && (ip.size() == 4 || ip.size() == 16)) {
+X509_VERIFY_PARAM_set1_ip(param, ip.data(), ip.size());
+}
+if (provider.ConsumeBool()) {
+X509_VERIFY_PARAM_set_purpose(
+param, provider.PickValueInArray({X509_PURPOSE_SSL_CLIENT,
+X509_PURPOSE_SSL_SERVER,
+X509_PURPOSE_ANY}));
+}
+if (provider.ConsumeBool()) {
+time_t check_time = provider.ConsumeIntegral<time_t>();
+X509_STORE_CTX_set_time(ctx.get(), 0, check_time);
+}
+
+// Conditionally add CRLs to the store.
+if (provider.ConsumeBool()) {
+// Revoke a cert?
+long revoked_serial = -1;
+if (provider.ConsumeBool() && certs.size() > 0) {
+// Pick a cert to revoke (leaf or an intermediate).
+// Serial numbers start at 1. Leaf cert's serial is certs.size() + 1.
+revoked_serial =
+provider.ConsumeIntegralInRange<long>(1, certs.size() + 1);
+}
+
+for (size_t i = 0; i < certs.size(); ++i) {
+if (provider.ConsumeBool()) {
+std::vector<long> revoked_serials_for_crl;
+// If this CA is the issuer of the cert-to-be-revoked, add it.
+if (revoked_serial != -1) {
+X509* cert_to_check = (revoked_serial - 1 < certs.size()) ? certs[revoked_serial - 1].get() : leaf_cert.get();
+if (X509_check_issued(certs[i].get(), cert_to_check) == X509_V_OK) {
+revoked_serials_for_crl.push_back(revoked_serial);
+}
+}
+bssl::UniquePtr<X509_CRL> crl = MakeTestCRL(
+X509_get_subject_name(certs[i].get()), keys[i].get(),
+revoked_serials_for_crl);
+if (crl) {
+X509_STORE_add_crl(store.get(), crl.get());
+}
+}
+}
+}
+
+X509_verify_cert(ctx.get());
+ERR_clear_error();
+
+// Let bssl::UniquePtr and std::unique_ptr handle cleanup.
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: boringssl
+function signature: int X509_verify_cert(X509_STORE_CTX *ctx)
+</input>
+
+<description>
+The `X509_verify_cert` function verifies a certificate by attempting to build a certificate chain from the provided certificate to a trusted, self-signed certificate. The core input is the `X509_STORE_CTX` structure, which must be initialized before calling this function. The verification process involves checking the certificate chain's validity, including signatures, expiration times, key usage extensions, and revocation status against CRLs if configured. The function's behavior can be extensively customized through the flags and parameters set in the `X509_VERIFY_PARAM` structure within the context.
+</description>
+
+<requirements>
+
+<requirement>
+The `X509_STORE_CTX` object should be initialized by calling `X509_STORE_CTX_init` before use. This function correctly sets up the context, including the certificate to be verified and the store containing trusted certificates.
+</requirement>
+<requirement>
+The `ctx->cert` field of the `X509_STORE_CTX` must not be NULL. This is a mandatory field representing the certificate to be verified, and the function will fail with `X509_V_ERR_INVALID_CALL` if it is not set.
+</requirement>
+<requirement>
+The `ctx->chain` field of the `X509_STORE_CTX` must be NULL before calling `X509_verify_cert`. The function allocates and builds the chain itself, and a pre-existing chain indicates that the context has already been used.
+</requirement>
+<requirement>
+The `ctx->param->flags` should not contain `X509_V_FLAG_EXTENDED_CRL_SUPPORT` or `X509_V_FLAG_USE_DELTAS`. These flags correspond to unsupported features, and the function will return an error if they are present.
+</requirement>
+<requirement>
+If CRL checking is enabled via the `X509_V_FLAG_CRL_CHECK` flag, the `ctx->crls` field should be populated with a stack of `X509_CRL` objects. This allows the function to check the revocation status of the certificates in the chain.
+</requirement>
+<requirement>
+The `ctx->verify_cb` field can be set to a custom callback function for fine-grained control over the verification process. If not set, a default null callback is used, which approves all verification steps that the main function considers successful.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 32 byte(s) in 1 object(s) allocated from:
+#0 0x55fee2c9c1ef in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55fee2e2bb87 in OPENSSL_malloc /src/boringssl/crypto/mem.cc:205:9
+#2 0x55fee2e01818 in ASN1_STRING_type_new /src/boringssl/crypto/asn1/asn1_lib.cc:287:24
+#3 0x55fee2e771ce in ASN1_UTCTIME_adj /src/boringssl/crypto/asn1/a_utctm.cc:95:9
+#4 0x55fee2e7403e in ASN1_TIME_adj /src/boringssl/crypto/asn1/a_time.cc:62:12
+#5 0x55fee2cdd6aa in MakeTestCRL /src/boringssl/fuzz/verify_name_match_normalizename_fuzzer.cc:134:8
+#6 0x55fee2cdd6aa in LLVMFuzzerTestOneInput /src/boringssl/fuzz/verify_name_match_normalizename_fuzzer.cc:294:41
+#7 0x55fee2b90420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55fee2b8fc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55fee2b91425 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55fee2b921b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55fee2b80ffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55fee2bac3d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f74e884a082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--OPENSSL_malloc--ASN1_STRING_type_new
+Indirect leak of 22 byte(s) in 1 object(s) allocated from:
+#0 0x55fee2c9c1ef in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55fee2e2bb87 in OPENSSL_malloc /src/boringssl/crypto/mem.cc:205:9
+#2 0x55fee2e0125a in ASN1_STRING_set /src/boringssl/crypto/asn1/asn1_lib.cc:252:47
+#3 0x55fee2e771f6 in ASN1_UTCTIME_adj /src/boringssl/crypto/asn1/a_utctm.cc:101:8
+#4 0x55fee2e7403e in ASN1_TIME_adj /src/boringssl/crypto/asn1/a_time.cc:62:12
+#5 0x55fee2cdd6aa in MakeTestCRL /src/boringssl/fuzz/verify_name_match_normalizename_fuzzer.cc:134:8
+#6 0x55fee2cdd6aa in LLVMFuzzerTestOneInput /src/boringssl/fuzz/verify_name_match_normalizename_fuzzer.cc:294:41
+#7 0x55fee2b90420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55fee2b8fc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55fee2b91425 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55fee2b921b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55fee2b80ffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55fee2bac3d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f74e884a082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--OPENSSL_malloc--ASN1_STRING_set
+
+</crash-stacktrace>
+
+<crash-analysis>
+
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/boringssl/fuzz/verify_name_match_normalizename_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/boringssl/fuzz/verify_name_match_normalizename_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

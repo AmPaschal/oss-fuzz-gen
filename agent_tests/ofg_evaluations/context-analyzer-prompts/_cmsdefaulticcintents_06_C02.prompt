@@ -1,0 +1,512 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project lcms.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/lcms/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "lcms2.h"
+#include "/src/lcms/include/lcms2_plugin.h"
+
+#define MAX_PROFILES 10
+
+// Helper to safely consume data from the fuzzing input
+static int consume_data(const uint8_t **data, size_t *size, void *dest, size_t dest_size) {
+if (*size < dest_size) {
+return 0;
+}
+if (dest != NULL && dest_size > 0) {
+memcpy(dest, *data, dest_size);
+}
+*data += dest_size;
+*size -= dest_size;
+return 1;
+}
+
+// Helper to create a variety of tone curves for profile creation
+static cmsToneCurve* CreateFuzzedToneCurve(cmsContext ContextID, const uint8_t **data, size_t *size) {
+uint8_t type;
+if (!consume_data(data, size, &type, sizeof(type))) return NULL;
+
+// Simple parametric curve
+double params[5];
+if (*size < sizeof(params)) {
+return cmsBuildGamma(ContextID, 2.2); // Fallback
+}
+if (!consume_data(data, size, params, sizeof(params))) return NULL;
+// Use params to avoid UB, but keep them in a reasonable range
+for(int i=0; i<5; i++) {
+if (params[i] > 10.0) params[i] = 10.0;
+if (params[i] < -10.0) params[i] = -10.0;
+}
+return cmsBuildParametricToneCurve(ContextID, type % 8, params);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size == 0) {
+return 0;
+}
+
+cmsContext ContextID = cmsCreateContext(NULL, NULL);
+if (ContextID == NULL) {
+return 0;
+}
+
+// 1. Fuzz the number of profiles
+uint8_t nProfiles_u8;
+if (!consume_data(&data, &size, &nProfiles_u8, sizeof(nProfiles_u8))) {
+cmsDeleteContext(ContextID);
+return 0;
+}
+cmsUInt32Number nProfiles = (nProfiles_u8 % MAX_PROFILES) + 1; // Ensure 1 <= nProfiles <= MAX_PROFILES
+
+// Check if there's enough data for all parameters for the chosen nProfiles
+size_t required_size = nProfiles * (sizeof(uint8_t) + sizeof(cmsUInt32Number) + sizeof(cmsBool) + sizeof(cmsFloat64Number)) + sizeof(cmsUInt32Number);
+if (size < required_size) {
+cmsDeleteContext(ContextID);
+return 0;
+}
+
+cmsHPROFILE hProfiles[MAX_PROFILES];
+cmsUInt32Number TheIntents[MAX_PROFILES];
+cmsBool BPC[MAX_PROFILES];
+cmsFloat64Number AdaptationStates[MAX_PROFILES];
+cmsUInt32Number dwFlags;
+
+// 2. Fuzz the profile types and create them
+for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+uint8_t profile_type_selector;
+if (!consume_data(&data, &size, &profile_type_selector, sizeof(profile_type_selector))) {
+// Should not happen due to size check, but for safety
+for (cmsUInt32Number j = 0; j < i; j++) cmsCloseProfile(hProfiles[j]);
+cmsDeleteContext(ContextID);
+return 0;
+}
+
+switch (profile_type_selector % 5) {
+case 0:
+hProfiles[i] = cmsCreate_sRGBProfileTHR(ContextID);
+break;
+case 1:
+hProfiles[i] = cmsCreateGrayProfileTHR(ContextID, NULL, NULL);
+break;
+case 2:
+hProfiles[i] = cmsCreateLab4ProfileTHR(ContextID, NULL);
+break;
+case 3: // Abstract profile
+hProfiles[i] = cmsCreateInkLimitingDeviceLinkTHR(ContextID, cmsSigCmykData, 150);
+break;
+case 4: // DeviceLink profile
+{
+cmsToneCurve* curves[3];
+curves[0] = CreateFuzzedToneCurve(ContextID, &data, &size);
+curves[1] = CreateFuzzedToneCurve(ContextID, &data, &size);
+curves[2] = CreateFuzzedToneCurve(ContextID, &data, &size);
+hProfiles[i] = cmsCreateLinearizationDeviceLinkTHR(ContextID, cmsSigRgbData, curves);
+if (curves[0]) cmsFreeToneCurve(curves[0]);
+if (curves[1]) cmsFreeToneCurve(curves[1]);
+if (curves[2]) cmsFreeToneCurve(curves[2]);
+}
+break;
+}
+if (hProfiles[i] == NULL) { // If profile creation fails, cleanup and exit
+for (cmsUInt32Number j = 0; j < i; j++) cmsCloseProfile(hProfiles[j]);
+cmsDeleteContext(ContextID);
+return 0;
+}
+}
+
+// 3. Fuzz the remaining parameters
+for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+cmsUInt32Number intent;
+consume_data(&data, &size, &intent, sizeof(intent));
+TheIntents[i] = intent % 16; // Keep intent in a valid range
+}
+
+for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+consume_data(&data, &size, &BPC[i], sizeof(BPC[i]));
+}
+
+for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+consume_data(&data, &size, &AdaptationStates[i], sizeof(AdaptationStates[i]));
+}
+
+consume_data(&data, &size, &dwFlags, sizeof(dwFlags));
+
+// Call the function under test
+cmsPipeline* pipeline = _cmsDefaultICCintents(ContextID, nProfiles, TheIntents, hProfiles, BPC, AdaptationStates, dwFlags);
+
+// Cleanup
+if (pipeline != NULL) {
+cmsPipelineFree(pipeline);
+}
+
+for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+cmsCloseProfile(hProfiles[i]);
+}
+
+cmsDeleteContext(ContextID);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: lcms
+function signature: cmsPipeline*  CMSEXPORT _cmsDefaultICCintents(cmsContext, cmsUInt32Number, cmsUInt32Number *, cmsHPROFILE *, cmsBool *, cmsFloat64Number *, cmsUInt32Number)
+</input>
+
+<description>
+The function `_cmsDefaultICCintents` is a helper function that creates a color transformation pipeline (LUT) based on a series of ICC profiles. It takes an array of profiles, corresponding rendering intents, and other parameters to construct a sequence of color transformations. It is the default implementation for handling ICC intents and is called by other parts of the lcms library, including plugins that define custom rendering intents.
+</description>
+
+<requirements>
+<requirement>
+The `nProfiles` argument must be greater than 0. This is to prevent a NULL return and potential crashes in the calling function.
+</requirement>
+<requirement>
+The `hProfiles` array must contain valid `cmsHPROFILE` handles. These can be created using functions like `cmsCreateLab2ProfileTHR`, `cmsOpenProfileFromFileTHR`, or `cmsCreateLinearizationDeviceLinkTHR`.
+</requirement>
+<requirement>
+The color spaces of adjacent profiles in the `hProfiles` array must be compatible. The function checks for compatibility and will fail if they are not.
+</requirement>
+<requirement>
+The `TheIntents` array should be populated with valid rendering intent constants. These can be standard intents like `INTENT_PERCEPTUAL`, or custom intents defined via a plugin.
+</requirement>
+<requirement>
+The `BPC` array should be initialized. It is an array of booleans indicating whether to apply black point compensation for each profile.
+</requirement>
+<requirement>
+The `AdaptationStates` array should be initialized. It is an array of doubles specifying the adaptation state for each profile.
+</requirement>
+<requirement>
+The `dwFlags` argument can be used to pass various flags, for example, `cmsFLAGS_NONEGATIVES` to clip negative values in the output.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: stack-buffer-overflow on address 0x7f8c72c9a848 at pc 0x5575c9709062 bp 0x7ffc3c811370 sp 0x7ffc3c810b30
+READ of size 56 at 0x7f8c72c9a848 thread T0
+SCARINESS: 41 (multi-byte-read-stack-buffer-overflow)
+#0 0x5575c9709061 in __asan_memcpy /src/llvm-project/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cpp:63:3
+#1 0x5575c9755e55 in cmsBuildParametricToneCurve /src/lcms/src/cmsgamma.c:901:5
+#2 0x5575c974b28c in CreateFuzzedToneCurve /src/cms_gdb_fuzzer.c:38:12
+#3 0x5575c974b28c in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:100:33
+#4 0x5575c95ff3a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x5575c95febc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x5575c96003a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#7 0x5575c9601135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#8 0x5575c95eff7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x5575c961b352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f8c73443082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#11 0x5575c95e27fd in _start (out/libfuzzer-address-x86_64/cms_gdb_fuzzer+0x767fd)
+
+DEDUP_TOKEN: __asan_memcpy--cmsBuildParametricToneCurve--CreateFuzzedToneCurve
+Address 0x7f8c72c9a848 is located in stack of thread T0 at offset 72 in frame
+#0 0x5575c974a83f in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:41
+
+DEDUP_TOKEN: LLVMFuzzerTestOneInput
+This frame has 8 object(s):
+[32, 72) 'params.i250' (line 28)
+[112, 152) 'params.i218' (line 28) <== Memory access at offset 72 partially underflows this variable
+[192, 232) 'params.i' (line 28)
+[272, 352) 'hProfiles' (line 66)
+[384, 424) 'TheIntents' (line 67)
+[464, 504) 'BPC' (line 68)
+[544, 624) 'AdaptationStates' (line 69)
+[656, 680) 'curves' (line 97)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+(longjmp and C++ exceptions *are* supported)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+1.  The fuzz driver's `CreateFuzzedToneCurve` function allocates a `double params[5]` array on the stack. This array has a size of 40 bytes.
+2.  It calls `cmsBuildParametricToneCurve` with a `type` parameter controlled by the fuzzer input.
+3.  The crashing input causes `type % 8` to become 6.
+4.  The `cmsBuildParametricToneCurve` function, when given `Type = 6`, expects 7 `double` parameters (56 bytes) as documented in its source code comments.
+5.  The function proceeds to read these 7 parameters from the `params` array provided by the fuzzer. Since the array only holds 5 `double`s, this read goes 16 bytes past the end of the buffer.
+6.  AddressSanitizer detects this out-of-bounds read and terminates the program, producing the crash report.
+
+The root cause is a bug in the `lcms` library. The `cmsBuildParametricToneCurve` function performs an unsafe memory access by reading from the `Params` array based on the `Type` argument without any mechanism to verify that the `Params` array is large enough. This is a classic example of a missing bounds check.
+
+**Suggestion for Project Patch:**
+
+The API for `cmsBuildParametricToneCurve` is inherently unsafe as it cannot know the size of the caller-provided `Params` array. A proper fix would involve changing the API to include the number of parameters, for example: `cmsBuildParametricToneCurve(ContextID, Type, Params, nParams)`.
+
+Within the function, a check could then be added:
+```c
+// Inside cmsBuildParametricToneCurve...
+cmsInt32Number required_params = 0;
+switch (Type) {
+case 1: required_params = 1; break;
+case 2: required_params = 4; break;
+// ... add cases for all types ...
+case 6: required_params = 7; break;
+// ...
+}
+
+if (nParams < required_params) {
+cmsSignalError(ContextID, cmsERROR_RANGE, "Not enough parameters for curve type %d", Type);
+return NULL;
+}
+```
+Since changing a public API can be a breaking change, a less disruptive (but also less safe) fix could be to add internal checks and assume a maximum number of parameters if the type is unknown, but the fundamental issue remains. The function should not read past the memory it is given.
+
+**Suggestion for Fuzz Driver:**
+
+While the bug is in the project, the fuzzer could be made more "intelligent" to avoid this specific crash and test other paths more effectively. It should provide an appropriately sized `params` array for the `type` it generates.
+
+```c
+// In CreateFuzzedToneCurve:
+
+// Allocate enough space for the largest possible type.
+// Type 8 requires 9 parameters.
+double params[10];
+uint8_t type;
+
+if (!consume_data(data, size, &type, sizeof(type))) return NULL;
+type = (type % 8) + 1; // Ensure type is 1-8
+
+// Determine required params based on type
+int n_params = 0;
+switch (type) {
+case 1: n_params = 1; break;
+case 2: n_params = 4; break;
+case 3: n_params = 5; break;
+case 4: n_params = 7; break;
+case 5: n_params = 4; break;
+case 6: n_params = 7; break;
+case 7: n_params = 8; break;
+case 8: n_params = 9; break;
+}
+
+// Consume the correct number of parameters
+if (*size < sizeof(double) * n_params) {
+return cmsBuildGamma(ContextID, 2.2); // Fallback
+}
+if (!consume_data(data, size, params, sizeof(double) * n_params)) return NULL;
+
+// ... (optional clamping of params) ...
+
+return cmsBuildParametricToneCurve(ContextID, type, params);
+```
+This change would make the fuzzer correctly exercise the `cmsBuildParametricToneCurve` API according to its documented requirements.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/cms_gdb_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/cms_gdb_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

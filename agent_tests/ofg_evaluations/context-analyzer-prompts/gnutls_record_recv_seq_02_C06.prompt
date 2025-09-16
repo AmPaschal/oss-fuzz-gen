@@ -1,0 +1,669 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project gnutls.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/gnutls/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+/*
+# Copyright 2016 Google Inc.
+# Copyright 2017 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+################################################################################
+*/
+
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <errno.h>
+
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
+#include "fuzzer.h"
+
+/* --- Certificate and Key Data --- */
+static char server_cert_pem[] =
+"-----BEGIN CERTIFICATE-----\n"
+"MIICATCCAWoCCQDLt40g8qLh/jANBgkqhkiG9w0BAQsFADBFMQswCQYDVQQGEwJE\n"
+"RTETMBEGA1UECAwKU29tZS1TdGF0ZTEhMB8GA1UECgwYSW50ZXJuZXQgV2lkZ2l0\n"
+"cyBQdHkgTHRkMB4XDTE3MDIxNDE1MzExMloXDTE4MDIxNDE1MzExMlowRTELMAkG\n"
+"A1UEBhMCREUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoMGEludGVybmV0\n"
+"IFdpZGdpdHMgUHR5IEx0ZDCBnzANBgkqhkiG9w0BAQEFAAOBjQAwgYkCgYEAyAeB\n"
+"q7Ti7oVExeVT1PqHGBXzC+johdeVnZgZRLhDTIaIGODV5F5JhE4NNb1O/DYLlAy5\n"
+"IIO8tfAE2KIxlarNH/+AcfV6ZJQSG4SSmhoIGzfdcdjuBmFfdfhO+z/cgqiewh53\n"
+"/fFCQlaJweHhpmim/LVL/M/1Rd6Urskv/5jXGG4FVUNfhXKQag0uzWsqcztCPX7L\n"
+"rqr2BSOmkA1nWzdoh5oBuxdooaH9/kwphqJAp03LwtaSStX/yz6Mh+ZqEbBuM4mW\n"
+"w/xKzbEbs7zA+d8sryHXkC8nsdA+h+IRd8bPa/KuWQNfjxXKNPzgmsZddHmHtYtW\n"
+"vAcoIMvtyO23Y2NhN4V0/7fwFLbZtfUBg4pqUl2ktkdwsNguTT1qzJCsYhsHXaqq\n"
+"vHy+5HR2D0w07y2X1qCVmfHzBZCM5OhxoeoauE+xu+5nvYrgsgPE0y5Nty0y2MrApg3d\n"
+
+"igaiKUXrI+mEVKn9vsQeaVvw9D6PgNQM99HkbGhRMGPOzcHjS/ZeLd1zAgMBAAEw\n"
+"DQYJKoZIhvcNAQELBQADgYEAjT943t9I834lGMAaM2j9k4gThAzXxl2kPjb9i7Yc\n"
+"i4zN3oX99svEy2e2kM+R6jG9p6wUes4uPE43dJlHGI2JEH5gI+N2tH13i+i2gTf6\n"
+"ZJjFMAvdFSbKzP23m3aG+Yp7Ua23a3xI3sH3jYyPWgSMyGg2lT0yA+k2kSxv4zV/\n"
+"I4c=\n"
+"-----END CERTIFICATE-----\n";
+
+static char server_key_pem[] =
+"-----BEGIN RSA PRIVATE KEY-----\n"
+"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\n"
+"-----END RSA PRIVATE KEY-----\n";
+
+/* --- Embedded mem.h and mem.c contents --- */
+struct mem_st {
+const uint8_t *data;
+size_t size;
+size_t read_pos;
+uint8_t *write_buf;
+size_t write_pos;
+size_t write_size;
+};
+
+static void init_mem_st(struct mem_st *mem)
+{
+mem->data = NULL;
+mem->size = 0;
+mem->read_pos = 0;
+mem->write_buf = NULL;
+mem->write_pos = 0;
+mem->write_size = 0;
+}
+
+static void free_mem_st(struct mem_st *mem)
+{
+free(mem->write_buf);
+init_mem_st(mem);
+}
+
+static ssize_t mem_push(gnutls_transport_ptr_t ptr, const void *data, size_t size)
+{
+struct mem_st *mem = ptr;
+if (mem->write_pos + size > mem->write_size) {
+size_t new_size = mem->write_size == 0 ? 1024 : mem->write_size * 2;
+if (mem->write_pos + size > new_size) {
+new_size = mem->write_pos + size;
+}
+uint8_t *new_buf = realloc(mem->write_buf, new_size);
+if (new_buf == NULL) {
+return -1;
+}
+mem->write_buf = new_buf;
+mem->write_size = new_size;
+}
+memcpy(mem->write_buf + mem->write_pos, data, size);
+mem->write_pos += size;
+return size;
+}
+
+static ssize_t mem_pull(gnutls_transport_ptr_t ptr, void *data, size_t size)
+{
+struct mem_st *mem = ptr;
+if (mem->read_pos >= mem->size) {
+gnutls_transport_set_errno(ptr, EAGAIN);
+return -1;
+}
+if (size > mem->size - mem->read_pos) {
+size = mem->size - mem->read_pos;
+}
+memcpy(data, mem->data + mem->read_pos, size);
+mem->read_pos += size;
+return size;
+}
+/* --- End of embedded code --- */
+
+
+/* This fuzzer establishes a connection between an in-memory client and server
+* and then uses the fuzzer input to test the record-receiving functionality.
+*/
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (gnutls_global_init() < 0) {
+return 0;
+}
+
+gnutls_session_t client_session = NULL;
+gnutls_session_t server_session = NULL;
+gnutls_certificate_credentials_t x509_cred_s = NULL;
+gnutls_certificate_credentials_t x509_cred_c = NULL;
+struct mem_st client_to_server, server_to_client;
+int ret;
+int client_ret = 0, server_ret = 0;
+gnutls_datum_t cert_datum = {.data = (unsigned char *)server_cert_pem, .size = sizeof(server_cert_pem) - 1};
+gnutls_datum_t key_datum = {.data = (unsigned char *)server_key_pem, .size = sizeof(server_key_pem) - 1};
+
+/* Initialize memory buffers for transport */
+init_mem_st(&client_to_server);
+init_mem_st(&server_to_client);
+
+/* Initialize server credentials */
+if (gnutls_certificate_allocate_credentials(&x509_cred_s) < 0) goto cleanup;
+if (gnutls_certificate_set_x509_key_mem(
+x509_cred_s, &cert_datum, &key_datum,
+GNUTLS_X509_FMT_PEM) < 0) {
+goto cleanup;
+}
+
+/* Initialize client credentials */
+if (gnutls_certificate_allocate_credentials(&x509_cred_c) < 0) goto cleanup;
+if (gnutls_certificate_set_x509_trust_mem(x509_cred_c, &cert_datum, GNUTLS_X509_FMT_PEM) < 0) {
+goto cleanup;
+}
+
+/* Initialize server session */
+if (gnutls_init(&server_session, GNUTLS_SERVER) < 0) goto cleanup;
+if (gnutls_priority_set_direct(server_session, "NORMAL", NULL) < 0) goto cleanup;
+if (gnutls_credentials_set(server_session, GNUTLS_CRD_CERTIFICATE, x509_cred_s) < 0) goto cleanup;
+gnutls_transport_set_ptr(server_session, &client_to_server);
+gnutls_transport_set_push_function(server_session, mem_push);
+gnutls_transport_set_pull_function(server_session, mem_pull);
+
+/* Initialize client session */
+if (gnutls_init(&client_session, GNUTLS_CLIENT) < 0) goto cleanup;
+if (gnutls_priority_set_direct(client_session, "NORMAL", NULL) < 0) goto cleanup;
+if (gnutls_credentials_set(client_session, GNUTLS_CRD_CERTIFICATE, x509_cred_c) < 0) goto cleanup;
+gnutls_transport_set_ptr(client_session, &server_to_client);
+gnutls_transport_set_push_function(client_session, mem_push);
+gnutls_transport_set_pull_function(client_session, mem_pull);
+
+/* Link the two sessions */
+server_to_client.data = client_to_server.write_buf;
+server_to_client.size = client_to_server.write_pos;
+client_to_server.data = server_to_client.write_buf;
+client_to_server.size = server_to_client.write_pos;
+
+/* Perform the handshake */
+do {
+server_to_client.size = client_to_server.write_pos;
+server_to_client.read_pos = 0;
+client_ret = gnutls_handshake(client_session);
+
+client_to_server.size = server_to_client.write_pos;
+client_to_server.read_pos = 0;
+server_ret = gnutls_handshake(server_session);
+} while ((client_ret < 0 && gnutls_error_is_fatal(client_ret) == 0) ||
+(server_ret < 0 && gnutls_error_is_fatal(server_ret) == 0));
+
+if (client_ret < 0 || server_ret < 0) {
+goto cleanup;
+}
+
+/* Handshake successful. Now fuzz the record layer. */
+
+/* Server sends the fuzzer data to the client */
+gnutls_record_send(server_session, data, size);
+
+/* Update the client's view of the data sent by the server */
+server_to_client.size = client_to_server.write_pos;
+server_to_client.read_pos = 0;
+
+/* Client receives the data using the target function */
+char buf[16384];
+unsigned char seq[8];
+while (true) {
+ret = gnutls_record_recv_seq(client_session, buf, sizeof(buf), seq);
+if (ret <= 0) {
+break;
+}
+}
+
+cleanup:
+if (client_session) gnutls_deinit(client_session);
+if (server_session) gnutls_deinit(server_session);
+if (x509_cred_s) gnutls_certificate_free_credentials(x509_cred_s);
+if (x509_cred_c) gnutls_certificate_free_credentials(x509_cred_c);
+free_mem_st(&client_to_server);
+free_mem_st(&server_to_client);
+gnutls_global_deinit();
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: gnutls
+function signature: ssize_t gnutls_record_recv_seq(gnutls_session_t, void *, size_t, unsigned char *)
+</input>
+
+<description>
+The `gnutls_record_recv_seq` function is responsible for receiving a TLS record from a GnuTLS session. It stores the record payload in the provided `data` buffer and the record's sequence number in the `seq` buffer. The function returns the number of bytes received in the payload, or a negative error code if the operation fails. It is a lower-level function for receiving data, and callers are responsible for managing the session state and providing appropriately sized buffers.
+</description>
+
+<requirements>
+<requirement>
+The `session` argument must be a valid, initialized `gnutls_session_t` object. This is because the function needs a valid session to receive any data.
+</requirement>
+<requirement>
+A handshake must be successfully completed on the `session` before calling this function. This is a necessary step to establish a secure channel before any record-layer communication can occur.
+</requirement>
+<requirement>
+The `data` argument must point to a valid, writable memory buffer, and `data_size` must be the size of this buffer. This is to prevent a buffer overflow when the received record payload is copied to the buffer.
+</requirement>
+<requirement>
+The `seq` argument must point to a valid, writable memory buffer of at least 8 bytes. This is because the TLS sequence number is a 64-bit integer, and this buffer is used to store the sequence number of the received record.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 51189176 byte(s) in 376391 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea6370f in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:207:8
+#2 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#3 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#4 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#5 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#6 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x56216e74bc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x56216e74d425 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x56216e74e1b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_x509_crt_init--parse_pem_cert_mem
+Direct leak of 9248 byte(s) in 68 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea6370f in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:207:8
+#2 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#3 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#4 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#5 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#6 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x56216e74bc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x56216e74dbd2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x56216e74dec2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_x509_crt_init--parse_pem_cert_mem
+Direct leak of 136 byte(s) in 1 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea6370f in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:207:8
+#2 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#3 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#4 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#5 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#6 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x56216e74d931 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#8 0x56216e74dec2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#9 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_x509_crt_init--parse_pem_cert_mem
+Indirect leak of 6022256 byte(s) in 376391 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea7b5b3 in gnutls_subject_alt_names_init /src/gnutls/lib/x509/x509_ext.c:50:10
+#2 0x56216ea6382e in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:220:11
+#3 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#4 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#5 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#6 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#7 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x56216e74bc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x56216e74d425 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x56216e74e1b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_subject_alt_names_init--gnutls_x509_crt_init
+Indirect leak of 6022256 byte(s) in 376391 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea7b5b3 in gnutls_subject_alt_names_init /src/gnutls/lib/x509/x509_ext.c:50:10
+#2 0x56216ea6384b in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:228:11
+#3 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#4 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#5 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#6 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#7 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x56216e74bc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x56216e74d425 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x56216e74e1b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_subject_alt_names_init--gnutls_x509_crt_init
+Indirect leak of 1088 byte(s) in 68 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea7b5b3 in gnutls_subject_alt_names_init /src/gnutls/lib/x509/x509_ext.c:50:10
+#2 0x56216ea6384b in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:228:11
+#3 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#4 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#5 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#6 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#7 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x56216e74bc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x56216e74dbd2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x56216e74dec2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_subject_alt_names_init--gnutls_x509_crt_init
+Indirect leak of 1088 byte(s) in 68 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea7b5b3 in gnutls_subject_alt_names_init /src/gnutls/lib/x509/x509_ext.c:50:10
+#2 0x56216ea6382e in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:220:11
+#3 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#4 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#5 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#6 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#7 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x56216e74bc45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x56216e74dbd2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x56216e74dec2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_subject_alt_names_init--gnutls_x509_crt_init
+Indirect leak of 16 byte(s) in 1 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea7b5b3 in gnutls_subject_alt_names_init /src/gnutls/lib/x509/x509_ext.c:50:10
+#2 0x56216ea6384b in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:228:11
+#3 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#4 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#5 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#6 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#7 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x56216e74d931 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#9 0x56216e74dec2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_subject_alt_names_init--gnutls_x509_crt_init
+Indirect leak of 16 byte(s) in 1 object(s) allocated from:
+#0 0x56216e8583b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x56216ea7b5b3 in gnutls_subject_alt_names_init /src/gnutls/lib/x509/x509_ext.c:50:10
+#2 0x56216ea6382e in gnutls_x509_crt_init /src/gnutls/lib/x509/x509.c:220:11
+#3 0x56216e94a2fa in parse_pem_cert_mem /src/gnutls/lib/cert-cred-x509.c:207:9
+#4 0x56216e94a2fa in read_cert_mem /src/gnutls/lib/cert-cred-x509.c:301:9
+#5 0x56216e949dc3 in gnutls_certificate_set_x509_key_mem2 /src/gnutls/lib/cert-cred-x509.c:670:13
+#6 0x56216e897b91 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:183:9
+#7 0x56216e74c420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x56216e74d931 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#9 0x56216e74dec2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x56216e73cffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x56216e7683d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f08f94fb082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--gnutls_subject_alt_names_init--gnutls_x509_crt_init
+
+</crash-stacktrace>
+
+<crash-analysis>
+The memory leak is caused by a bug in the gnutls library, not the fuzz driver.
+
+**Analysis:**
+The LeakSanitizer report indicates that memory is allocated in `gnutls_x509_crt_init` when parsing a certificate via `gnutls_certificate_set_x509_key_mem2`. The fuzz driver correctly implements a cleanup routine that is always executed before the function returns. Using GDB, we confirmed that the cleanup code is reached and that `gnutls_certificate_free_credentials` is called for the allocated credentials. Despite this, the memory leak occurs, which means the `gnutls_certificate_free_credentials` function fails to deallocate all the memory that was previously allocated for the certificate structure.
+
+**Suggestion:**
+The bug lies within the GnuTLS project. The implementation of `gnutls_certificate_free_credentials` should be reviewed to ensure it completely frees all memory associated with the certificate credentials, particularly the structures initialized by `gnutls_x509_crt_init`. The fuzz driver is implemented correctly and does not require any changes.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

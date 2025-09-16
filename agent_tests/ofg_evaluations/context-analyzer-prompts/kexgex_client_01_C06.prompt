@@ -1,0 +1,783 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project hpn-ssh.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/hpn-ssh/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdarg>
+#include <string>
+#include <vector>
+
+extern "C" {
+#include "includes.h"
+#include "kex.h"
+#include "packet.h"
+#include "compat.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "myproposal.h"
+#include "log.h"
+#include "sshkey.h"
+#include "authfile.h"
+#include "fixed-keys.h"
+#include "xmalloc.h"
+#include "dispatch.h"
+#include "digest.h"
+#include "dh.h"
+#include <openssl/dh.h>
+#include <openssl/bn.h>
+
+/*
+* Forward declare functions from sshpkt.h to avoid include issues in the
+* build environment.
+*/
+int sshpkt_start(struct ssh *, u_char);
+int sshpkt_put_bignum2(struct ssh *, const BIGNUM *);
+int sshpkt_send(struct ssh *);
+int sshpkt_put_stringb(struct ssh *, const struct sshbuf *);
+int sshpkt_put_string(struct ssh *, const void *, size_t);
+int sshpkt_get_bignum2(struct ssh *, BIGNUM **);
+int sshpkt_get_end(struct ssh *);
+
+// Forward declare for signature generation
+int kexgex_hash(int, const struct sshbuf *, const struct sshbuf *,
+const struct sshbuf *, const struct sshbuf *, const struct sshbuf *,
+int, int, int, const BIGNUM *, const BIGNUM *, const BIGNUM *,
+const BIGNUM *, const u_char *, size_t, u_char *, size_t *);
+
+int sshkey_sign(struct sshkey *, u_char **, size_t *,
+const u_char *, size_t, const char *, const char *, const char *, u_int);
+}
+
+// Custom DH key computation for the fuzzer's simulated server
+static int
+fuzz_kex_dh_compute_key_bn(DH *dh, const BIGNUM *pub_key, struct sshbuf *out)
+{
+BIGNUM *shared_secret = NULL;
+u_char *kbuf = NULL;
+size_t klen = 0;
+int kout, r;
+
+if (!dh_pub_is_valid(dh, pub_key)) {
+return SSH_ERR_MESSAGE_INCOMPLETE;
+}
+klen = DH_size(dh);
+if ((kbuf = (u_char*)malloc(klen)) == NULL ||
+(shared_secret = BN_new()) == NULL) {
+r = SSH_ERR_ALLOC_FAIL;
+goto out;
+}
+if ((kout = DH_compute_key(kbuf, pub_key, dh)) < 0 ||
+BN_bin2bn(kbuf, kout, shared_secret) == NULL) {
+r = SSH_ERR_LIBCRYPTO_ERROR;
+goto out;
+}
+r = sshbuf_put_bignum2(out, shared_secret);
+out:
+if (kbuf)
+free(kbuf);
+BN_clear_free(shared_secret);
+return r;
+}
+
+
+// Key preparation logic adapted from kex_fuzz.cc to be self-contained.
+static int prepare_key(struct sshkey **privkey_p, struct sshkey **pubkey_p) {
+const char *privstr = PRIV_RSA;
+const char *pubstr = PUB_RSA;
+struct sshbuf *b = NULL;
+int r;
+
+if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+abort();
+if ((r = sshkey_parse_private_fileblob(b, "", privkey_p, NULL)) != 0) {
+sshbuf_free(b);
+abort();
+}
+sshbuf_free(b);
+
+char *tmp, *cp;
+tmp = cp = xstrdup(pubstr);
+if ((*pubkey_p = sshkey_new(KEY_UNSPEC)) == NULL) {
+free(tmp);
+abort();
+}
+if ((r = sshkey_read(*pubkey_p, &cp)) != 0) {
+free(tmp);
+abort();
+}
+free(tmp);
+return 0;
+}
+
+// Helper to move a packet from a source ssh struct's output buffer to a
+// destination ssh struct's input buffer.
+static void transfer_packet(struct ssh *from, struct ssh *to) {
+const u_char *p;
+size_t len;
+p = ssh_output_ptr(from, &len);
+if (p == NULL || len == 0)
+return;
+if (ssh_input_append(to, p, len) != 0)
+abort();
+if (ssh_output_consume(from, len) != 0)
+abort();
+}
+
+extern "C" int kex_input_kexinit(int, u_int32_t, struct ssh *);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+static struct sshkey *client_privkey, *client_pubkey;
+static struct sshkey *server_privkey, *server_pubkey;
+FuzzedDataProvider provider(data, size);
+
+struct ssh *client = NULL;
+struct ssh *server = NULL;
+char *proposal_copy[PROPOSAL_MAX] = {0};
+BIGNUM *p = NULL, *g = NULL;
+DH *server_dh = NULL;
+u_char *signature = NULL;
+BIGNUM *f = NULL;
+size_t slen = 0;
+
+// One-time setup for logging and keys
+if (client_pubkey == NULL) {
+log_init("fuzz", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_AUTH, 1);
+if (prepare_key(&client_privkey, &client_pubkey) != 0)
+abort();
+if (prepare_key(&server_privkey, &server_pubkey) != 0)
+abort();
+}
+
+struct kex_params kex_params;
+
+// Set up a valid proposal for kexgex
+const char *proposal_template[PROPOSAL_MAX] = { KEX_CLIENT };
+for (size_t i = 0; i < PROPOSAL_MAX; i++) {
+proposal_copy[i] = (proposal_template[i] == NULL) ? NULL : xstrdup(proposal_template[i]);
+}
+
+free(proposal_copy[PROPOSAL_KEX_ALGS]);
+proposal_copy[PROPOSAL_KEX_ALGS] = xstrdup("diffie-hellman-group-exchange-sha256");
+free(proposal_copy[PROPOSAL_SERVER_HOST_KEY_ALGS]);
+proposal_copy[PROPOSAL_SERVER_HOST_KEY_ALGS] = xstrdup(sshkey_ssh_name(server_pubkey));
+
+memcpy(kex_params.proposal, proposal_copy, sizeof(proposal_copy));
+
+// Initialize the client and a dummy server
+if (ssh_init(&client, 0 /* is_server */, &kex_params) != 0 ||
+ssh_init(&server, 1 /* is_server */, &kex_params) != 0) {
+goto cleanup;
+}
+
+// Set server version string needed for hash
+server->kex->server_version = sshbuf_new();
+sshbuf_put_cstring(server->kex->server_version, "SSH-2.0-fuzz");
+
+if (ssh_add_hostkey(client, server_pubkey) != 0 ||
+ssh_add_hostkey(server, server_privkey) != 0) {
+goto cleanup;
+}
+
+// === Stage 1: KEXINIT exchange ===
+if (kex_send_kexinit(client) != 0 || kex_send_kexinit(server) != 0)
+goto cleanup;
+
+transfer_packet(server, client);
+
+if (client->kex) {
+client->kex->dh_need = provider.ConsumeIntegralInRange<u_int>(1024, 2048);
+if (provider.ConsumeBool()) {
+client->compat |= SSH_BUG_DHGEX_LARGE;
+}
+}
+
+ssh_dispatch_set(client, SSH2_MSG_KEXINIT, &kex_input_kexinit);
+if (ssh_dispatch_run(client, DISPATCH_NONBLOCK, &client->kex->done) != 0)
+goto cleanup;
+
+// === Stage 2: Simulate server's KEX_DH_GEX_GROUP reply ===
+if ((p = BN_new()) == NULL || (g = BN_new()) == NULL) abort();
+
+// Use a fixed valid DH group for simplicity
+BN_hex2bn(&p, "00FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCE38934D034B90C63298E75B1A45517C95958511DF29E1F6B227CEAE2491B3D5C3F40C04559188D8D");
+BN_set_word(g, 2);
+
+if (sshpkt_start(server, SSH2_MSG_KEX_DH_GEX_GROUP) != 0 ||
+sshpkt_put_bignum2(server, p) != 0 ||
+sshpkt_put_bignum2(server, g) != 0 ||
+sshpkt_send(server) != 0) {
+goto cleanup;
+}
+
+transfer_packet(server, client);
+if (ssh_dispatch_run(client, DISPATCH_NONBLOCK, &client->kex->done) != 0)
+goto cleanup;
+
+// === Stage 2.5: Server computes signature ===
+{
+BIGNUM *client_pub = NULL;
+struct sshbuf *shared_secret = NULL;
+u_char hash[SSH_DIGEST_MAX_LENGTH];
+size_t hashlen = sizeof(hash);
+u_char *host_key_blob = NULL;
+size_t host_key_blob_len = 0;
+const BIGNUM *pub_key;
+struct sshbuf *hkb_buf = NULL;
+
+if ((f = BN_new()) == NULL || (client_pub = BN_new()) == NULL) abort();
+
+transfer_packet(client, server);
+if (sshpkt_get_bignum2(server, &client_pub) != 0 || sshpkt_get_end(server) != 0)
+goto sign_cleanup;
+
+if ((server_dh = dh_new_group(g, p)) == NULL) goto sign_cleanup;
+if (dh_gen_key(server_dh, sshkey_size(server_privkey)) != 0) goto sign_cleanup;
+DH_get0_key(server_dh, &pub_key, NULL);
+BN_copy(f, pub_key);
+
+if ((shared_secret = sshbuf_new()) == NULL) goto sign_cleanup;
+if (fuzz_kex_dh_compute_key_bn(server_dh, client_pub, shared_secret) != 0)
+goto sign_cleanup;
+
+if (sshkey_to_blob(server_pubkey, &host_key_blob, &host_key_blob_len) != 0)
+goto sign_cleanup;
+if ((hkb_buf = sshbuf_from(host_key_blob, host_key_blob_len)) == NULL)
+goto sign_cleanup;
+
+if (kexgex_hash(client->kex->hash_alg, client->kex->client_version,
+client->kex->server_version, client->kex->my, client->kex->peer,
+hkb_buf, client->kex->min, client->kex->nbits, client->kex->max,
+p, g, client_pub, f, sshbuf_ptr(shared_secret), sshbuf_len(shared_secret),
+hash, &hashlen) != 0)
+goto sign_cleanup;
+
+if (sshkey_sign(server_privkey, &signature, &slen, hash, hashlen,
+client->kex->hostkey_alg, NULL, NULL, 0) != 0)
+goto sign_cleanup;
+
+sign_cleanup:
+BN_free(client_pub);
+sshbuf_free(shared_secret);
+sshbuf_free(hkb_buf);
+free(host_key_blob);
+}
+
+// === Stage 3: Simulate server's KEX_DH_GEX_REPLY reply ===
+if (f != NULL && signature != NULL) {
+u_char *host_key_blob = NULL;
+size_t host_key_blob_len = 0;
+
+if (sshkey_to_blob(server_pubkey, &host_key_blob, &host_key_blob_len) == 0) {
+if (sshpkt_start(server, SSH2_MSG_KEX_DH_GEX_REPLY) == 0 &&
+sshpkt_put_string(server, host_key_blob, host_key_blob_len) == 0 &&
+sshpkt_put_bignum2(server, f) == 0 &&
+sshpkt_put_string(server, signature, slen) == 0 &&
+sshpkt_send(server) == 0) {
+
+transfer_packet(server, client);
+ssh_dispatch_run(client, DISPATCH_NONBLOCK, &client->kex->done);
+}
+free(host_key_blob);
+}
+}
+
+cleanup:
+DH_free(server_dh);
+BN_free(f);
+BN_free(p);
+BN_free(g);
+free(signature);
+for (size_t i = 0; i < PROPOSAL_MAX; i++)
+free(proposal_copy[i]);
+if (client)
+ssh_free(client);
+if (server)
+ssh_free(server);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: hpn-ssh
+function signature: kexgex_client(struct ssh *ssh)
+</input>
+
+<description>
+The `kexgex_client` function is responsible for initiating the Diffie-Hellman Group Exchange (DH-GEX) key exchange process from the client's side. It constructs and sends a `SSH2_MSG_KEX_DH_GEX_REQUEST` packet to the SSH server. This packet includes the client's desired range for the size of the Diffie-Hellman group (minimum, preferred, and maximum number of bits). After sending the request, the function sets up a dispatch handler (`input_kex_dh_gex_group`) to process the server's `SSH2_MSG_KEX_DH_GEX_GROUP` response, which will contain the server's chosen group parameters. The function's primary role is to communicate the client's DH-GEX preferences to the server and prepare for the next step in the key exchange.
+
+The function takes a pointer to a `struct ssh` as its only argument. This `ssh` struct is a large and complex data structure that holds the entire state of the SSH connection. The callers of `kexgex_client` do not call it directly, but instead assign it to a function pointer in the `ssh->kex->kex` array. The actual execution is triggered later during the key exchange process. Therefore, the `ssh` struct must be fully initialized and connected before `kexgex_client` is called. This initialization is typically handled by functions like `ssh_connect` and `ssh_login`.
+
+The function's behavior depends on several fields within the `ssh` and `kex` structs. It uses `ssh->kex->dh_need` to estimate the required number of bits for the DH group. It also checks the `ssh->compat` field for the `SSH_BUG_DHGEX_LARGE` flag, which, if set, limits the number of bits to 4096. The `kex->min` and `kex->max` fields are hardcoded to `DH_GRP_MIN` (2048) and `DH_GRP_MAX` (8192) respectively. The function relies on the `sshpkt_*` API to construct and send the packet, so the `ssh` struct must be in a state that allows for packet operations. Finally, it uses `ssh_dispatch_set` to register a handler for the server's response, which means the dispatch mechanism must be active.
+</description>
+
+<requirements>
+<requirement>
+The `ssh` argument must be a valid, fully initialized, and connected `ssh` struct. This is because the function accesses various members of the `ssh` and `ssh->kex` structs and uses the `sshpkt_*` API, which requires a connected session.
+</requirement>
+<requirement>
+The `ssh->kex` pointer must not be NULL. This is because the function dereferences `ssh->kex` in its first line without any prior null check.
+</requirement>
+<requirement>
+The `ssh->kex->dh_need` field must be initialized to a reasonable value. This value is used by the `dh_estimate` function to determine the preferred number of bits for the key exchange.
+</requirement>
+<requirement>
+The `ssh->compat` field should be fuzzed to include the `SSH_BUG_DHGEX_LARGE` flag. This will exercise the code path that limits the number of bits to 4096.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 9863808 byte(s) in 72528 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5563 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:121:13
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55a2eed5eac5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55a2eed5f855 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Direct leak of 1740672 byte(s) in 72528 object(s) allocated from:
+#0 0x55a2eee6988f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55a2eefc57ed in CRYPTO_zalloc (out/libfuzzer-address-x86_64/authopt_fuzz+0x3517ed)
+#2 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a2eed5eac5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55a2eed5f855 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--CRYPTO_zalloc--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Direct leak of 9792 byte(s) in 72 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5563 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:121:13
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55a2eed5f272 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55a2eed5f562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Direct leak of 1728 byte(s) in 72 object(s) allocated from:
+#0 0x55a2eee6988f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55a2eefc57ed in CRYPTO_zalloc (out/libfuzzer-address-x86_64/authopt_fuzz+0x3517ed)
+#2 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a2eed5f272 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#5 0x55a2eed5f562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#6 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--CRYPTO_zalloc--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Direct leak of 816 byte(s) in 6 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5563 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:121:13
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55a2eed5d1a6 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#10 0x55a2eed5f79f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#11 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Direct leak of 144 byte(s) in 6 object(s) allocated from:
+#0 0x55a2eee6988f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55a2eefc57ed in CRYPTO_zalloc (out/libfuzzer-address-x86_64/authopt_fuzz+0x3517ed)
+#2 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a2eed5d1a6 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#5 0x55a2eed5f79f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#6 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--CRYPTO_zalloc--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Direct leak of 136 byte(s) in 1 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5563 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:121:13
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5efd1 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#9 0x55a2eed5f562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Direct leak of 24 byte(s) in 1 object(s) allocated from:
+#0 0x55a2eee6988f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55a2eefc57ed in CRYPTO_zalloc (out/libfuzzer-address-x86_64/authopt_fuzz+0x3517ed)
+#2 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a2eed5efd1 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#4 0x55a2eed5f562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#5 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#6 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#7 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--CRYPTO_zalloc--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Indirect leak of 18567168 byte(s) in 72528 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5647 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:130:26
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55a2eed5eac5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55a2eed5f855 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Indirect leak of 18432 byte(s) in 72 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5647 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:130:26
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55a2eed5f272 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55a2eed5f562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Indirect leak of 1536 byte(s) in 6 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5647 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:130:26
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5d2e5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55a2eed5d1a6 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#10 0x55a2eed5f79f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#11 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+Indirect leak of 256 byte(s) in 1 object(s) allocated from:
+#0 0x55a2eee69a59 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a2eeeb5647 in sshbuf_new_label /src/hpn-ssh/sshbuf.c:130:26
+#2 0x55a2eef4b60f in kex_new /src/hpn-ssh/kex.c:679:29
+#3 0x55a2eeef4d82 in ssh_alloc_session_state /src/hpn-ssh/packet.c:253:18
+#4 0x55a2eeef5714 in ssh_packet_set_connection /src/hpn-ssh/packet.c:331:9
+#5 0x55a2eeeb19e0 in ssh_init /src/hpn-ssh/ssh_api.c:101:13
+#6 0x55a2eeea92ec in LLVMFuzzerTestOneInput /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc:165:9
+#7 0x55a2eed5dac0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55a2eed5efd1 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:807:3
+#9 0x55a2eed5f562 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55a2eed4e69b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55a2eed79a72 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fb263b35082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--sshbuf_new_label--kex_new
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a memory leak caused by a bug in the project's cleanup logic.
+
+**Analysis:**
+1. The LeakSanitizer report shows that memory allocated by `kex_new` is being leaked. `kex_new` is called from within `ssh_init`.
+2. The fuzz driver correctly allocates `ssh` structures for a client and server using `ssh_init` and correctly calls `ssh_free` on both at the end of the test case.
+3. `ssh_free` calls `ssh_packet_close`, which in turn calls `ssh_packet_close_internal`.
+4. The source code for `ssh_packet_close_internal` shows that it frees various buffers and keying material associated with the `ssh` session state. However, it does *not* call `kex_free` to deallocate the `ssh->kex` structure itself. This is the direct cause of the memory leak.
+
+**Suggestion:**
+To fix the bug, a call to `kex_free(ssh->kex)` should be added to the `ssh_packet_close_internal` function in `packet.c`. This will ensure that the key exchange-related memory is properly released when an `ssh` session is closed.
+
+```c
+// In /src/hpn-ssh/packet.c, inside ssh_packet_close_internal
+
+static void
+ssh_packet_close_internal(struct ssh *ssh, int do_close)
+{
+struct session_state *state = ssh->state;
+u_int mode;
+
+if (!state->initialized)
+return;
+state->initialized = 0;
+if (do_close) {
+if (state->connection_in == state->connection_out) {
+close(state->connection_out);
+} else {
+close(state->connection_in);
+close(state->connection_out);
+}
+}
+sshbuf_free(state->input);
+sshbuf_free(state->output);
+sshbuf_free(state->outgoing_packet);
+sshbuf_free(state->incoming_packet);
+for (mode = 0; mode < MODE_MAX; mode++) {
+kex_free_newkeys(state->newkeys[mode]);	/* current keys */
+state->newkeys[mode] = NULL;
+ssh_clear_newkeys(ssh, mode);		/* next keys */
+}
+// Add the following line:
+kex_free(ssh->kex);
+
+#ifdef WITH_ZLIB
+/* compression state is in shared mem, so we can only release it once */
+if (do_close && state->compression_buffer) {
+sshbuf_free(state->compression_buffer);
+if (state->compression_out_started) {
+```
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/hpn-ssh/regress/misc/fuzz-harness/authopt_fuzz.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

@@ -1,0 +1,633 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project lcms.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/lcms/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+#include "/src/lcms/include/lcms2.h"
+
+// A simple data provider to consume data from the fuzzer input buffer.
+typedef struct {
+const uint8_t* data;
+size_t size;
+size_t offset;
+} DataProvider;
+
+// Consume data as an integer within a given range.
+int consume_int(DataProvider* p, int min, int max) {
+if (max <= min || p->offset + sizeof(int) > p->size) {
+return min;
+}
+int val;
+memcpy(&val, p->data + p->offset, sizeof(int));
+p->offset += sizeof(int);
+return min + (abs(val) % (max - min + 1));
+}
+
+// Consume data as a float.
+float consume_float(DataProvider* p) {
+if (p->offset + sizeof(float) > p->size) {
+return 0.0f;
+}
+float val;
+memcpy(&val, p->data + p->offset, sizeof(float));
+p->offset += sizeof(float);
+// Return 0 for non-finite values to avoid issues with fprintf.
+return isfinite(val) ? val : 0.0f;
+}
+
+// Consume data as a sanitized string.
+void consume_string(DataProvider* p, char* out, size_t max_len) {
+if (p->offset >= p->size || max_len == 0) {
+out[0] = '\0';
+return;
+}
+// Use one byte for length.
+size_t len_to_copy = p->data[p->offset] % max_len;
+p->offset++;
+
+if (p->offset + len_to_copy > p->size) {
+len_to_copy = p->size - p->offset;
+}
+
+memcpy(out, p->data + p->offset, len_to_copy);
+out[len_to_copy] = '\0';
+p->offset += len_to_copy;
+
+// Sanitize the string to be valid in a "TITLE" field.
+for (size_t i = 0; i < len_to_copy; ++i) {
+if (!isprint(out[i]) || out[i] == '"' || out[i] == '\\') {
+out[i] = 'a';
+}
+}
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 100) { // Need a reasonable amount of data to build a file.
+return 0;
+}
+
+DataProvider p = {data, size, 0};
+
+char filename[256];
+sprintf(filename, "/tmp/fuzz-%d.cube", getpid());
+
+FILE *fp = fopen(filename, "w"); // Open in text mode "w".
+if (!fp) {
+return 0;
+}
+
+// 1. Construct a plausible .cube file from fuzzer data.
+char title[128];
+consume_string(&p, title, 127);
+fprintf(fp, "TITLE \"%s\"\n", title);
+
+// Keep LUT sizes small to avoid OOMs and timeouts.
+int lut_1d_size = consume_int(&p, 2, 64);
+int lut_3d_size = consume_int(&p, 2, 33); // Max 33 for lcms
+fprintf(fp, "LUT_1D_SIZE %d\n", lut_1d_size);
+fprintf(fp, "LUT_3D_SIZE %d\n", lut_3d_size);
+
+// Write domain, which is optional in the format.
+if (consume_int(&p, 0, 1)) {
+fprintf(fp, "DOMAIN_MIN %f %f %f\n", consume_float(&p), consume_float(&p), consume_float(&p));
+fprintf(fp, "DOMAIN_MAX %f %f %f\n", consume_float(&p), consume_float(&p), consume_float(&p));
+}
+
+// 2. Write LUT table data.
+for (int i = 0; i < lut_1d_size; ++i) {
+if (p.offset >= p.size) break;
+fprintf(fp, "%f %f %f\n", consume_float(&p), consume_float(&p), consume_float(&p));
+}
+
+int num_3d_entries = lut_3d_size * lut_3d_size * lut_3d_size;
+for (int i = 0; i < num_3d_entries; ++i) {
+if (p.offset >= p.size) break; // Stop if we run out of data.
+fprintf(fp, "%f %f %f\n", consume_float(&p), consume_float(&p), consume_float(&p));
+}
+
+fclose(fp);
+
+// 3. Call the target function with the generated file.
+// Use the non-thread-safe version as specified, which uses a global context.
+cmsHPROFILE hProfile = cmsCreateDeviceLinkFromCubeFile(filename);
+if (hProfile) {
+cmsCloseProfile(hProfile);
+}
+
+remove(filename);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: lcms
+function signature: cmsHPROFILE cmsCreateDeviceLinkFromCubeFile(const char *cFileName)
+</input>
+
+<description>
+The function `cmsCreateDeviceLinkFromCubeFile` creates a device link profile from a .cube file. It is a wrapper for `cmsCreateDeviceLinkFromCubeFileTHR`. The file name is passed as an argument, and the function attempts to open and parse it as a .cube file. If successful, it creates a device link profile; otherwise, it returns NULL.
+</description>
+
+<requirements>
+<requirement> The cFileName argument must be a path to a readable file. This is because the function uses fopen to open the file. </requirement> <requirement> The file pointed to by cFileName must be a valid .cube file. This is because the file is parsed by the ParseCube function. </requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 221266800 byte(s) in 2741 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2a092a in ParseCube /src/lcms/src/cmscgats.c:3180:47
+#2 0x55603c2a092a in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#3 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#4 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#7 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#8 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--ParseCube--cmsCreateDeviceLinkFromCubeFileTHR
+Direct leak of 4394436 byte(s) in 20522 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2a023b in ParseCube /src/lcms/src/cmscgats.c:3150:64
+#2 0x55603c2a023b in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#3 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#4 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#7 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#8 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--ParseCube--cmsCreateDeviceLinkFromCubeFileTHR
+Direct leak of 175424 byte(s) in 2741 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2e093e in _cmsStageAllocPlaceholder /src/lcms/src/cmslut.c:40:32
+#4 0x55603c2e093e in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:255:14
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 67362816 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2c1e85 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:256:42
+#4 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 2762928 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2c1d9d in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:241:43
+#4 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 1776168 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2cd536 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55603c2cdb44 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55603c2c267f in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:298:24
+#6 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#7 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#8 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#9 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#10 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 1776168 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2cd536 in _cmsComputeInterpParamsEx /src/lcms/src/cmsintrp.c:126:28
+#4 0x55603c2cdb44 in _cmsComputeInterpParams /src/lcms/src/cmsintrp.c:172:12
+#5 0x55603c2c2125 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:282:36
+#6 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#7 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#8 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#9 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#10 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 460488 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2c1d62 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:232:25
+#4 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 369768 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf2cb in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf2cb in _cmsDupDefaultFn /src/lcms/src/cmserr.c:172:11
+#3 0x55603c2c2231 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:287:69
+#4 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsDupDefaultFn
+Indirect leak of 197352 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2c2029 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:275:45
+#4 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 197352 byte(s) in 8223 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2c1dd1 in AllocateToneCurveStruct /src/lcms/src/cmsgamma.c:244:55
+#4 0x55603c2e0b56 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:280:38
+#5 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#6 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#7 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#8 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 65784 byte(s) in 2741 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2e0ad4 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:268:44
+#4 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#5 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#6 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#7 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+Indirect leak of 43856 byte(s) in 2741 object(s) allocated from:
+#0 0x55603c1fa18f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55603c2bf055 in _cmsMalloc /src/lcms/src/cmserr.c:268:12
+#2 0x55603c2bf055 in _cmsMallocZeroDefaultFn /src/lcms/src/cmserr.c:107:16
+#3 0x55603c2e0a83 in cmsStageAllocToneCurves /src/lcms/src/cmslut.c:259:42
+#4 0x55603c2a08b3 in ParseCube /src/lcms/src/cmscgats.c:3171:27
+#5 0x55603c2a08b3 in cmsCreateDeviceLinkFromCubeFileTHR /src/lcms/src/cmscgats.c:3229:10
+#6 0x55603c23adb4 in LLVMFuzzerTestOneInput /src/cms_gdb_fuzzer.c:114:28
+#7 0x55603c0ee3c0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55603c0edbe5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55603c0ef3c5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55603c0f0155 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55603c0def9b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55603c10a372 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fa955f81082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_cmsMalloc--_cmsMallocZeroDefaultFn
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is caused by a memory leak in the `lcms` library, specifically within the `ParseCube` function in `cmscgats.c`.
+
+**Analysis:**
+
+1.  **Memory Leak in `ParseCube`:** The crash log clearly indicates multiple memory leaks originating from the `ParseCube` function. The most significant leaks are associated with memory allocated for `shapers` and `lut_table`.
+
+*   At line 3150, `shapers` is allocated:
+```c
+cmsFloat32Number* shapers = (cmsFloat32Number*)_cmsMalloc(cube->ContextID, 3 * shaper_size * sizeof(cmsFloat32Number));
+```
+This memory is used to build tone curves, which are then added to a `cmsStage` (`Shaper`). However, the `shapers` buffer itself is never freed.
+
+*   At line 3180, `lut_table` is allocated:
+```c
+cmsFloat32Number* lut_table = _cmsMalloc(cube->ContextID, nodes * 3 * sizeof(cmsFloat32Number));
+```
+This table is used to create a CLUT stage (`CLUT`). The data is copied into the stage by `cmsStageAllocCLutFloat`. The original `lut_table` is freed at line 3195, which is correct. However, other allocations within the functions called from `ParseCube` (like `cmsStageAllocToneCurves` and its sub-functions) are the source of the indirect leaks reported by ASan.
+
+2.  **GDB Investigation:** The GDB session was initially misleading because the provided crashing input `/artifact/crash-da39a3ee5e6b4b0d3255bfef95601890afd80709` was an empty file. This caused the fuzzer to return early without calling the target `lcms` functions, hence no breakpoints were hit. This is a common occurrence in fuzzing where a corpus might contain empty or minimal files that don't trigger the bug but are kept for coverage reasons. The actual crash is triggered by a non-empty, well-formed `.cube` file that exposes the leak.
+
+3.  **Root Cause:** The function `ParseCube` allocates memory for `shapers` on the heap. This memory is used to populate tone curve structures. After the tone curves are created and encapsulated within a pipeline stage, the original `shapers` buffer is no longer needed but is not deallocated. This happens on successful parsing paths. If an error occurs during parsing, the function might return early, and the `Done:` cleanup section in `cmsCreateDeviceLinkFromCubeFileTHR` will handle freeing some, but not all, of the allocated resources. The `shapers` buffer, being local to `ParseCube`, is not visible to the cleanup code in the caller.
+
+**Suggestion for Patching the Project:**
+
+The memory allocated for `shapers` at line 3150 in `cmscgats.c` needs to be freed after it's been used to build the tone curves. A call to `_cmsFree` should be added after the tone curves have been created and the `Shaper` stage has been allocated.
+
+**Proposed Patch:**
+
+In `cmscgats.c`, add a `_cmsFree` call for the `shapers` buffer.
+
+```c
+// In cmscgats.c, inside ParseCube function
+
+// ... after line 3173
+cmsFreeToneCurveTriple(curves);
+_cmsFree(cube->ContextID, shapers); // <-- ADD THIS LINE
+}
+//...
+```
+
+This will release the memory allocated for the `shapers` array after it is no longer needed, fixing the direct memory leak. The indirect leaks are likely consequences of this primary leak and should be resolved as well, as freeing the top-level structures should trigger the freeing of their internal components.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/cms_gdb_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/cms_gdb_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

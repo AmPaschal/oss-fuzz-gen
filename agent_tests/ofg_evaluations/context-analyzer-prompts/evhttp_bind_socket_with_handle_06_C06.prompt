@@ -1,0 +1,481 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libevent.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/libevent/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+extern "C" {
+#include "libevent/include/event2/event.h"
+#include "libevent/include/event2/http.h"
+#include "libevent/include/event2/buffer.h"
+#include "libevent/include/event2/bufferevent.h" // For bufferevent_pair_new
+#include "libevent/http-internal.h" // For evhttp_bound_socket definition
+}
+
+// Dummy callback for handling HTTP requests.
+void generic_request_handler(struct evhttp_request *req, void *arg) {
+if (req) {
+evhttp_send_reply(req, HTTP_OK, "OK", NULL);
+}
+}
+
+// Custom bufferevent creation callback to exercise an uncovered code path.
+// It creates a pair of bufferevents and passes one to the server, keeping
+// the other for the fuzzer to write to.
+struct bufferevent* bev_creator_cb(struct event_base *base, void *arg) {
+struct bufferevent **bevs_out = (struct bufferevent **)arg;
+struct bufferevent *pair[2];
+if (bufferevent_pair_new(base, BEV_OPT_CLOSE_ON_FREE, pair) < 0) {
+return NULL;
+}
+// The http server will use pair[0]. We keep pair[1] to write to it.
+bevs_out[0] = pair[0];
+bevs_out[1] = pair[1];
+return pair[0];
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+FuzzedDataProvider data_provider(data, size);
+
+struct event_base *base = event_base_new();
+if (!base) {
+return 0;
+}
+
+struct evhttp *http = evhttp_new(base);
+if (!http) {
+event_base_free(base);
+return 0;
+}
+
+evhttp_set_gencb(http, generic_request_handler, NULL);
+
+// This will hold the two ends of our bufferevent pair if the custom cb is used.
+struct bufferevent *bevs[2] = {NULL, NULL};
+
+// With some probability, set the custom bufferevent creator callback.
+if (data_provider.ConsumeBool()) {
+evhttp_set_bevcb(http, bev_creator_cb, bevs);
+}
+
+const char *address = data_provider.PickValueInArray<const char *>({
+nullptr, "127.0.0.1", "0.0.0.0", "::1", "::", "localhost",
+});
+
+std::string random_address_str;
+if (data_provider.ConsumeBool()) {
+random_address_str = data_provider.ConsumeRandomLengthString(32);
+address = random_address_str.c_str();
+}
+
+const uint16_t port = data_provider.ConsumeIntegral<uint16_t>();
+
+struct evhttp_bound_socket *bound_socket =
+evhttp_bind_socket_with_handle(http, address, port);
+
+if (bound_socket) {
+// If we used the custom bevcb, bevs[1] is the client-side bufferevent.
+if (bevs[1]) {
+std::string request_data = data_provider.ConsumeRemainingBytesAsString();
+if (!request_data.empty()) {
+// Write data to our side of the pair, which will be received by the server.
+bufferevent_write(bevs[1], request_data.c_str(), request_data.length());
+}
+// Run the event loop to process the connection and data.
+event_base_loop(base, EVLOOP_NONBLOCK);
+// The server side (bevs[0]) is freed by libevent. We free our side.
+bufferevent_free(bevs[1]);
+} else {
+// Original logic for real socket connections
+evutil_socket_t listener_fd = evhttp_bound_socket_get_fd(bound_socket);
+struct sockaddr_storage ss;
+socklen_t slen = sizeof(ss);
+if (getsockname(listener_fd, (struct sockaddr *)&ss, &slen) == 0) {
+int client_fd = socket(ss.ss_family, SOCK_STREAM, 0);
+if (client_fd != -1) {
+fcntl(client_fd, F_SETFL, O_NONBLOCK);
+connect(client_fd, (struct sockaddr *)&ss, slen);
+std::string request_data = data_provider.ConsumeRemainingBytesAsString();
+if (!request_data.empty()) {
+write(client_fd, request_data.c_str(), request_data.length());
+}
+event_base_loop(base, EVLOOP_NONBLOCK);
+close(client_fd);
+}
+}
+}
+evhttp_del_accept_socket(http, bound_socket);
+}
+
+evhttp_free(http);
+event_base_free(base);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libevent
+function signature: struct evhttp_bound_socket * evhttp_bind_socket_with_handle(struct evhttp *, const char *, uint16_t)
+</input>
+
+<description>
+The function `evhttp_bind_socket_with_handle` creates a listening socket and makes it available for an HTTP server. It takes an `evhttp` structure, a string for the address, and a port number. It returns a pointer to a `evhttp_bound_socket` structure on success, or NULL on failure. The address can be a NULL pointer, in which case the socket is bound to 0.0.0.0 (all interfaces). The port can be 0, in which case the system will pick an available port.
+</description>
+
+<requirements>
+<requirement>
+The evhttp_new function should be called to initialize the `http` argument. This is because the `http` argument is passed to `evhttp_accept_socket_with_handle` which expects a valid and initialized evhttp object.
+</requirement>
+<requirement>
+The `address` argument can be a fuzzed string or NULL. This is because the function can handle NULL as a valid address, and otherwise expects a valid address string.
+</requirement>
+<requirement>
+The `port` argument should be a fuzzed 16-bit integer. This is because the function can handle any port number, including 0 for an ephemeral port.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Indirect leak of 58184408 byte(s) in 108553 object(s) allocated from:
+#0 0x555af3c8a4b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x555af3cd4c75 in bufferevent_pair_elt_new /src/libevent/bufferevent_pair.c:95:17
+#2 0x555af3cd4c75 in bufferevent_pair_new /src/libevent/bufferevent_pair.c:125:11
+#3 0x555af3cc9ac0 in bev_creator_cb(event_base*, void*) /src/utils_fuzzer.cc:35:9
+#4 0x555af3d2db28 in evhttp_get_request_connection /src/libevent/http.c:4662:10
+#5 0x555af3d2db28 in evhttp_get_request /src/libevent/http.c:4742:10
+#6 0x555af3d2db28 in accept_socket_cb /src/libevent/http.c:3882:2
+#7 0x555af3d588d6 in listener_read_cb /src/libevent/listener.c:465:3
+#8 0x555af3cff1af in event_persist_closure /src/libevent/event.c:1665:2
+#9 0x555af3cff1af in event_process_active_single_queue /src/libevent/event.c:1727:4
+#10 0x555af3cf112e in event_process_active /src/libevent/event.c
+#11 0x555af3cf112e in event_base_loop /src/libevent/event.c:2078:12
+#12 0x555af3cca61e in LLVMFuzzerTestOneInput /src/utils_fuzzer.cc:109:17
+#13 0x555af3b7e520 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#14 0x555af3b7dd45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#15 0x555af3b7f525 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#16 0x555af3b802b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#17 0x555af3b6f0fb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#18 0x555af3b9a4d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#19 0x7f0bf7703082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--bufferevent_pair_elt_new--bufferevent_pair_new
+Indirect leak of 15631632 byte(s) in 108553 object(s) allocated from:
+#0 0x555af3c8a4b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x555af3d402c9 in evbuffer_new /src/libevent/buffer.c:375:11
+#2 0x555af3ccd7a8 in bufferevent_init_common_ /src/libevent/bufferevent.c:322:24
+#3 0x555af3cd4c9a in bufferevent_pair_elt_new /src/libevent/bufferevent_pair.c:97:6
+#4 0x555af3cd4c9a in bufferevent_pair_new /src/libevent/bufferevent_pair.c:125:11
+#5 0x555af3cc9ac0 in bev_creator_cb(event_base*, void*) /src/utils_fuzzer.cc:35:9
+#6 0x555af3d2db28 in evhttp_get_request_connection /src/libevent/http.c:4662:10
+#7 0x555af3d2db28 in evhttp_get_request /src/libevent/http.c:4742:10
+#8 0x555af3d2db28 in accept_socket_cb /src/libevent/http.c:3882:2
+#9 0x555af3d588d6 in listener_read_cb /src/libevent/listener.c:465:3
+#10 0x555af3cff1af in event_persist_closure /src/libevent/event.c:1665:2
+#11 0x555af3cff1af in event_process_active_single_queue /src/libevent/event.c:1727:4
+#12 0x555af3cf112e in event_process_active /src/libevent/event.c
+#13 0x555af3cf112e in event_base_loop /src/libevent/event.c:2078:12
+#14 0x555af3cca61e in LLVMFuzzerTestOneInput /src/utils_fuzzer.cc:109:17
+#15 0x555af3b7e520 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#16 0x555af3b7dd45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#17 0x555af3b7f525 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#18 0x555af3b802b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#19 0x555af3b6f0fb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#20 0x555af3b9a4d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#21 0x7f0bf7703082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--evbuffer_new--bufferevent_init_common_
+Indirect leak of 15631632 byte(s) in 108553 object(s) allocated from:
+#0 0x555af3c8a4b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x555af3d402c9 in evbuffer_new /src/libevent/buffer.c:375:11
+#2 0x555af3ccd746 in bufferevent_init_common_ /src/libevent/bufferevent.c:317:23
+#3 0x555af3cd4c9a in bufferevent_pair_elt_new /src/libevent/bufferevent_pair.c:97:6
+#4 0x555af3cd4c9a in bufferevent_pair_new /src/libevent/bufferevent_pair.c:125:11
+#5 0x555af3cc9ac0 in bev_creator_cb(event_base*, void*) /src/utils_fuzzer.cc:35:9
+#6 0x555af3d2db28 in evhttp_get_request_connection /src/libevent/http.c:4662:10
+#7 0x555af3d2db28 in evhttp_get_request /src/libevent/http.c:4742:10
+#8 0x555af3d2db28 in accept_socket_cb /src/libevent/http.c:3882:2
+#9 0x555af3d588d6 in listener_read_cb /src/libevent/listener.c:465:3
+#10 0x555af3cff1af in event_persist_closure /src/libevent/event.c:1665:2
+#11 0x555af3cff1af in event_process_active_single_queue /src/libevent/event.c:1727:4
+#12 0x555af3cf112e in event_process_active /src/libevent/event.c
+#13 0x555af3cf112e in event_base_loop /src/libevent/event.c:2078:12
+#14 0x555af3cca61e in LLVMFuzzerTestOneInput /src/utils_fuzzer.cc:109:17
+#15 0x555af3b7e520 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#16 0x555af3b7dd45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#17 0x555af3b7f525 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#18 0x555af3b802b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#19 0x555af3b6f0fb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#20 0x555af3b9a4d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#21 0x7f0bf7703082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--evbuffer_new--bufferevent_init_common_
+Indirect leak of 4342120 byte(s) in 108553 object(s) allocated from:
+#0 0x555af3c8a4b9 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x555af3d548bf in evbuffer_add_cb /src/libevent/buffer.c:3389:13
+#2 0x555af3cd4d1a in bufferevent_pair_elt_new /src/libevent/bufferevent_pair.c:102:7
+#3 0x555af3cd4d1a in bufferevent_pair_new /src/libevent/bufferevent_pair.c:125:11
+#4 0x555af3cc9ac0 in bev_creator_cb(event_base*, void*) /src/utils_fuzzer.cc:35:9
+#5 0x555af3d2db28 in evhttp_get_request_connection /src/libevent/http.c:4662:10
+#6 0x555af3d2db28 in evhttp_get_request /src/libevent/http.c:4742:10
+#7 0x555af3d2db28 in accept_socket_cb /src/libevent/http.c:3882:2
+#8 0x555af3d588d6 in listener_read_cb /src/libevent/listener.c:465:3
+#9 0x555af3cff1af in event_persist_closure /src/libevent/event.c:1665:2
+#10 0x555af3cff1af in event_process_active_single_queue /src/libevent/event.c:1727:4
+#11 0x555af3cf112e in event_process_active /src/libevent/event.c
+#12 0x555af3cf112e in event_base_loop /src/libevent/event.c:2078:12
+#13 0x555af3cca61e in LLVMFuzzerTestOneInput /src/utils_fuzzer.cc:109:17
+#14 0x555af3b7e520 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#15 0x555af3b7dd45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#16 0x555af3b7f525 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#17 0x555af3b802b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#18 0x555af3b6f0fb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#19 0x555af3b9a4d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#20 0x7f0bf7703082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--evbuffer_add_cb--bufferevent_pair_elt_new
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a memory leak that occurs when a custom bufferevent creator (`bev_creator_cb`) is used with an `evhttp` server.
+
+**Analysis:**
+
+1.  The fuzzer sets a callback (`bev_creator_cb`) using `evhttp_set_bevcb`.
+2.  This callback creates a `bufferevent` pair using `bufferevent_pair_new`. It gives one end of the pair (`pair[0]`) to the libevent server and keeps the other end (`pair[1]`) for itself, storing it in the `bevs` array.
+3.  The fuzzer correctly writes data to its end of the pair (`bevs[1]`) and then frees it using `bufferevent_free(bevs[1])`.
+4.  The leak occurs because the other end of the pair (`bevs[0]`), which is now owned by the `evhttp_connection` within the libevent server, is never freed.
+5.  The final calls to `evhttp_del_accept_socket`, `evhttp_free`, and `event_base_free` should, in a well-behaved library, clean up all associated resources, including any active connections and their bufferevents. The fact that they do not indicates a resource management bug within libevent. The library fails to properly track and release the bufferevent provided by the custom callback when the server is torn down.
+
+**Suggestion for Project Patch:**
+
+The `evhttp_free` function (and potentially `evhttp_connection_free` or related cleanup functions) in libevent needs to be modified. It should iterate through any remaining active connections, including those established via a `bevcb`, and ensure that their associated bufferevents are freed. The cleanup logic should not assume that all connections are tied to a real network socket that gets closed. It must handle the case of these "internal" connections created via callbacks.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/utils_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/utils_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

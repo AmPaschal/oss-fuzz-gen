@@ -1,0 +1,421 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project opus.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/opus/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+#include <numeric>
+#include <algorithm>
+
+// Main opus headers
+#include "opus_multistream.h"
+#include "opus.h"
+
+// Fuzzing target function
+int opus_multistream_encode_float(OpusMSEncoder *st, const float *pcm, int frame_size, unsigned char *data, opus_int32 max_data_bytes);
+
+enum EncoderType {
+kStandard,
+kSurround,
+kAmbisonics,
+kMaxValue = kAmbisonics
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+FuzzedDataProvider provider(data, size);
+
+// 1. Fuzz encoder creation parameters
+const opus_int32 Fs_options[] = {8000, 12000, 16000, 24000, 48000};
+const opus_int32 Fs = provider.PickValueInArray(Fs_options);
+
+const int application_options[] = {OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_APPLICATION_RESTRICTED_LOWDELAY};
+const int application = provider.PickValueInArray(application_options);
+
+OpusMSEncoder *st = nullptr;
+int error;
+int channels = 0;
+int streams = 0;
+int coupled_streams = 0;
+
+// 2. Choose encoder type explicitly to ensure all paths are tested
+EncoderType encoder_type = provider.ConsumeEnum<EncoderType>();
+
+switch (encoder_type) {
+case kStandard: {
+streams = provider.ConsumeIntegralInRange<int>(1, 8);
+coupled_streams = provider.ConsumeIntegralInRange<int>(0, streams);
+channels = streams + coupled_streams;
+if (channels > 255 || channels == 0) return 0;
+
+std::vector<unsigned char> mapping(channels);
+if (provider.remaining_bytes() < channels) return 0;
+for (int i = 0; i < channels; ++i) {
+mapping[i] = provider.ConsumeIntegral<uint8_t>();
+}
+if (channels > 0 && !mapping.empty() && *std::max_element(mapping.begin(), mapping.end()) >= streams + coupled_streams) {
+std::iota(mapping.begin(), mapping.end(), 0);
+}
+
+st = opus_multistream_encoder_create(Fs, channels, streams, coupled_streams, mapping.data(), application, &error);
+break;
+}
+case kSurround: {
+channels = provider.ConsumeIntegralInRange<int>(1, 8);
+int mapping_family = provider.PickValueInArray({0, 1});
+std::vector<unsigned char> mapping(channels);
+st = opus_multistream_surround_encoder_create(Fs, channels, mapping_family, &streams, &coupled_streams, mapping.data(), application, &error);
+break;
+}
+case kAmbisonics: {
+const int ambisonics_channels[] = {1, 3, 4, 6, 9, 11, 16, 18, 25, 27};
+channels = provider.PickValueInArray(ambisonics_channels);
+int mapping_family = 2;
+std::vector<unsigned char> mapping(channels);
+st = opus_multistream_surround_encoder_create(Fs, channels, mapping_family, &streams, &coupled_streams, mapping.data(), application, &error);
+break;
+}
+}
+
+if (error != OPUS_OK || st == nullptr) {
+return 0;
+}
+
+// 3. Fuzz runtime configurations using CTLs
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_BITRATE(provider.ConsumeIntegralInRange<opus_int32>(500, 1000000)));
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_COMPLEXITY(provider.ConsumeIntegralInRange<opus_int32>(0, 10)));
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_VBR(provider.ConsumeBool()));
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_VBR_CONSTRAINT(provider.ConsumeBool()));
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_SIGNAL(provider.PickValueInArray({OPUS_AUTO, OPUS_SIGNAL_VOICE, OPUS_SIGNAL_MUSIC})));
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_PACKET_LOSS_PERC(provider.ConsumeIntegralInRange<opus_int32>(0, 100)));
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_INBAND_FEC(provider.ConsumeBool()));
+if (provider.ConsumeBool()) {
+const int expert_frame_duration_options[] = {
+OPUS_FRAMESIZE_2_5_MS, OPUS_FRAMESIZE_5_MS, OPUS_FRAMESIZE_10_MS,
+OPUS_FRAMESIZE_20_MS, OPUS_FRAMESIZE_40_MS, OPUS_FRAMESIZE_60_MS,
+OPUS_FRAMESIZE_ARG
+};
+opus_multistream_encoder_ctl(st, OPUS_SET_EXPERT_FRAME_DURATION(provider.PickValueInArray(expert_frame_duration_options)));
+}
+if (provider.ConsumeBool()) opus_multistream_encoder_ctl(st, OPUS_SET_DRED_DURATION(provider.ConsumeIntegralInRange<opus_int32>(0, 200)));
+
+
+// 4. Prepare for encoding loop
+const int frame_duration_x2[] = {5, 10, 20, 40, 80, 120};
+const int frame_size = (Fs / 1000 * provider.PickValueInArray(frame_duration_x2)) / 2;
+const size_t pcm_elements = static_cast<size_t>(frame_size) * channels;
+
+if (pcm_elements == 0 || pcm_elements > 100000) {
+opus_multistream_encoder_destroy(st);
+return 0;
+}
+
+const opus_int32 min_data_bytes = streams > 0 ? streams * 2 - 1 : 1;
+const opus_int32 max_data_bytes = provider.ConsumeIntegralInRange<opus_int32>(min_data_bytes, min_data_bytes + 8192);
+std::vector<unsigned char> out_data(max_data_bytes);
+
+// 5. Stateful fuzzing loop
+const int loop_count = provider.ConsumeIntegralInRange<int>(1, 10);
+for (int i = 0; i < loop_count; ++i) {
+// Decide whether to encode real data or request a packet loss concealment frame
+if (provider.ConsumeBool()) {
+// Encode a real frame
+const size_t pcm_byte_size = pcm_elements * sizeof(float);
+if (provider.remaining_bytes() < pcm_byte_size) {
+break;
+}
+std::vector<float> pcm(pcm_elements);
+provider.ConsumeData(pcm.data(), pcm_byte_size);
+opus_multistream_encode_float(st, pcm.data(), frame_size, out_data.data(), max_data_bytes);
+} else {
+// Request a packet loss concealment (FEC) frame by passing pcm=NULL
+opus_multistream_encode_float(st, NULL, frame_size, out_data.data(), max_data_bytes);
+}
+}
+
+// 6. Cleanup
+opus_multistream_encoder_destroy(st);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: opus
+function signature: int opus_multistream_encode_float(OpusMSEncoder *, const opus_val16 *, int, unsigned char *, opus_int32)
+</input>
+
+<description>
+The `opus_multistream_encode_float` function is used to encode a multi-stream Opus packet from floating-point audio data. It acts as a wrapper for the `opus_multistream_encode_native` function, which performs the core encoding logic. The function takes an `OpusMSEncoder` state, a buffer of PCM audio data, the frame size, a buffer to store the encoded data, and the maximum size of the output buffer. Internally, it validates the frame size, performs surround sound analysis if configured, allocates bitrates to the individual streams, and then encodes each stream. The encoded data from the streams is then combined into a single packet using a repacketizer. The function is part of a set of functions for handling multi-stream Opus encoding, with other functions available for different input data types (e.g., `opus_multistream_encode` for `opus_int16`). The encoder state must be properly initialized before calling this function using `opus_multistream_encoder_create` or a similar function. This setup is crucial for defining the number of streams, their coupling, and other encoding parameters.
+</description>
+
+<requirements>
+
+<requirement>
+The `st` argument, a pointer to an `OpusMSEncoder` struct, must be initialized by `opus_multistream_encoder_create` or `opus_multistream_surround_encoder_create`. This is because these functions properly allocate and initialize the encoder's memory and internal state, which is essential for the encoding process to function correctly.
+</requirement>
+<requirement>
+The `pcm` argument must be a pointer to a valid memory buffer of type float. The size of this buffer should be at least `frame_size * st->layout.nb_channels` to prevent buffer over-reads during the encoding process.
+</requirement>
+<requirement>
+The `frame_size` argument must be a valid Opus frame size, such as `Fs/400`, `Fs/200`, `Fs/100`, `Fs/50`, `Fs/25`, `3*Fs/50`, `4*Fs/25`, `5*Fs/25`, or `6*Fs/25`, where `Fs` is the sample rate. An invalid frame size will cause the internal `frame_size_select` function to return an error, resulting in a failure of the encoding operation.
+</requirement>
+<requirement>
+The `max_data_bytes` argument must be greater than or equal to `st->layout.nb_streams * 2 - 1`. This is a minimum buffer size check performed within the `opus_multistream_encode_native` function to ensure there is enough space for the encoded data.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x561c93b59918 bp 0x7ffca4930a20 sp 0x7ffca49309f0 T0)
+==19==The signal is caused by a READ memory access.
+==19==Hint: address points to the zero page.
+SCARINESS: 10 (null-deref)
+#0 0x561c93b59918 in opus_copy_channel_in_float /src/opus/src/opus_multistream_encoder.c
+#1 0x561c93b545d5 in surround_analysis /src/opus/src/opus_multistream_encoder.c:275:7
+#2 0x561c93b5796c in opus_multistream_encode_native /src/opus/src/opus_multistream_encoder.c:879:7
+#3 0x561c93b5987f in opus_multistream_encode_float /src/opus/src/opus_multistream_encoder.c:1111:11
+#4 0x561c93b52f43 in LLVMFuzzerTestOneInput /src/opus/tests/opus_repacketizer_fuzzer.cc:129:11
+#5 0x561c93a053a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x561c93a04bc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x561c93a06b52 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#8 0x561c93a06e42 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#9 0x561c939f5f7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x561c93a21352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f49b1be0082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#12 0x561c939e87fd in _start (out/libfuzzer-address-x86_64/opus_repacketizer_fuzzer_fixed+0x957fd)
+
+DEDUP_TOKEN: opus_copy_channel_in_float--surround_analysis--opus_multistream_encode_native
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a null pointer dereference that occurs within the `opus` library, not the fuzz driver.
+
+**Analysis:**
+The backtrace clearly shows that the fuzz driver at `opus_repacketizer_fuzzer.cc:129` intentionally calls `opus_multistream_encode_float` with a `NULL` `pcm` pointer. The comment in the preceding line, `// Request a packet loss concealment (FEC) frame by passing pcm=NULL`, confirms this is a deliberate test of a documented feature of the Opus API.
+
+The crash happens deep inside the Opus library in `surround_analysis`. This function is called when a surround sound encoder is configured. The `surround_analysis` function receives the `NULL` `pcm` pointer but fails to check for this special case. It proceeds to pass the `NULL` pointer to `opus_copy_channel_in_float`, which then attempts to dereference it, causing the segmentation fault.
+
+The bug lies in the `opus` library's implementation of surround sound encoding, which does not correctly handle the generation of FEC frames when `pcm` is `NULL`.
+
+**Suggestion:**
+The project's code should be patched to handle the `pcm == NULL` case for surround sound configurations. A check should be added in `opus_multistream_encode_native` or at the beginning of `surround_analysis` in `src/opus/src/opus_multistream_encoder.c`. If `pcm` is `NULL`, the `surround_analysis` routine should be skipped, and the logic should proceed to generate the FEC packet as intended by the API.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/opus/tests/opus_repacketizer_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/opus/tests/opus_repacketizer_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

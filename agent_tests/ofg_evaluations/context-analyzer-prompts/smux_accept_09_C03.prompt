@@ -1,0 +1,506 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project net-snmp.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/net-snmp/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/agent/net-snmp-agent-includes.h>
+#include <net-snmp/agent/snmp_agent.h>
+#include <net-snmp/library/asn1.h> /* For asn_build_* functions */
+
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdint.h>
+
+/* smux_listen_sd is a global variable defined in agent/mibgroup/smux/smux.c */
+extern int smux_listen_sd;
+
+/* real_init_smux is defined in agent/mibgroup/smux/smux.c */
+extern void real_init_smux(void);
+
+/* The function under test */
+int smux_accept(int);
+
+/* SMUX PDU type for open, from smux/smux.h */
+#define SMUX_OPEN (ASN_APPLICATION | 0)
+
+typedef struct {
+const uint8_t *data;
+size_t size;
+} client_thread_args;
+
+/*
+* This thread acts as a client to connect to the listening socket,
+* which unblocks the accept() call in smux_accept(). It now constructs
+* a valid SMUX_OPEN PDU using the fuzzer data.
+*/
+static void *client_thread_func(void *arg) {
+client_thread_args *args = (client_thread_args *)arg;
+int client_sd = -1;
+struct sockaddr_in serv_addr;
+u_char pdu_buf[SNMP_MAX_MSG_SIZE];
+u_char *pdu_ptr = NULL;
+size_t pdu_len = SNMP_MAX_MSG_SIZE;
+
+/*
+* Add a check to ensure the input data is large enough to be processed.
+* The PDU construction logic crashes on empty or very small inputs.
+* At least sizeof(long) is needed for the version.
+*/
+if (args->size < sizeof(long)) {
+return NULL;
+}
+
+const uint8_t *fuzz_ptr = args->data;
+size_t fuzz_remaining = args->size;
+
+memset(&serv_addr, 0, sizeof(serv_addr));
+serv_addr.sin_family = AF_INET;
+/* SMUXPORT is 199, defined in net-snmp/library/snmp_impl.h */
+serv_addr.sin_port = htons(199);
+if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+return NULL;
+}
+
+client_sd = socket(AF_INET, SOCK_STREAM, 0);
+if (client_sd < 0) {
+return NULL;
+}
+
+if (connect(client_sd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+close(client_sd);
+return NULL;
+}
+
+/*
+* Construct a valid SMUX_OPEN PDU from the fuzzer data.
+* The PDU structure is: SEQUENCE { version, identity, description, password }
+*/
+
+// 1. Consume fuzzer data for PDU fields
+long version = 0;
+if (fuzz_remaining >= sizeof(long)) {
+memcpy(&version, fuzz_ptr, sizeof(long));
+fuzz_ptr += sizeof(long);
+fuzz_remaining -= sizeof(long);
+}
+
+oid fuzz_oid[MAX_OID_LEN] = {1, 3, 6, 1, 3}; // A default OID
+size_t fuzz_oid_len = 5;
+if (fuzz_remaining > 0) {
+size_t oid_bytes_to_consume = fuzz_remaining < (MAX_OID_LEN * sizeof(oid)) ? fuzz_remaining : (MAX_OID_LEN * sizeof(oid));
+fuzz_oid_len = oid_bytes_to_consume / sizeof(oid);
+if (fuzz_oid_len > 0) {
+memcpy(fuzz_oid, fuzz_ptr, fuzz_oid_len * sizeof(oid));
+}
+fuzz_ptr += oid_bytes_to_consume;
+fuzz_remaining -= oid_bytes_to_consume;
+}
+
+size_t descr_len = fuzz_remaining / 2;
+const u_char *descr = fuzz_ptr;
+fuzz_ptr += descr_len;
+fuzz_remaining -= descr_len;
+
+size_t passwd_len = fuzz_remaining;
+const u_char *passwd = fuzz_ptr;
+
+// 2. Build the PDU in reverse order
+pdu_ptr = pdu_buf + SNMP_MAX_MSG_SIZE;
+pdu_len = SNMP_MAX_MSG_SIZE;
+
+// Build password, description, OID, and version
+pdu_ptr = asn_build_string(pdu_ptr, &pdu_len, ASN_OCTET_STR, passwd, passwd_len);
+if (!pdu_ptr) goto send_fail;
+pdu_ptr = asn_build_string(pdu_ptr, &pdu_len, ASN_OCTET_STR, descr, descr_len);
+if (!pdu_ptr) goto send_fail;
+pdu_ptr = asn_build_objid(pdu_ptr, &pdu_len, ASN_OBJECT_ID, fuzz_oid, fuzz_oid_len);
+if (!pdu_ptr) goto send_fail;
+pdu_ptr = asn_build_int(pdu_ptr, &pdu_len, ASN_INTEGER, &version, sizeof(version));
+if (!pdu_ptr) goto send_fail;
+
+// Build the main sequence header
+size_t content_len = (pdu_buf + SNMP_MAX_MSG_SIZE) - pdu_ptr;
+pdu_ptr = asn_build_sequence(pdu_ptr, &pdu_len, (ASN_SEQUENCE | ASN_CONSTRUCTOR), content_len);
+if (!pdu_ptr) goto send_fail;
+
+// Build the SMUX_OPEN PDU header
+size_t total_len = (pdu_buf + SNMP_MAX_MSG_SIZE) - pdu_ptr;
+pdu_ptr = asn_build_header(pdu_ptr, &pdu_len, SMUX_OPEN, total_len);
+if (!pdu_ptr) goto send_fail;
+
+// Send the constructed PDU
+size_t final_pdu_len = (pdu_buf + SNMP_MAX_MSG_SIZE) - pdu_ptr;
+send(client_sd, pdu_ptr, final_pdu_len, 0);
+
+send_fail:
+close(client_sd);
+return NULL;
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+/* One-time initialization for the library */
+init_snmp("snmpd");
+return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+pthread_t tid;
+client_thread_args args;
+int new_sd;
+
+args.data = data;
+args.size = size;
+
+/* Initialize SMUX listener for each fuzzing iteration */
+real_init_smux();
+
+if (smux_listen_sd < 0) {
+return 0;
+}
+
+if (pthread_create(&tid, NULL, client_thread_func, &args) != 0) {
+close(smux_listen_sd);
+smux_listen_sd = -1;
+return 0;
+}
+
+/* This call will block until the client thread connects */
+new_sd = smux_accept(smux_listen_sd);
+if (new_sd >= 0) {
+close(new_sd);
+}
+
+pthread_join(tid, NULL);
+
+/* Clean up the listening socket for the next run */
+if (smux_listen_sd >= 0) {
+close(smux_listen_sd);
+smux_listen_sd = -1;
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: net-snmp
+function signature: int smux_accept(int)
+</input>
+
+<description>
+The `smux_accept` function accepts a new SMUX connection on a listening socket. It takes a socket descriptor as input and returns a new socket descriptor for the accepted connection, or -1 on error. The input socket descriptor is a global variable, `smux_listen_sd`, which is initialized by the `smux_init` function. `smux_init` creates a TCP socket, binds it to the SMUX port, and puts it into a listening state. Therefore, `smux_init` must be called before `smux_accept`.
+</description>
+
+<requirements>
+<requirement>
+The `smux_init()` function should be called before `smux_accept()`. This is because `smux_init()` creates and initializes the listening socket that `smux_accept()` uses to accept new connections.
+</requirement>
+<requirement>
+The integer argument to `smux_accept()` must be a valid file descriptor for a listening socket. This is to ensure that the underlying `accept()` call succeeds.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: stack-buffer-overflow on address 0x7f01bcfafe00 at pc 0x55750a27ced1 bp 0x7f01baab7c30 sp 0x7f01baab7c28
+WRITE of size 1 at 0x7f01bcfafe00 thread T6
+SCARINESS: 46 (1-byte-write-stack-buffer-overflow)
+#0 0x55750a27ced0 in asn_build_header /src/net-snmp/snmplib/asn1.c:1229:13
+#1 0x55750a27ced0 in asn_build_string /src/net-snmp/snmplib/asn1.c:1017:12
+#2 0x55750a17db64 in client_thread_func /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:114:15
+#3 0x55750a13b868 in asan_thread_start(void*) /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:239:28
+#4 0x7f01bf092608 in start_thread (/lib/x86_64-linux-gnu/libpthread.so.0+0x8608) (BuildId: 9753720502573b97dbac595b61fd72c2df18e078)
+#5 0x7f01bef70352 in __clone (/lib/x86_64-linux-gnu/libc.so.6+0x11f352) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: asn_build_header--asn_build_string--client_thread_func
+Address 0x7f01bcfafe00 is located in stack of thread T6 at offset 1536 in frame
+#0 0x55750a17d75f in client_thread_func /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:38
+
+DEDUP_TOKEN: client_thread_func
+This frame has 5 object(s):
+[32, 48) 'serv_addr' (line 41)
+[64, 1536) 'pdu_buf' (line 42) <== Memory access at offset 1536 overflows this variable
+[1664, 1672) 'pdu_len' (line 44)
+[1696, 1704) 'version' (line 82)
+[1728, 2752) 'fuzz_oid' (line 89)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+(longjmp and C++ exceptions *are* supported)
+Thread T6 created by T0 here:
+#0 0x55750a1238b1 in pthread_create /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:250:3
+#1 0x55750a17d540 in LLVMFuzzerTestOneInput /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:163:9
+#2 0x55750a031f60 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55750a031785 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55750a032f65 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55750a033cf5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55750a022b3b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55750a04df12 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f01bee75082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: ___interceptor_pthread_create--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a stack-buffer-overflow occurring in the `asn_build_header` function. The analysis is consistent with the initial findings, and the GDB session, despite some misleading intermediate output, ultimately confirms the scenario via the final AddressSanitizer report.
+
+1.  The fuzz driver's `client_thread_func` allocates a 1500-byte stack buffer `pdu_buf` (as `SNMP_MAX_MSG_SIZE` is 1500).
+2.  The fuzzer input is processed to determine lengths for PDU components. The crashing input results in `descr_len` and `passwd_len` being large. Specifically, the total length of data to be encoded exceeds the 1500-byte buffer capacity once ASN.1 overhead is included.
+3.  The first call to `asn_build_string` is for the `passwd` field. It is requested to write a large amount of data (e.g., 1500 bytes as per the logic) into a buffer of 1500 bytes.
+4.  The length validation inside `asn_build_string` is flawed. It checks `if (str_len > *pkt_len)`, which passes if the data length is equal to the buffer capacity. However, it fails to account for the extra bytes needed for the ASN.1 type and length fields that its helper function, `asn_build_header`, will prepend.
+5.  `asn_build_string` writes the string data, consuming the entire buffer. It then calls `asn_build_header` to write the header.
+6.  `asn_build_header` then attempts to write the header into memory just before the start of the data, which is now outside the bounds of the original `pdu_buf`, causing the stack-buffer-overflow. The AddressSanitizer report confirms a write at an offset that overflows `pdu_buf`.
+
+The root cause is a bug in the `net-snmp` library. The `asn_build_string` function does not perform adequate bounds checking; it must validate that there is sufficient space for both the payload data and the required ASN.1 header metadata. The fuzzer is operating correctly by exposing this flaw.
+
+**Suggestion:**
+The project's `asn_build_string` function in `/src/net-snmp/snmplib/asn1.c` must be patched. The validation logic needs to be improved to account for the size of the ASN.1 header in addition to the string data itself.
+
+A corrected implementation should calculate the required header size *before* performing the length check. The check should be modified to ensure that `*pkt_len` is greater than or equal to `str_len + header_len`.
+
+Example of a corrected check at the beginning of `asn_build_string`:
+```c
+/*
+* Calculate required header length.
+* 1 byte for type, plus 1-5 bytes for length.
+*/
+size_t header_len = 1;
+if (str_len < 0x80) {
+header_len += 1;
+} else if (str_len < 0x100) {
+header_len += 2;
+} else if (str_len < 0x8000) {
+header_len += 3;
+} else if (str_len < 0x1000000) {
+header_len += 4;
+} else {
+header_len += 5;
+}
+
+if ((str_len + header_len) > *pkt_len) {
+ASN_DEBUG_LOG("build string: length too large for data and header");
+return NULL;
+}
+```
+This ensures that the function fails safely when the provided buffer is too small, preventing the overflow.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

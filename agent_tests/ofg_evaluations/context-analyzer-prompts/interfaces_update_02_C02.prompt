@@ -1,0 +1,533 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project lldpd.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/lldpd/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <net/if.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#include "/src/lldpd/src/daemon/lldpd.h"
+
+// Forward declare the function under test
+void interfaces_update(struct lldpd *);
+
+// Globals to hold fuzzer input for the mock functions
+static const uint8_t *fuzz_data;
+static size_t fuzz_size;
+static size_t fuzz_offset;
+
+// Helper to consume data safely
+static int
+consume_data(void *dest, size_t len)
+{
+if (fuzz_offset + len > fuzz_size) {
+return 0;
+}
+memcpy(dest, fuzz_data + fuzz_offset, len);
+fuzz_offset += len;
+return 1;
+}
+
+// Mock for netlink_get_interfaces
+struct interfaces_device_list *
+mock_netlink_get_interfaces(void)
+{
+struct interfaces_device_list *interfaces =
+calloc(1, sizeof(struct interfaces_device_list));
+if (!interfaces) return NULL;
+TAILQ_INIT(interfaces);
+
+uint8_t num_interfaces;
+if (!consume_data(&num_interfaces, sizeof(num_interfaces))) {
+return interfaces;
+}
+num_interfaces %= 5; // Max 4 interfaces
+
+for (int i = 0; i < num_interfaces; i++) {
+struct interfaces_device *iface =
+calloc(1, sizeof(struct interfaces_device));
+if (!iface) break;
+
+iface->index = i + 1; // Use 1-based index
+
+if (!consume_data(&iface->flags, sizeof(iface->flags))) {
+free(iface);
+break;
+}
+
+uint8_t name_len;
+if (!consume_data(&name_len, sizeof(name_len))) {
+free(iface);
+break;
+}
+name_len %= (IFNAMSIZ -1);
+
+iface->name = malloc(name_len + 1);
+if (iface->name == NULL) {
+free(iface);
+break;
+}
+if (!consume_data(iface->name, name_len)) {
+free(iface->name);
+free(iface);
+break;
+}
+iface->name[name_len] = '\0';
+
+TAILQ_INSERT_TAIL(interfaces, iface, next);
+}
+
+return interfaces;
+}
+
+// Mock for netlink_get_addresses
+struct interfaces_address_list *
+mock_netlink_get_addresses(void)
+{
+struct interfaces_address_list *addresses =
+calloc(1, sizeof(struct interfaces_address_list));
+if (!addresses) return NULL;
+TAILQ_INIT(addresses);
+
+uint8_t num_addresses;
+if (!consume_data(&num_addresses, sizeof(num_addresses))) {
+return addresses;
+}
+num_addresses %= 5;
+
+for (int i = 0; i < num_addresses; i++) {
+struct interfaces_address *addr =
+calloc(1, sizeof(struct interfaces_address));
+if (!addr) break;
+
+if (!consume_data(&addr->index, sizeof(addr->index))) {
+free(addr);
+break;
+}
+addr->index %= 5; // Map to one of the created interfaces
+
+uint8_t family;
+if (!consume_data(&family, sizeof(family))) {
+free(addr);
+break;
+}
+
+if (family % 2 == 0) {
+addr->address.ss_family = AF_INET;
+struct sockaddr_in *sin = (struct sockaddr_in *)&addr->address;
+if (!consume_data(&sin->sin_addr, sizeof(sin->sin_addr))) {
+free(addr);
+break;
+}
+} else {
+addr->address.ss_family = AF_INET6;
+struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr->address;
+if (!consume_data(&sin6->sin6_addr, sizeof(sin6->sin6_addr))) {
+free(addr);
+break;
+}
+}
+TAILQ_INSERT_TAIL(addresses, addr, next);
+}
+
+return addresses;
+}
+
+// Use preprocessor to replace real functions with mocks
+#define netlink_get_interfaces(cfg) mock_netlink_get_interfaces()
+#define netlink_get_addresses(cfg) mock_netlink_get_addresses()
+
+// Dummy log function to suppress output
+void donothing(int pri, const char *msg) {}
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+// Setup globals for the mock functions
+fuzz_data = data;
+fuzz_size = size;
+fuzz_offset = 0;
+
+struct lldpd cfg;
+memset(&cfg, 0, sizeof(struct lldpd));
+
+// Initialize required members of the lldpd struct
+TAILQ_INIT(&cfg.g_hardware);
+TAILQ_INIT(&cfg.g_chassis);
+log_register(donothing);
+
+// Create and initialize a local chassis
+struct lldpd_chassis *local_chassis =
+calloc(1, sizeof(struct lldpd_chassis));
+if (!local_chassis) {
+return 0;
+}
+if (!consume_data(&local_chassis->c_cap_available, sizeof(local_chassis->c_cap_available))) {
+free(local_chassis);
+return 0;
+}
+TAILQ_INSERT_TAIL(&cfg.g_chassis, local_chassis, c_entries);
+
+// Populate g_hardware list
+uint8_t num_hw;
+if (consume_data(&num_hw, sizeof(num_hw))) {
+num_hw %= 5;
+for (int i = 0; i < num_hw; i++) {
+struct lldpd_hardware *hardware = calloc(1, sizeof(struct lldpd_hardware));
+if (!hardware) break;
+
+hardware->h_ifindex = i + 1;
+snprintf(hardware->h_ifname, IFNAMSIZ, "eth%d", i);
+
+// Fuzz the flags, making sure IFF_RUNNING can be set
+if (!consume_data(&hardware->h_flags, sizeof(hardware->h_flags))) {
+free(hardware);
+break;
+}
+hardware->h_flags |= IFF_UP; // Ensure it's up
+
+TAILQ_INSERT_TAIL(&cfg.g_hardware, hardware, h_entries);
+}
+}
+
+// Call the target function
+interfaces_update(&cfg);
+
+// Cleanup
+lldpd_cleanup(&cfg);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: lldpd
+function signature: void interfaces_update(struct lldpd *)
+</input>
+
+<description>
+The `interfaces_update` function is responsible for updating the list of local network interfaces that lldpd monitors. It is a central function that orchestrates the discovery and configuration of interfaces. It starts by fetching the list of interfaces and their addresses from the operating system using netlink sockets. Then, it enriches this information with details like driver name, wireless properties, bridge and bond information, and VLANs. After gathering all the information, it applies configured filters (allowlists), and initializes the necessary data structures for each interface to handle LLDP operations. The function's correct execution heavily depends on the data retrieved from the OS about the network interfaces.
+</description>
+
+<requirements>
+
+<requirement>
+The `cfg` argument must be a valid pointer to a `struct lldpd` initialized by `lldpd_main`. This is because the function accesses various members of this structure, and an uninitialized structure will lead to crashes.
+</requirement>
+<requirement>
+The `g_chassis` member of the `cfg` structure, which is a TAILQ, must be initialized and contain at least one element representing the local chassis. This is because the `LOCAL_CHASSIS` macro is used to access the first element of this queue, and a crash will occur if it's empty.
+</requirement>
+<requirement>
+The `c_cap_available` member of the local chassis (`LOCAL_CHASSIS(cfg)`) should be fuzzed with different combinations of `LLDP_CAP_WLAN` and `LLDP_CAP_BRIDGE` flags. Setting these flags enables the execution of `iflinux_add_wireless` and `iflinux_add_bridge` respectively, which is necessary for achieving higher code coverage.
+</requirement>
+<requirement>
+The `g_hardware` member of the `cfg` structure, which is a TAILQ, must be initialized. While it can be empty, for better code coverage, it should be populated with `struct lldpd_hardware` elements, with the `h_flags` member being fuzzed to test different interface states.
+</requirement>
+<requirement>
+For effective fuzzing, the functions `netlink_get_interfaces` and `netlink_get_addresses` should be mocked to return fuzzer-controlled data. These functions are the primary source of input for `interfaces_update`, and in a restricted fuzzing environment, they are unlikely to return meaningful data, thus limiting the fuzzing effectiveness.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 36990328 byte(s) in 58529 object(s) allocated from:
+#0 0x55a788fb0539 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a788fee77e in LLVMFuzzerTestOneInput /src/lldpd/tests/fuzz_sonmp.c:176:38
+#2 0x55a788ea45a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a788ea3dc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a788ea55a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55a788ea6335 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55a788e9517b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a788ec0552 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f58ca283082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Indirect leak of 414329088 byte(s) in 655584 object(s) allocated from:
+#0 0x55a788fb0539 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a788fee77e in LLVMFuzzerTestOneInput /src/lldpd/tests/fuzz_sonmp.c:176:38
+#2 0x55a788ea45a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a788ea3dc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a788ea55a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55a788ea6335 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55a788e9517b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a788ec0552 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f58ca283082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Indirect leak of 12640 byte(s) in 20 object(s) allocated from:
+#0 0x55a788fb0539 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a788fee77e in LLVMFuzzerTestOneInput /src/lldpd/tests/fuzz_sonmp.c:176:38
+#2 0x55a788ea45a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a788ea3dc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a788ea3c86 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#5 0x55a788ea627f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#6 0x55a788e9517b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a788ec0552 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f58ca283082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+Indirect leak of 7584 byte(s) in 12 object(s) allocated from:
+#0 0x55a788fb0539 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55a788fee77e in LLVMFuzzerTestOneInput /src/lldpd/tests/fuzz_sonmp.c:176:38
+#2 0x55a788ea45a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55a788ea3dc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55a788ea5d52 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#5 0x55a788ea6042 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#6 0x55a788e9517b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55a788ec0552 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f58ca283082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is caused by a memory leak in the `lldpd` project, specifically within the `lldpd_cleanup` function.
+
+**Analysis:**
+
+1.  The fuzz driver allocates `lldpd_hardware` structs and adds them to the `cfg.g_hardware` list. The `h_flags` member of these structs is set to a non-zero value.
+2.  The `lldpd_cleanup` function is called at the end of the fuzzer to free the allocated memory.
+3.  Inside `lldpd_cleanup`, the code iterates through the `g_hardware` list. It only considers cleaning up a `hardware` interface if `hardware->h_flags` is zero.
+4.  Because the fuzzer sets `h_flags` to a non-zero value, the condition `!hardware->h_flags` is false.
+5.  Consequently, the cleanup logic, including the call to `lldpd_hardware_cleanup` (which contains the `free(hardware)` call), is never executed for the allocated `lldpd_hardware` structs.
+6.  This results in a memory leak, which is detected by LeakSanitizer.
+
+**Suggestion:**
+
+The `lldpd_cleanup` function should be modified to ensure that all `lldpd_hardware` structs in the `g_hardware` list are freed, regardless of their `h_flags` value. A potential fix would be to move the cleanup logic out of the conditional block or to add an unconditional cleanup loop at the end of the function.
+
+For example, a separate loop could be added after the existing one in `lldpd_cleanup` to iterate through the list again and free all remaining `hardware` structs.
+
+```c
+// In lldpd_cleanup, after the existing loop:
+while ((hardware = TAILQ_FIRST(&cfg->g_hardware)) != NULL) {
+TAILQ_REMOVE(&cfg->g_hardware, hardware, h_entries);
+lldpd_remote_cleanup(hardware, 1, 1);
+lldpd_hardware_cleanup(cfg, hardware);
+}
+```
+
+This ensures that all allocated hardware interfaces are properly deallocated when the program terminates, fixing the memory leak.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/lldpd/tests/fuzz_sonmp.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/lldpd/tests/fuzz_sonmp.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

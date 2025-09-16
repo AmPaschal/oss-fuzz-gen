@@ -1,0 +1,516 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project gnutls.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/gnutls/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+/*
+# Copyright 2016 Google Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+################################################################################
+*/
+
+#include <assert.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+
+#include <gnutls/crypto.h>
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
+
+#include "certs.h"
+#include "fuzzer.h"
+
+static ssize_t push_func(gnutls_transport_ptr_t p, const void *data, size_t len)
+{
+gnutls_datum_t *buf = (gnutls_datum_t *)p;
+void *new_data = gnutls_realloc(buf->data, buf->size + len);
+if (new_data == NULL) {
+return -1;
+}
+buf->data = new_data;
+memcpy(buf->data + buf->size, data, len);
+buf->size += len;
+return len;
+}
+
+static ssize_t pull_func(gnutls_transport_ptr_t p, void *data, size_t len)
+{
+gnutls_datum_t *buf = (gnutls_datum_t *)p;
+if (buf->size == 0) {
+errno = EAGAIN;
+return -1;
+}
+
+size_t to_copy = (len > buf->size) ? buf->size : len;
+memcpy(data, buf->data, to_copy);
+if (buf->size > to_copy) {
+memmove(buf->data, buf->data + to_copy, buf->size - to_copy);
+}
+buf->size -= to_copy;
+return to_copy;
+}
+
+static int do_handshake(gnutls_session_t client, gnutls_session_t server)
+{
+int ret_c = 0, ret_s = 0;
+
+do {
+if (ret_c != GNUTLS_E_AGAIN && ret_c < 0) return ret_c;
+if (ret_s != GNUTLS_E_AGAIN && ret_s < 0) return ret_s;
+
+ret_c = gnutls_handshake(client);
+ret_s = gnutls_handshake(server);
+
+} while ((ret_c < 0 && gnutls_error_is_fatal(ret_c) == 0) ||
+(ret_s < 0 && gnutls_error_is_fatal(ret_s) == 0));
+
+if (ret_c < 0 || ret_s < 0) return -1;
+
+return 0;
+}
+
+static void setup_sessions(gnutls_session_t *client_session, gnutls_session_t *server_session,
+gnutls_certificate_credentials_t *xcred_s, gnutls_certificate_credentials_t *xcred_c,
+gnutls_datum_t *skey, gnutls_datum_t *client_to_server_buf, gnutls_datum_t *server_to_client_buf,
+uint8_t control_byte, unsigned int server_flags)
+{
+gnutls_datum_t rsa_cert, rsa_key;
+
+gnutls_init(server_session, GNUTLS_SERVER | server_flags);
+gnutls_init(client_session, GNUTLS_CLIENT);
+
+gnutls_transport_set_ptr2(*client_session, server_to_client_buf, client_to_server_buf);
+gnutls_transport_set_push_function(*client_session, push_func);
+gnutls_transport_set_pull_function(*client_session, pull_func);
+
+gnutls_transport_set_ptr2(*server_session, client_to_server_buf, server_to_client_buf);
+gnutls_transport_set_push_function(*server_session, push_func);
+gnutls_transport_set_pull_function(*server_session, pull_func);
+
+gnutls_certificate_allocate_credentials(xcred_s);
+rsa_cert.data = (unsigned char *)kRSACertificateDER;
+rsa_cert.size = sizeof(kRSACertificateDER);
+rsa_key.data = (unsigned char *)kRSAPrivateKeyDER;
+rsa_key.size = sizeof(kRSAPrivateKeyDER);
+gnutls_certificate_set_x509_key_mem(*xcred_s, &rsa_cert, &rsa_key, GNUTLS_X509_FMT_DER);
+gnutls_certificate_set_known_dh_params(*xcred_s, GNUTLS_SEC_PARAM_MEDIUM);
+gnutls_credentials_set(*server_session, GNUTLS_CRD_CERTIFICATE, *xcred_s);
+
+gnutls_session_ticket_key_generate(skey);
+gnutls_session_ticket_enable_server(*server_session, skey);
+
+if (control_byte % 2 == 1) {
+gnutls_record_set_max_early_data_size(*server_session, 1024);
+}
+
+gnutls_certificate_allocate_credentials(xcred_c);
+gnutls_certificate_set_x509_trust_mem(*xcred_c, &rsa_cert, GNUTLS_X509_FMT_DER);
+gnutls_credentials_set(*client_session, GNUTLS_CRD_CERTIFICATE, *xcred_c);
+
+const char *priority = "NORMAL:-VERS-TLS-ALL:+VERS-TLS1.3";
+gnutls_priority_set_direct(*server_session, priority, NULL);
+gnutls_priority_set_direct(*client_session, priority, NULL);
+}
+
+static void cleanup_sessions(gnutls_session_t *client_session, gnutls_session_t *server_session,
+gnutls_certificate_credentials_t *xcred_s, gnutls_certificate_credentials_t *xcred_c,
+gnutls_datum_t *skey, gnutls_datum_t *client_to_server_buf, gnutls_datum_t *server_to_client_buf)
+{
+if (*server_session) gnutls_deinit(*server_session);
+if (*client_session) gnutls_deinit(*client_session);
+if (*xcred_s) gnutls_certificate_free_credentials(*xcred_s);
+if (*xcred_c) gnutls_certificate_free_credentials(*xcred_c);
+if (skey->data) gnutls_free(skey->data);
+if (client_to_server_buf->data) gnutls_free(client_to_server_buf->data);
+if (server_to_client_buf->data) gnutls_free(server_to_client_buf->data);
+
+*server_session = NULL;
+*client_session = NULL;
+*xcred_s = NULL;
+*xcred_c = NULL;
+skey->data = NULL;
+client_to_server_buf->data = NULL;
+server_to_client_buf->data = NULL;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+if (size < 3) {
+return 0;
+}
+
+uint8_t scenario = data[0] % 3;
+uint8_t control_byte = data[1];
+unsigned int nr = data[2];
+if (nr == 0) {
+nr = 1;
+}
+
+gnutls_session_t server_session = NULL, client_session = NULL;
+gnutls_certificate_credentials_t xcred_s = NULL, xcred_c = NULL;
+gnutls_datum_t skey = {0};
+gnutls_datum_t client_to_server_buf = {0};
+gnutls_datum_t server_to_client_buf = {0};
+
+if (scenario == 0) { // Initial handshake path
+setup_sessions(&client_session, &server_session, &xcred_s, &xcred_c, &skey,
+&client_to_server_buf, &server_to_client_buf, control_byte, 0);
+
+if (do_handshake(client_session, server_session) >= 0) {
+gnutls_session_ticket_send(server_session, nr, 0);
+}
+} else if (scenario == 1) { // Resumed handshake path
+gnutls_datum_t resumption_data = {0};
+
+// Handshake 1: Establish session and get ticket
+setup_sessions(&client_session, &server_session, &xcred_s, &xcred_c, &skey,
+&client_to_server_buf, &server_to_client_buf, control_byte, 0);
+
+if (do_handshake(client_session, server_session) >= 0) {
+gnutls_session_get_data2(client_session, &resumption_data);
+}
+
+cleanup_sessions(&client_session, &server_session, &xcred_s, &xcred_c, &skey,
+&client_to_server_buf, &server_to_client_buf);
+
+if (resumption_data.size > 0) {
+// Handshake 2: Resume the session
+setup_sessions(&client_session, &server_session, &xcred_s, &xcred_c, &skey,
+&client_to_server_buf, &server_to_client_buf, control_byte, 0);
+
+gnutls_session_set_data(client_session, resumption_data.data, resumption_data.size);
+
+if (do_handshake(client_session, server_session) >= 0) {
+gnutls_session_ticket_send(server_session, nr, 0);
+}
+}
+gnutls_free(resumption_data.data);
+
+} else { // GNUTLS_NO_TICKETS flag path
+setup_sessions(&client_session, &server_session, &xcred_s, &xcred_c, &skey,
+&client_to_server_buf, &server_to_client_buf, control_byte, GNUTLS_NO_TICKETS);
+
+if (do_handshake(client_session, server_session) >= 0) {
+gnutls_session_ticket_send(server_session, nr, 0);
+}
+}
+
+cleanup_sessions(&client_session, &server_session, &xcred_s, &xcred_c, &skey,
+&client_to_server_buf, &server_to_client_buf);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: gnutls
+function signature: int gnutls_session_ticket_send(gnutls_session_t, unsigned int, unsigned int)
+</input>
+
+<description>
+The `gnutls_session_ticket_send` function is used on the server side of a TLS 1.3 connection to send one or more session tickets to the client after the initial handshake has completed. This allows the client to use these tickets to resume sessions in the future, improving performance. The function can be called at any time after the handshake, but it is typically called either automatically by GnuTLS or manually by the application if automatic sending is disabled. It takes a session handle, the number of tickets to send, and a flags parameter (which must be zero) as input.
+</description>
+
+<requirements>
+
+<requirement>
+The session must be initialized as a server session by calling `gnutls_init` with the `GNUTLS_SERVER` flag. This is because sending session tickets is a server-side operation.
+</requirement>
+<requirement>
+The session must be configured to use the TLS 1.3 protocol. The function explicitly checks for TLS 1.3 semantics and will return an error otherwise.
+</requirement>
+<requirement>
+The `gnutls_session_ticket_enable_server` function must be called before the handshake. This function sets up the session ticket encryption key required to create and send tickets.
+</requirement>
+<requirement>
+A full TLS handshake must have been completed successfully on the session. This ensures the session is in the correct state and the necessary keys are available to generate tickets.
+</requirement>
+<requirement>
+The `nr` argument, representing the number of tickets to send, must be greater than zero. The function returns an `GNUTLS_E_INVALID_REQUEST` error if `nr` is zero.
+</requirement>
+<requirement>
+The `flags` argument must be set to zero. The function's documentation specifies this, and non-zero values are reserved for future use.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x000000000001 (pc 0x7f848159ac23 bp 0x7ffd52799790 sp 0x7ffd52798f48 T0)
+==18==The signal is caused by a READ memory access.
+==18==Hint: address points to the zero page.
+SCARINESS: 10 (null-deref)
+#0 0x7f848159ac23  (/lib/x86_64-linux-gnu/libc.so.6+0xbbc23) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#1 0x55ca077fae62 in __asan_memcpy /src/llvm-project/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cpp:63:3
+#2 0x55ca0783df85 in pull_func /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:55:2
+#3 0x55ca0786055b in _gnutls_stream_read /src/gnutls/lib/buffers.c:332:7
+#4 0x55ca0786055b in _gnutls_read /src/gnutls/lib/buffers.c:408:10
+#5 0x55ca0786055b in _gnutls_io_read_buffered /src/gnutls/lib/buffers.c:561:9
+#6 0x55ca078417cc in recv_headers /src/gnutls/lib/record.c:1159:8
+#7 0x55ca078417cc in _gnutls_recv_in_buffers /src/gnutls/lib/record.c:1288:8
+#8 0x55ca07867d9a in _gnutls_handshake_io_recv_int /src/gnutls/lib/buffers.c:1409:9
+#9 0x55ca0786b911 in _gnutls_recv_handshake /src/gnutls/lib/handshake.c:1604:8
+#10 0x55ca078771ee in handshake_client /src/gnutls/lib/handshake.c:3100:10
+#11 0x55ca078771ee in gnutls_handshake /src/gnutls/lib/handshake.c:2900:10
+#12 0x55ca0783d451 in do_handshake /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:71:11
+#13 0x55ca0783d451 in LLVMFuzzerTestOneInput /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c:193:8
+#14 0x55ca076f1420 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#15 0x55ca076f0c45 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#16 0x55ca076f2425 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#17 0x55ca076f31b5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#18 0x55ca076e1ffb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#19 0x55ca0770d3d2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#20 0x7f8481503082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#21 0x55ca076d487d in _start (out/libfuzzer-address-x86_64/gnutls_private_key_parser_fuzzer+0x20d87d)
+
+DEDUP_TOKEN: __asan_memcpy--pull_func
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The root cause of the crash is a bug in the GnuTLS library, not the fuzz driver. The fuzz driver correctly configures separate transport buffers for client-to-server and server-to-client communication using `gnutls_transport_set_ptr2`.
+
+The debugging session reveals the following:
+1.  The crash occurs when the `client` session attempts to read data during the handshake (`gnutls_handshake(client)`).
+2.  The library is expected to invoke the registered `pull_func` with a pointer to the client's receive buffer (`server_to_client_buf`).
+3.  Instead, the library incorrectly calls `pull_func` with a pointer to the client's send buffer (`client_to_server_buf`).
+4.  Concurrently, another bug (likely related) causes the `data` field of this `client_to_server_buf` structure to be corrupted to `0x1`.
+5.  When `pull_func` attempts to `memcpy` from this corrupted `data` pointer (`0x1`), a segmentation fault occurs.
+
+The fuzzer's logic for setting up the TLS sessions and their I/O callbacks is standard and correct. The bug lies in the GnuTLS library's internal state management, which leads it to use the wrong buffer pointer for a pull operation.
+
+**Suggestion for patching the project:**
+
+The GnuTLS library code needs to be investigated to find why the transport pointer for sending is being used for a receive operation within the client's handshake state machine. The investigation should focus on the code path triggered by the fuzzer's input (`scenario=1`, `control_byte=1`), which involves setting `max_early_data_size`. The logic in `lib/record.c` and `lib/handshake.c` that handles reading handshake messages for a client session should be reviewed to ensure it correctly retrieves and uses the `recv_ptr` set by `gnutls_transport_set_ptr2`.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/gnutls/fuzz/gnutls_private_key_parser_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

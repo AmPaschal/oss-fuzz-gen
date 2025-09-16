@@ -1,0 +1,561 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libtpms.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/libtpms/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <assert.h>
+#include <vector>
+
+#include <libtpms/tpm_error.h>
+#include <libtpms/tpm_library.h>
+#include <libtpms/tpm_memory.h>
+#include <libtpms/tpm_nvfilename.h>
+
+// All necessary headers will be included via the build script's CXXFLAGS
+extern "C" {
+#include "Tpm.h"
+#include "Create_fp.h"
+#include "CreatePrimary_fp.h"
+#include "FlushContext_fp.h"
+#include "TpmTypes.h"
+#include "TpmAlgorithmDefines.h"
+#include "Hash_fp.h"
+#include "Object_spt_fp.h"
+}
+
+// From `fuzz.cc`
+static void die(const char *msg) {
+fprintf(stderr, "%s", msg);
+// OSS-Fuzz has a 60-second timeout. This prevents it from being triggered.
+// Instead, the fuzzer should crash.
+assert(false);
+}
+
+static TPM_RESULT mytpm_io_init(void) { return TPM_SUCCESS; }
+
+static TPM_RESULT mytpm_io_getlocality(TPM_MODIFIER_INDICATOR *locModif, uint32_t tpm_number) {
+*locModif = 0;
+return TPM_SUCCESS;
+}
+
+static TPM_RESULT mytpm_io_getphysicalpresence(TPM_BOOL *phyPres, uint32_t tpm_number) {
+*phyPres = FALSE;
+return TPM_SUCCESS;
+}
+
+static unsigned char *permall;
+static uint32_t permall_length;
+
+static TPM_RESULT mytpm_nvram_loaddata(unsigned char **data, uint32_t *length, uint32_t tpm_number, const char *name) {
+if (!strcmp(name, TPM_PERMANENT_ALL_NAME)) {
+if (permall) {
+*data = NULL;
+assert(TPM_Malloc(data, permall_length) == TPM_SUCCESS);
+memcpy(*data, permall, permall_length);
+*length = permall_length;
+return TPM_SUCCESS;
+}
+}
+return TPM_RETRY;
+}
+
+static TPM_RESULT mytpm_nvram_storedata(const unsigned char *data, uint32_t length, uint32_t tpm_number, const char *name) {
+if (!strcmp(name, TPM_PERMANENT_ALL_NAME)) {
+free(permall);
+permall = NULL;
+assert(TPM_Malloc(&permall, length) == TPM_SUCCESS);
+memcpy(permall, data, length);
+permall_length = length;
+}
+return TPM_SUCCESS;
+}
+
+// Main fuzzing entry point
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+FuzzedDataProvider fdp(data, size);
+
+// Initialization logic
+struct libtpms_callbacks cbs = {
+.sizeOfStruct = sizeof(struct libtpms_callbacks),
+.tpm_nvram_init = NULL,
+.tpm_nvram_loaddata = mytpm_nvram_loaddata,
+.tpm_nvram_storedata = mytpm_nvram_storedata,
+.tpm_nvram_deletename = NULL,
+.tpm_io_init = mytpm_io_init,
+.tpm_io_getlocality = mytpm_io_getlocality,
+.tpm_io_getphysicalpresence = mytpm_io_getphysicalpresence,
+};
+
+if (TPMLIB_RegisterCallbacks(&cbs) != TPM_SUCCESS) {
+return 0;
+}
+if (TPMLIB_ChooseTPMVersion(TPMLIB_TPM_VERSION_2) != TPM_SUCCESS) {
+return 0;
+}
+if (TPMLIB_MainInit() != TPM_SUCCESS) {
+return 0;
+}
+
+// TPM2_Startup
+unsigned char *rbuffer = NULL;
+uint32_t rlength;
+uint32_t rtotal = 0;
+unsigned char startup[] = {0x80, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00};
+if (TPMLIB_Process(&rbuffer, &rlength, &rtotal, startup, sizeof(startup)) != TPM_SUCCESS) {
+TPM_Free(rbuffer);
+TPMLIB_Terminate();
+free(permall);
+permall = NULL;
+return 0;
+}
+TPM_Free(rbuffer);
+
+// Step 1: Create a primary object to act as the parent.
+CreatePrimary_In primary_in;
+CreatePrimary_Out primary_out;
+memset(&primary_in, 0, sizeof(primary_in));
+memset(&primary_out, 0, sizeof(primary_out));
+
+primary_in.primaryHandle = TPM_RH_OWNER;
+primary_in.inPublic.publicArea.type = TPM_ALG_RSA;
+primary_in.inPublic.publicArea.nameAlg = TPM_ALG_SHA256;
+primary_in.inPublic.publicArea.objectAttributes = (TPMA_OBJECT_fixedTPM |
+TPMA_OBJECT_fixedParent |
+TPMA_OBJECT_sensitiveDataOrigin |
+TPMA_OBJECT_userWithAuth |
+TPMA_OBJECT_decrypt |
+TPMA_OBJECT_restricted);
+primary_in.inPublic.publicArea.parameters.rsaDetail.symmetric.algorithm = TPM_ALG_AES;
+primary_in.inPublic.publicArea.parameters.rsaDetail.symmetric.keyBits.sym = 128;
+primary_in.inPublic.publicArea.parameters.rsaDetail.symmetric.mode.sym = TPM_ALG_CFB;
+primary_in.inPublic.publicArea.parameters.rsaDetail.scheme.scheme = TPM_ALG_NULL;
+primary_in.inPublic.publicArea.parameters.rsaDetail.keyBits = 2048;
+primary_in.inPublic.publicArea.parameters.rsaDetail.exponent = 0;
+
+if (TPM2_CreatePrimary(&primary_in, &primary_out) != TPM_RC_SUCCESS) {
+TPMLIB_Terminate();
+free(permall);
+permall = NULL;
+return 0;
+}
+
+// Step 2: Fuzz and call TPM2_Create
+Create_In create_in;
+Create_Out create_out;
+memset(&create_in, 0, sizeof(create_in));
+memset(&create_out, 0, sizeof(create_out));
+
+create_in.parentHandle = primary_out.objectHandle;
+
+TPMT_PUBLIC *public_area = &create_in.inPublic.publicArea;
+
+const TPM_ALG_ID valid_types[] = {TPM_ALG_RSA, TPM_ALG_ECC, TPM_ALG_KEYEDHASH, TPM_ALG_SYMCIPHER};
+public_area->type = fdp.PickValueInArray(valid_types);
+
+const TPM_ALG_ID valid_name_algs[] = {TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TPM_ALG_SM3_256};
+public_area->nameAlg = fdp.PickValueInArray(valid_name_algs);
+
+public_area->objectAttributes = fdp.ConsumeIntegral<TPMA_OBJECT>();
+
+bool tpm_generates_data;
+switch (public_area->type) {
+case TPM_ALG_RSA:
+case TPM_ALG_ECC:
+// For asymmetric keys, TPM must generate the data.
+tpm_generates_data = true;
+break;
+case TPM_ALG_SYMCIPHER:
+// For symmetric objects, user must provide the data.
+tpm_generates_data = false;
+break;
+default: // KEYEDHASH
+// For keyed hash, either is possible.
+tpm_generates_data = fdp.ConsumeBool();
+break;
+}
+
+size_t sensitive_size;
+if (tpm_generates_data) {
+public_area->objectAttributes |= TPMA_OBJECT_sensitiveDataOrigin;
+sensitive_size = 0;
+} else {
+public_area->objectAttributes &= ~TPMA_OBJECT_sensitiveDataOrigin;
+// Must provide data if not sensitiveDataOrigin
+sensitive_size = fdp.ConsumeIntegralInRange<size_t>(1, 128);
+}
+
+std::vector<uint8_t> sensitive_data = fdp.ConsumeBytes<uint8_t>(sensitive_size);
+create_in.inSensitive.sensitive.data.t.size = sensitive_data.size();
+if (!sensitive_data.empty()) {
+memcpy(create_in.inSensitive.sensitive.data.t.buffer, sensitive_data.data(), sensitive_data.size());
+}
+
+if (fdp.ConsumeBool()) public_area->objectAttributes |= TPMA_OBJECT_fixedTPM;
+if (fdp.ConsumeBool()) public_area->objectAttributes |= TPMA_OBJECT_fixedParent;
+if (fdp.ConsumeBool()) public_area->objectAttributes |= TPMA_OBJECT_userWithAuth;
+if (fdp.ConsumeBool()) public_area->objectAttributes |= TPMA_OBJECT_decrypt;
+if (fdp.ConsumeBool()) public_area->objectAttributes |= TPMA_OBJECT_sign;
+if (fdp.ConsumeBool()) public_area->objectAttributes |= TPMA_OBJECT_restricted;
+
+if (IS_ATTRIBUTE(public_area->objectAttributes, TPMA_OBJECT, restricted) &&
+(IS_ATTRIBUTE(public_area->objectAttributes, TPMA_OBJECT, sign) == 
+IS_ATTRIBUTE(public_area->objectAttributes, TPMA_OBJECT, decrypt))) {
+if (fdp.ConsumeBool()) {
+public_area->objectAttributes |= TPMA_OBJECT_sign;
+public_area->objectAttributes &= ~TPMA_OBJECT_decrypt;
+} else {
+public_area->objectAttributes &= ~TPMA_OBJECT_sign;
+public_area->objectAttributes |= TPMA_OBJECT_decrypt;
+}
+}
+
+switch (public_area->type) {
+case TPM_ALG_RSA:
+public_area->parameters.rsaDetail.keyBits = fdp.PickValueInArray<UINT16>({1024, 2048, 4096});
+public_area->parameters.rsaDetail.scheme.scheme = fdp.PickValueInArray<TPM_ALG_ID>({TPM_ALG_NULL, TPM_ALG_RSASSA, TPM_ALG_RSAES, TPM_ALG_RSAPSS});
+break;
+case TPM_ALG_ECC:
+public_area->parameters.eccDetail.curveID = fdp.PickValueInArray<TPM_ECC_CURVE>({TPM_ECC_NIST_P256, TPM_ECC_NIST_P384, TPM_ECC_BN_P256});
+public_area->parameters.eccDetail.scheme.scheme = fdp.PickValueInArray<TPM_ALG_ID>({TPM_ALG_NULL, TPM_ALG_ECDSA, TPM_ALG_ECDAA, TPM_ALG_SM2});
+break;
+case TPM_ALG_KEYEDHASH:
+public_area->parameters.keyedHashDetail.scheme.scheme = fdp.PickValueInArray<TPM_ALG_ID>({TPM_ALG_NULL, TPM_ALG_HMAC, TPM_ALG_XOR});
+break;
+case TPM_ALG_SYMCIPHER:
+public_area->parameters.symDetail.sym.algorithm = fdp.PickValueInArray<TPM_ALG_ID>({TPM_ALG_AES, TPM_ALG_SM4, TPM_ALG_CAMELLIA, TPM_ALG_TDES});
+public_area->parameters.symDetail.sym.keyBits.sym = fdp.PickValueInArray<UINT16>({128, 192, 256});
+public_area->parameters.symDetail.sym.mode.sym = fdp.PickValueInArray<TPM_ALG_ID>({TPM_ALG_CFB, TPM_ALG_CTR, TPM_ALG_OFB, TPM_ALG_CBC, TPM_ALG_ECB});
+break;
+}
+
+UINT16 policy_size_to_consume = fdp.ConsumeBool() 
+? CryptHashGetDigestSize(public_area->nameAlg)
+: fdp.ConsumeIntegralInRange<UINT16>(0, sizeof(public_area->authPolicy.t.buffer));
+std::vector<uint8_t> policy_data = fdp.ConsumeBytes<uint8_t>(policy_size_to_consume);
+public_area->authPolicy.t.size = policy_data.size();
+if (!policy_data.empty()) {
+memcpy(public_area->authPolicy.t.buffer, policy_data.data(), policy_data.size());
+}
+
+std::vector<uint8_t> auth_data = fdp.ConsumeBytes<uint8_t>(fdp.ConsumeIntegralInRange<size_t>(0, sizeof(create_in.inSensitive.sensitive.userAuth.t.buffer)));
+create_in.inSensitive.sensitive.userAuth.t.size = auth_data.size();
+if(!auth_data.empty()) {
+memcpy(create_in.inSensitive.sensitive.userAuth.t.buffer, auth_data.data(), auth_data.size());
+}
+
+if (fdp.remaining_bytes() >= sizeof(create_in.outsideInfo)) {
+fdp.ConsumeData(&create_in.outsideInfo, sizeof(create_in.outsideInfo));
+}
+if (fdp.remaining_bytes() >= sizeof(create_in.creationPCR)) {
+fdp.ConsumeData(&create_in.creationPCR, sizeof(create_in.creationPCR));
+}
+
+TPM2_Create(&create_in, &create_out);
+
+FlushContext_In flush_in;
+flush_in.flushHandle = primary_out.objectHandle;
+TPM2_FlushContext(&flush_in);
+
+TPMLIB_Terminate();
+free(permall);
+permall = NULL;
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libtpms
+function signature: TPM_RC TPM2_Create(Create_In *, Create_Out *)
+</input>
+
+<description>
+The TPM2_Create function is used to create a new object in the TPM. It takes a handle to a parent object and a template for the new object. The template includes public and sensitive portions. The function validates the template against the parent's properties and the TPM's capabilities. If the validation is successful, it creates the new object and returns its private and public areas to the caller.
+</description>
+
+<requirements>
+<requirement>
+The `in->parentHandle` must be a valid handle to an object that has the `parent` attribute. The function will fail if the handle is invalid or the object is not a parent.
+</requirement>
+<requirement>
+The `in->inPublic.publicArea.nameAlg` must not be `TPM_ALG_NULL`. This algorithm is essential for cryptographic operations related to the object.
+</requirement>
+<requirement>
+If the `authPolicy` in `in->inPublic.publicArea` is not empty, its size must match the digest size of the `nameAlg`. An incorrect size will lead to a `TPM_RCS_SIZE` error.
+</requirement>
+<requirement>
+The `objectAttributes` in `in->inPublic.publicArea` must be consistent and valid. For instance, a restricted key cannot have both `sign` and `decrypt` attributes set to the same value.
+</requirement>
+<requirement>
+If the `sensitiveDataOrigin` attribute is not set in the public area, the `in->inSensitive.sensitive.data.t.size` must be greater than zero. This is because the sensitive data must be provided externally in this case.
+</requirement>
+<requirement>
+If the `sensitiveDataOrigin` attribute is set in the public area, the `in->inSensitive.sensitive.data.t.size` must be zero for non-primary objects. This is because the TPM will generate the sensitive data internally.
+</requirement>
+<requirement>
+The `type` of the object in `in->inPublic.publicArea` must be consistent with its attributes. For example, only a `TPM_ALG_KEYEDHASH` object can have both `sign` and `decrypt` attributes cleared.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: stack-use-after-return on address 0x7f90d1833ca0 at pc 0x559a592a351c bp 0x7ffe94a331f0 sp 0x7ffe94a331e8
+READ of size 4 at 0x7f90d1833ca0 thread T0
+SCARINESS: 55 (4-byte-read-stack-use-after-return)
+#0 0x559a592a351b in ExecuteCommand /src/libtpms/src/tpm2/ExecCommand.c:112:40
+#1 0x559a59272cfd in _plat__RunCommand /src/libtpms/src/tpm2/RunCommand.c:95:5
+#2 0xab34b3d263e  (<unknown module>)
+
+DEDUP_TOKEN: ExecuteCommand--_plat__RunCommand--
+Address 0x7f90d1833ca0 is located in stack of thread T0 at offset 32 in frame
+#0 0x559a5919fe8f in TPM2_Process /src/libtpms/src/tpm_tpm2_interface.c:184
+
+DEDUP_TOKEN: TPM2_Process
+This frame has 2 object(s):
+[32, 48) 'resp' (line 187) <== Memory access at offset 32 is inside this variable
+[64, 68) 'locty' (line 194)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+(longjmp and C++ exceptions *are* supported)
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a stack-use-after-return, caused by a bug in the libtpms project.
+
+Here's the analysis:
+
+1.  The crash occurs in `ExecuteCommand` at `ExecCommand.c:112` when dereferencing `responseSize`.
+2.  The `responseSize` pointer is passed from `_plat__RunCommand`, which in turn receives it from `_rpc__Send_Command`.
+3.  `_rpc__Send_Command` is called from `TPM2_Process` with a pointer to a local variable `resp.BufferSize`. `resp` is a struct of type `_OUT_BUFFER` declared on the stack of `TPM2_Process`.
+4.  The function `_plat__RunCommand` uses `setjmp` to save the execution context.
+5.  In some error conditions within the `TPM2_Create` call stack, `longjmp` is used to return to the point where `setjmp` was called in `_plat__RunCommand`.
+6.  However, the `TPM2_Process` function, which allocated the `resp` buffer on its stack, may have already returned.
+7.  When `longjmp` returns control to `_plat__RunCommand`, the stack frame of `TPM2_Process` is no longer valid.
+8.  The subsequent call to `ExecuteCommand` from `_plat__RunCommand` uses the now-dangling pointer `responseSize`, which points to the deallocated stack frame of `TPM2_Process`. This leads to a use-after-return and a crash.
+
+The core issue is the use of `setjmp`/`longjmp` for error handling across function calls where pointers to stack variables are passed. When an error occurs and `longjmp` is called, it unwinds the stack, but not in a way that C++ destructors or other cleanup code would be called. The stack frame of `TPM2_Process` is gone, but `_plat__RunCommand` tries to use a pointer into it.
+
+**Suggestion for patching the project:**
+
+The use of `setjmp`/`longjmp` for error handling is fragile and should be replaced with a more robust mechanism, such as returning error codes. The functions in the call chain should check the return values and propagate the error up to the caller, which can then handle it appropriately without causing a stack-use-after-return.
+
+Specifically, the `longjmp` in the error path should be removed. Instead, functions should return an error code. The caller (`ExecuteCommand`, `_plat__RunCommand`, `_rpc__Send_Command`, etc.) should check for this error code and return immediately, propagating the error up the call stack. This will ensure that the stack is unwound correctly and that no dangling pointers are used.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libtpms/tests/fuzz.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libtpms/tests/fuzz.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

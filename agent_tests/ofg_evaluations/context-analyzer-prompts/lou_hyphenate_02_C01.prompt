@@ -1,0 +1,448 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project liblouis.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/liblouis/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <unistd.h>
+#include <fuzzer/FuzzedDataProvider.h>
+
+extern "C" {
+#include "/src/liblouis/liblouis/liblouis.h"
+#include "/src/liblouis/liblouis/internal.h"
+}
+
+// A callback to suppress log messages from liblouis
+void silent_log_callback(logLevels level, const char *message) {
+(void)level;
+(void)message;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+static bool initialized = false;
+if (!initialized) {
+lou_registerLogCallback(silent_log_callback);
+initialized = true;
+}
+
+FuzzedDataProvider provider(data, size);
+
+// 1. Create a temporary table file from the first part of the fuzzer data.
+std::vector<uint8_t> table_content = provider.ConsumeBytes<uint8_t>(
+provider.ConsumeIntegralInRange<size_t>(1, 512));
+if (table_content.empty()) {
+return 0;
+}
+
+char table_filename[] = "/tmp/fuzz-hyphenate-XXXXXX";
+int fd = mkstemp(table_filename);
+if (fd == -1) {
+return 0;
+}
+
+FILE *fp = fdopen(fd, "wb");
+if (!fp) {
+close(fd);
+unlink(table_filename);
+return 0;
+}
+fwrite(table_content.data(), 1, table_content.size(), fp);
+fclose(fp);
+
+// 2. Check if the table is valid. If not, clean up and exit.
+if (lou_checkTable(table_filename) == 0) {
+lou_free();
+unlink(table_filename);
+return 0;
+}
+
+// 3. Prepare the input string for translation.
+std::string text_to_process = provider.ConsumeRemainingBytesAsString();
+if (text_to_process.empty()) {
+lou_free();
+unlink(table_filename);
+return 0;
+}
+
+// Convert the string to widechar using the internal function, as seen in other fuzzers.
+widechar *inputText = (widechar *)malloc((text_to_process.length() * 2 + 1) * sizeof(widechar));
+if (!inputText) {
+lou_free();
+unlink(table_filename);
+return 0;
+}
+int inputLen = _lou_extParseChars(text_to_process.c_str(), inputText);
+if (inputLen <= 0) {
+free(inputText);
+lou_free();
+unlink(table_filename);
+return 0;
+}
+
+// 4. Translate the string to get the required input for lou_hyphenate.
+int translatedLen = inputLen * 5; // Allocate a generous buffer for the output.
+widechar *translatedText = (widechar *)malloc((translatedLen + 1) * sizeof(widechar));
+if (!translatedText) {
+free(inputText);
+lou_free();
+unlink(table_filename);
+return 0;
+}
+
+int originalInputLen = inputLen;
+if (lou_translateString(table_filename, inputText, &originalInputLen, translatedText, &translatedLen, NULL, NULL, 0) == 0) {
+free(inputText);
+free(translatedText);
+lou_free();
+unlink(table_filename);
+return 0;
+}
+
+// 5. Call lou_hyphenate with the translated text.
+// Adhere to the requirement that inlen must be less than 100.
+if (translatedLen > 0 && translatedLen < 100) {
+char *hyphens = (char *)malloc(translatedLen + 1);
+if (hyphens) {
+int mode = provider.ConsumeBool();
+lou_hyphenate(table_filename, translatedText, translatedLen, hyphens, mode);
+free(hyphens);
+}
+}
+
+// 6. Clean up all resources.
+free(inputText);
+free(translatedText);
+lou_free();
+unlink(table_filename);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: liblouis
+function signature: int lou_hyphenate(const char *, const widechar *, int, char *, int)
+</input>
+
+<description>
+The `lou_hyphenate` function hyphenates a given wide character string (`inbuf`) of length `inlen` based on the rules defined in the provided `tableList`. The `hyphens` buffer is populated with the hyphenation result, where '1' indicates a hyphenation point and '0' indicates no hyphenation. The `mode` parameter determines if the input should be back-translated from braille before hyphenation. The function returns 1 on success and 0 on failure. The callers of this function, such as `lou_checkhyphens.c` and `brl_checks.c`, first translate a string using `lou_translateString` and then pass the result to `lou_hyphenate`.
+</description>
+
+<requirements>
+
+<requirement>
+The `tableList` argument must be a comma-separated list of valid table files. This is because `lou_getTable` is called internally to load these tables, and the hyphenation logic depends on a valid, non-null table with hyphenation states.
+</requirement>
+<requirement>
+The `inbuf` argument should be the result of a call to `lou_translateString`, and `inlen` should be its corresponding length. The function expects a translated wide character string for proper hyphenation, not arbitrary wide characters.
+</requirement>
+<requirement>
+The `inlen` argument must be less than 100. This is to avoid a stack buffer overflow in the `textBuffer` array, which has a fixed size of `HYPHSTRING` (100).
+</requirement>
+<requirement>
+The `hyphens` argument must point to a pre-allocated buffer of at least `inlen + 1` characters. This buffer is used to store the output of the hyphenation process.
+</requirement>
+<requirement>
+The `mode` argument should be either 0 or a non-zero integer. A non-zero value for `mode` triggers a back-translation step from braille before hyphenation.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: heap-buffer-overflow on address 0x51a000025d02 at pc 0x55cb5e04a0b4 bp 0x7ffce4826970 sp 0x7ffce4826130
+WRITE of size 1224 at 0x51a000025d02 thread T0
+SCARINESS: 45 (multi-byte-write-heap-buffer-overflow)
+#0 0x55cb5e04a0b3 in __asan_memcpy /src/llvm-project/compiler-rt/lib/asan/asan_interceptors_memintrinsics.cpp:63:3
+#1 0x55cb5e08e962 in _lou_extParseChars /src/liblouis/liblouis/compileTranslationTable.c:1412:51
+#2 0x55cb5e08be06 in LLVMFuzzerTestOneInput /src/liblouis/tests/fuzzing/table_fuzzer.cc:73:20
+#3 0x55cb5df40360 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#4 0x55cb5df3fb85 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#5 0x55cb5df41365 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#6 0x55cb5df420f5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#7 0x55cb5df30f3b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#8 0x55cb5df5c312 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#9 0x7f37826fe082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#10 0x55cb5df237bd in _start (out/libfuzzer-address-x86_64/table_fuzzer+0x727bd)
+
+DEDUP_TOKEN: __asan_memcpy--_lou_extParseChars--LLVMFuzzerTestOneInput
+0x51a000025d02 is located 0 bytes after 1154-byte region [0x51a000025880,0x51a000025d02)
+allocated by thread T0 here:
+#0 0x55cb5e04c12f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55cb5e08bdbf in LLVMFuzzerTestOneInput /src/liblouis/tests/fuzzing/table_fuzzer.cc:67:39
+#2 0x55cb5df40360 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55cb5df3fb85 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55cb5df41365 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x55cb5df420f5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x55cb5df30f3b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55cb5df5c312 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f37826fe082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+The crash is a heap-buffer-overflow that occurs within the `_lou_parseChars` function. The analysis revealed two contributing factors, with the primary bug residing in the project code.
+
+1.  **Project Bug (Root Cause):** The function `_lou_parseChars` in `compileTranslationTable.c` incorrectly calculates the index for the output buffer. When processing a multi-byte character sequence of length `charlen`, it copies `charlen` bytes into the `widechar` output buffer. Assuming `charlen` is a multiple of `sizeof(widechar)`, this corresponds to `charlen / sizeof(widechar)` elements. However, the code increments the output buffer index `j` by `charlen` (e.g., `j += 4`) instead of by the number of `widechar` elements written (e.g., `j++`). This causes the write index `j` to advance much faster than the actual data being written, leading it to quickly go past the buffer's boundary, resulting in a heap-buffer-overflow.
+
+2.  **Fuzz Driver Weakness:** The fuzz driver calls `_lou_extParseChars`, an unsafe wrapper function that internally calls `_lou_parseChars` with a hardcoded buffer size of `MAXSTRING` (1024). The fuzzer, however, allocates a buffer smaller than 1024 `widechar`s based on the input string length. This discrepancy between the allocated buffer size and the size communicated to the function makes an overflow almost certain if the input is long enough, even without the index calculation bug.
+
+The crash is fundamentally caused by the incorrect index arithmetic in the project's C code.
+
+**Suggestion for Project Patch:**
+The bug is located in `liblouis/liblouis/compileTranslationTable.c` within the `_lou_parseChars` function. The line that increments the output buffer index `j` should be corrected.
+
+**Incorrect code:**
+```c
+memcpy(&outbuf[j], &inbuf[i], charlen);
+j += charlen;
+i += charlen - 1;
+```
+
+**Corrected code:**
+```c
+memcpy(&outbuf[j], &inbuf[i], charlen);
+j += charlen / sizeof(widechar); // Or simply j++; if charlen is always sizeof(widechar)
+i += charlen - 1;
+```
+Assuming `charlen` will always be a multiple of `sizeof(widechar)`, dividing by the size is the most robust fix. Given the context, it seems `charlen` represents the byte-length of a single wide character, so `j++` would also be correct.
+
+**Suggestion for Fuzz Driver:**
+To improve the fuzzer's safety and precision, it should avoid using the unsafe `_lou_extParseChars` wrapper. Instead, it should call `_lou_parseChars` directly and provide the correct size of the buffer it allocated.
+
+**Current code:**
+```cpp
+widechar *inputText = (widechar *)malloc((text_to_process.length() * 2 + 1) * sizeof(widechar));
+// ...
+int inputLen = _lou_extParseChars(text_to_process.c_str(), inputText);
+```
+
+**Suggested modification:**
+```cpp
+int inputTextSize = text_to_process.length() * 2 + 1;
+widechar *inputText = (widechar *)malloc(inputTextSize * sizeof(widechar));
+// ...
+int inputLen = _lou_parseChars(text_to_process.c_str(), inputText, inputTextSize);
+```
+This change ensures that the library function is aware of the actual buffer size, allowing its internal bounds checks to work as intended (once the primary bug is fixed).
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/liblouis/tests/fuzzing/table_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/liblouis/tests/fuzzing/table_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

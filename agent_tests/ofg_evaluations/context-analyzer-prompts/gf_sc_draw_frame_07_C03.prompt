@@ -1,0 +1,1022 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project gpac.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/gpac/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <gpac/filters.h>
+#include <gpac/compositor.h>
+#include <gpac/tools.h>
+#include <gpac/internal/compositor_dev.h> // Include internal header for full struct definition
+#include <string.h> // For memcpy
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+// We need enough data to manipulate some state fields.
+if (size < 10) {
+return 0;
+}
+
+// Initialize the GPAC library. This is mandatory.
+gf_sys_init(GF_MemTrackerNone, NULL);
+
+// Set "no-video" option using the correct API. This is crucial.
+// When gf_sc_load is called, it will see this option and initialize
+// compositor->video_out to a dummy non-NULL value, bypassing the early exit.
+gf_opts_set_key("temp", "no-video", "yes");
+
+GF_FilterSession *fs = gf_fs_new_defaults(0);
+if (!fs) {
+gf_sys_close();
+return 0;
+}
+
+GF_Filter *filter = gf_fs_load_filter(fs, "compositor", NULL);
+if (!filter) {
+gf_fs_del(fs);
+gf_sys_close();
+return 0;
+}
+
+GF_Compositor *compositor = (GF_Compositor *)gf_filter_get_udta(filter);
+if (!compositor) {
+gf_fs_del(fs);
+gf_sys_close();
+return 0;
+}
+
+// Load the compositor. This performs essential initialization.
+// Without this, compositor->vout is NULL.
+if (gf_sc_load(compositor) != GF_OK) {
+gf_fs_del(fs);
+gf_sys_close();
+return 0;
+}
+
+// Fuzz various state fields of the compositor to explore more code paths.
+size_t offset = 0;
+Bool no_flush = (data[offset++] % 2) ? GF_TRUE : GF_FALSE;
+
+if (size > offset)
+compositor->flush_pending = (data[offset++] % 2);
+
+// frame_ifce.user_data is a pointer, setting it to non-NULL will trigger an early return
+// which is a valid path to fuzz.
+if (size > offset) {
+if (data[offset++] % 2) {
+compositor->frame_ifce.user_data = compositor; // non-NULL dummy value
+} else {
+compositor->frame_ifce.user_data = NULL;
+}
+}
+
+if (size > offset + sizeof(s32)) {
+memcpy(&compositor->ms_until_next_frame, data + offset, sizeof(s32));
+offset += sizeof(s32);
+}
+
+if (size > offset)
+compositor->frame_draw_type = data[offset++];
+
+if (size > offset)
+compositor->fonts_pending = data[offset++];
+
+
+s32 ms_till_next;
+gf_sc_draw_frame(compositor, no_flush, &ms_till_next);
+
+// Cleanup: delete the filter session which also deletes all filters.
+gf_fs_del(fs);
+
+// Close the GPAC library.
+gf_sys_close();
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: gpac
+function signature: Bool gf_sc_draw_frame(GF_Compositor *, Bool, s32 *)
+</input>
+
+<description>
+The function `gf_sc_draw_frame` is responsible for drawing a single frame in the compositor. It is called repeatedly by the `compose` filter's processing function. The function first sends any pending audio data to the audio renderer. Then, it renders the video frame and updates the `ms_till_next` argument with the time until the next frame should be drawn. The function returns `GF_TRUE` if a redraw is needed, and `GF_FALSE` otherwise.
+</description>
+
+<requirements>
+<requirement>
+The first argument, `compositor`, must be a valid pointer to a `GF_Compositor` struct. This is because it is dereferenced multiple times without a null check.
+</requirement>
+<requirement>
+The `compositor` must be initialized by calling `gf_sc_load`, `compositor_setup_aout`, and `compositor_setup_vout`. This is because these functions set up the necessary state for the compositor to function correctly.
+</requirement>
+<requirement>
+The `no_flush` argument can be either `GF_TRUE` or `GF_FALSE`. This is because the function handles both cases.
+</requirement>
+<requirement>
+The `ms_till_next` argument can be `NULL`. This is because the function checks if `ms_till_next` is `NULL` before dereferencing it.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 8629024 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24a058d2 in gf_sc_load /src/gpac/src/compositor/compositor.c:814:2
+#2 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#3 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#4 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#5 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#6 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#7 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_sc_load--compose_initialize
+Direct leak of 736624 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c249ad383 in gf_mx_new /src/gpac/src/utils/os_thread.c:530:29
+#2 0x557c24a06841 in gf_sc_load /src/gpac/src/compositor/compositor.c:906:23
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_mx_new--gf_sc_load
+Direct leak of 736624 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c249ad383 in gf_mx_new /src/gpac/src/utils/os_thread.c:530:29
+#2 0x557c24a053ed in gf_sc_load /src/gpac/src/compositor/compositor.c:759:19
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_mx_new--gf_sc_load
+Direct leak of 526160 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24a2ab5e in drawable_new /src/gpac/src/compositor/drawable.c:148:2
+#2 0x557c24a064bc in gf_sc_load /src/gpac/src/compositor/compositor.c:864:32
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--drawable_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a0680a in gf_sc_load /src/gpac/src/compositor/compositor.c:904:33
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05a16 in gf_sc_load /src/gpac/src/compositor/compositor.c:827:33
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a06ab0 in gf_sc_load /src/gpac/src/compositor/compositor.c:932:27
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a067d8 in gf_sc_load /src/gpac/src/compositor/compositor.c:902:28
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05b10 in gf_sc_load /src/gpac/src/compositor/compositor.c:838:26
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a0589b in gf_sc_load /src/gpac/src/compositor/compositor.c:811:24
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05aac in gf_sc_load /src/gpac/src/compositor/compositor.c:833:32
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05a7a in gf_sc_load /src/gpac/src/compositor/compositor.c:831:35
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05a48 in gf_sc_load /src/gpac/src/compositor/compositor.c:829:30
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a059e4 in gf_sc_load /src/gpac/src/compositor/compositor.c:825:24
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05ade in gf_sc_load /src/gpac/src/compositor/compositor.c:835:32
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a0586c in gf_sc_load /src/gpac/src/compositor/compositor.c:809:28
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a0541d in gf_sc_load /src/gpac/src/compositor/compositor.c:763:30
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a069f5 in gf_sc_load /src/gpac/src/compositor/compositor.c:924:29
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a065b1 in gf_sc_load /src/gpac/src/compositor/compositor.c:887:29
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a0660c in gf_sc_load /src/gpac/src/compositor/compositor.c:891:28
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a065dd in gf_sc_load /src/gpac/src/compositor/compositor.c:889:25
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Direct leak of 210448 byte(s) in 13153 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a067ad in gf_sc_load /src/gpac/src/compositor/compositor.c:900:27
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Indirect leak of 3572720 byte(s) in 13135 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24a6fe6a in visual_new /src/gpac/src/compositor/visual_manager.c:45:2
+#2 0x557c24a05b44 in gf_sc_load /src/gpac/src/compositor/compositor.c:842:23
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--visual_new--gf_sc_load
+Indirect leak of 2732080 byte(s) in 13135 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24adbbc4 in evg_solid_brush /src/gpac/src/evg/stencil.c:280:2
+#2 0x557c24adbbc4 in gf_evg_stencil_new /src/gpac/src/evg/stencil.c:177:8
+#3 0x557c24a6ff8c in visual_new /src/gpac/src/compositor/visual_manager.c:59:22
+#4 0x557c24a05b44 in gf_sc_load /src/gpac/src/compositor/compositor.c:842:23
+#5 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#6 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#7 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#8 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#9 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#10 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--evg_solid_brush--gf_evg_stencil_new
+Indirect leak of 2101600 byte(s) in 13135 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24a6ff27 in visual_new /src/gpac/src/compositor/visual_manager.c:53:2
+#2 0x557c24a05b44 in gf_sc_load /src/gpac/src/compositor/compositor.c:842:23
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--visual_new--gf_sc_load
+Indirect leak of 1050800 byte(s) in 13135 object(s) allocated from:
+#0 0x557c24930d5c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x557c24983bf6 in realloc_chain /src/gpac/src/utils/list.c:643:23
+#2 0x557c24983bf6 in gf_list_add /src/gpac/src/utils/list.c:652:39
+#3 0x557c24a06437 in gf_sc_load /src/gpac/src/compositor/compositor.c:859:2
+#4 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#5 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#6 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#7 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#8 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#9 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--realloc_chain--gf_list_add
+Indirect leak of 841856 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c2538a9d6 in gf_path_new /src/gpac/src/utils/path2d.c:35:2
+#2 0x557c24a2ab8f in drawable_new /src/gpac/src/compositor/drawable.c:153:14
+#3 0x557c24a064bc in gf_sc_load /src/gpac/src/compositor/compositor.c:864:32
+#4 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#5 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#6 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#7 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#8 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#9 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_path_new--drawable_new
+Indirect leak of 631392 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c253a8a09 in gf_node_setup /src/gpac/src/scenegraph/base_scenegraph.c:1244:2
+#2 0x557c253abcf2 in gf_sg_new_base_node /src/gpac/src/scenegraph/base_scenegraph.c:1256:2
+#3 0x557c253abcf2 in gf_node_new /src/gpac/src/scenegraph/base_scenegraph.c:1992:42
+#4 0x557c24a064ee in gf_sc_load /src/gpac/src/compositor/compositor.c:867:38
+#5 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#6 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#7 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#8 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#9 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#10 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#11 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#12 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#13 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#14 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#15 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#16 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_node_setup--gf_sg_new_base_node
+Indirect leak of 631392 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24a2ac16 in drawable_new /src/gpac/src/compositor/drawable.c:158:3
+#2 0x557c24a064bc in gf_sc_load /src/gpac/src/compositor/compositor.c:864:32
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--drawable_new--gf_sc_load
+Indirect leak of 420928 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24a2abb7 in drawable_new /src/gpac/src/compositor/drawable.c:155:2
+#2 0x557c24a064bc in gf_sc_load /src/gpac/src/compositor/compositor.c:864:32
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--drawable_new--gf_sc_load
+Indirect leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a05930 in gf_sc_load /src/gpac/src/compositor/compositor.c:817:45
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Indirect leak of 210464 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a0598a in gf_sc_load /src/gpac/src/compositor/compositor.c:819:42
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--gf_sc_load
+Indirect leak of 210160 byte(s) in 13135 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a6ff69 in visual_new /src/gpac/src/compositor/visual_manager.c:56:20
+#3 0x557c24a05b44 in gf_sc_load /src/gpac/src/compositor/compositor.c:842:23
+#4 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#5 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#6 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#7 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#8 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#9 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--visual_new
+Indirect leak of 210160 byte(s) in 13135 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c24983956 in gf_list_new /src/gpac/src/utils/list.c:612:22
+#2 0x557c24a6ff46 in visual_new /src/gpac/src/compositor/visual_manager.c:55:20
+#3 0x557c24a05b44 in gf_sc_load /src/gpac/src/compositor/compositor.c:842:23
+#4 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#5 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#6 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#7 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#8 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#9 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_list_new--visual_new
+Indirect leak of 144694 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2491884a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x557c249ad493 in gf_mx_new /src/gpac/src/utils/os_thread.c:549:20
+#2 0x557c24a06841 in gf_sc_load /src/gpac/src/compositor/compositor.c:906:23
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_strdup--gf_mx_new--gf_sc_load
+Indirect leak of 144694 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2491884a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x557c249ad493 in gf_mx_new /src/gpac/src/utils/os_thread.c:549:20
+#2 0x557c24a053ed in gf_sc_load /src/gpac/src/compositor/compositor.c:759:19
+#3 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#4 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#5 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#6 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#7 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#8 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_strdup--gf_mx_new--gf_sc_load
+Indirect leak of 105232 byte(s) in 13154 object(s) allocated from:
+#0 0x557c2493096f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x557c253abce5 in gf_sg_new_base_node /src/gpac/src/scenegraph/base_scenegraph.c:1255:32
+#2 0x557c253abce5 in gf_node_new /src/gpac/src/scenegraph/base_scenegraph.c:1992:42
+#3 0x557c24a064ee in gf_sc_load /src/gpac/src/compositor/compositor.c:867:38
+#4 0x557c24bfeed5 in compose_initialize /src/gpac/src/filters/compose.c:864:9
+#5 0x557c24ba5ddb in gf_filter_new_finalize /src/gpac/src/filter_core/filter.c:573:8
+#6 0x557c24ba39cd in gf_filter_new /src/gpac/src/filter_core/filter.c:479:7
+#7 0x557c24b853d7 in gf_fs_load_filter_internal /src/gpac/src/filter_core/filter_session.c:1369:13
+#8 0x557c24970133 in LLVMFuzzerTestOneInput /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c:27:25
+#9 0x557c24824ba0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#10 0x557c248243c5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#11 0x557c24825ba5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#12 0x557c24826935 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#13 0x557c2481577b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#14 0x557c24840b52 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#15 0x7fe110301082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--gf_sg_new_base_node--gf_node_new
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a memory leak caused by a bug in the GPAC project. The fuzz driver correctly allocates and deallocates resources using the provided APIs (`gf_fs_new_defaults`, `gf_fs_load_filter`, `gf_fs_del`, `gf_sys_close`).
+
+The memory leaks originate from the `gf_sc_load` function, which is called by the fuzzer. This function allocates numerous resources (as seen in the LeakSanitizer report), but these resources are not properly freed when the filter is destroyed.
+
+The fuzz driver correctly calls `gf_fs_del(fs)`, which is expected to clean up all filters and their associated resources within the session. However, the `compose_finalize` function (the counterpart to `compose_initialize` which is called by `gf_fs_load_filter`) does not contain the necessary cleanup code to deallocate the resources allocated by `gf_sc_load`.
+
+To fix this, the `compose_finalize` function should be modified to call a corresponding cleanup function, likely `gf_sc_unload` or `gf_sc_del`, on the compositor object to release the allocated memory. The fact that GDB is unable to hit breakpoints within the loaded filter's code suggests a more complex issue, possibly related to how the filter is loaded and JIT-compiled, which prevents standard debugging techniques from working as expected. However, the evidence from the crash log and the fuzzer's code is sufficient to pinpoint the leak's origin within the project's code.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/gpac/testsuite/oss-fuzzers/fuzz_m2ts_probe.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

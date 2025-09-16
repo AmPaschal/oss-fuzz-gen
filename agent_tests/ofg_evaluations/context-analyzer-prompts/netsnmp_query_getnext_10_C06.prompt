@@ -1,0 +1,438 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project net-snmp.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/net-snmp/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/library/snmp_transport.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The function we are fuzzing */
+int netsnmp_query_getnext(netsnmp_variable_list *, netsnmp_session *);
+
+/* Global variables to hold the fuzzer input for the mock transport. */
+static const uint8_t *FuzzData;
+static size_t FuzzSize;
+
+/*
+* Mock transport implementation to simulate network responses.
+*/
+static int fuzz_transport_recv(netsnmp_transport *t, void *buf, int size,
+void **opaque, int *olength) {
+if (FuzzData == NULL || FuzzSize == 0) {
+return -1;
+}
+int bytes_to_copy = (FuzzSize < size) ? FuzzSize : size;
+memcpy(buf, FuzzData, bytes_to_copy);
+FuzzData = NULL;
+FuzzSize = 0;
+return bytes_to_copy;
+}
+
+static int fuzz_transport_send(netsnmp_transport *t, const void *buf, int size,
+void **opaque, int *olength) {
+return size;
+}
+
+static int fuzz_transport_close(netsnmp_transport *t) {
+return 0;
+}
+
+/* A single, reusable mock transport instance. */
+static netsnmp_transport FuzzTransport;
+
+/*
+* Factory function for creating our mock transport.
+* This is called by the library when a "fuzz:" peername is used.
+*/
+netsnmp_transport *fuzz_create_transport(const char *str, int local) {
+/*
+* The 'local' flag is a hint from the library that the transport
+* is not dynamically allocated. We set it to 1 to prevent a free()
+* in the library's error handling paths.
+*/
+FuzzTransport.local = 1;
+return &FuzzTransport;
+}
+
+/* Definition of our custom transport domain. */
+static const char *fuzz_domain_prefix[] = {"fuzz", NULL};
+static netsnmp_tdomain FuzzDomain = {
+NULL, 0, fuzz_domain_prefix, fuzz_create_transport
+};
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+init_snmp("netsnmp_query_getnext_fuzzer");
+
+/* Initialize our mock transport's function pointers. */
+memset(&FuzzTransport, 0, sizeof(FuzzTransport));
+FuzzTransport.f_recv = fuzz_transport_recv;
+FuzzTransport.f_send = fuzz_transport_send;
+FuzzTransport.f_close = fuzz_transport_close;
+
+/* Register our custom transport domain with the library. */
+netsnmp_tdomain_register(&FuzzDomain);
+
+if (getenv("NETSNMP_DEBUGGING") != NULL) {
+snmp_enable_stderrlog();
+snmp_set_do_debugging(1);
+debug_register_tokens("");
+}
+
+return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 2 * sizeof(oid)) {
+return 0;
+}
+
+/* Use the fuzzer input as the content of the simulated response packet. */
+FuzzData = data;
+FuzzSize = size;
+
+netsnmp_session session_template, *ss;
+snmp_sess_init(&session_template);
+
+session_template.rcvMsgMaxSize = 65535;
+session_template.sndMsgMaxSize = 65535;
+session_template.version = SNMP_VERSION_2c;
+session_template.community = (u_char *)"public";
+session_template.community_len = strlen("public");
+session_template.peername = "fuzz:";
+
+ss = snmp_open(&session_template);
+if (ss == NULL) {
+/*
+* snmp_open() can fail and crash if it hits an error path where
+* it tries to free our static transport. The session parameters
+* above are set to avoid known error paths, but some inputs may
+* still trigger a crash inside snmp_open(). If it returns NULL
+* without crashing, we just exit.
+*/
+return 0;
+}
+
+netsnmp_variable_list *vars = NULL;
+vars = snmp_varlist_add_variable(&vars, (const oid *)data, 2,
+ASN_NULL, NULL, 0);
+
+if (vars != NULL) {
+netsnmp_query_getnext(vars, ss);
+snmp_free_varbind(vars);
+}
+
+/*
+* Workaround for a bug in the library. snmp_close() will call
+* netsnmp_transport_free() on the session's transport, but
+* netsnmp_transport_free() does not check the transport's 'local'
+* flag. This would cause it to free() our static FuzzTransport.
+* By setting the transport pointer to NULL before closing, we
+* prevent snmp_close() from attempting to free it.
+*/
+void *sess_handle = snmp_sess_pointer(ss);
+if (sess_handle) {
+snmp_sess_transport_set(sess_handle, NULL);
+}
+snmp_close(ss);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: net-snmp
+function signature: int netsnmp_query_getnext(netsnmp_variable_list *, netsnmp_session *)
+</input>
+
+<description>
+The `netsnmp_query_getnext` function is a wrapper around the internal function `_query`. It sends an SNMP GETNEXT request to a target device to retrieve the next variable in the MIB tree. It takes a `netsnmp_variable_list` as input, which specifies the starting point for the GETNEXT operation. The retrieved data is then used to update this list. The function also takes a `netsnmp_session` object, which contains the necessary information for the SNMP communication, such as the target's address and community string. If the session is not provided, a default session is used, which can be configured using `netsnmp_query_set_default_session`.
+</description>
+
+<requirements>
+
+<requirement>
+The first argument, a pointer to a `netsnmp_variable_list`, must not be a NULL pointer. This is because the function dereferences this pointer without a prior null check, which would lead to a crash.
+</requirement>
+<requirement>
+The `netsnmp_variable_list` provided as the first argument should be initialized by calling `snmp_varlist_add_variable`. This is the standard way to create and populate this structure, ensuring that all its fields are correctly set.
+</requirement>
+<requirement>
+The second argument, a pointer to a `netsnmp_session`, must be a valid session object for SNMP communication. If this argument is NULL, a default session must be configured beforehand by calling `netsnmp_query_set_default_session` to avoid errors.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0xfffffffffffffff1 (pc 0x56149a230032 bp 0x000000000000 sp 0x7ffee1805d60 T0)
+==17==The signal is caused by a WRITE memory access.
+SCARINESS: 30 (wild-addr-write)
+#0 0x56149a230032 in atomic_compare_exchange_strong<__sanitizer::atomic_uint8_t> /src/llvm-project/compiler-rt/lib/asan/../sanitizer_common/sanitizer_atomic_clang.h:81:10
+#1 0x56149a230032 in AtomicallySetQuarantineFlagIfAllocated /src/llvm-project/compiler-rt/lib/asan/asan_allocator.cpp:668:10
+#2 0x56149a230032 in __asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType) /src/llvm-project/compiler-rt/lib/asan/asan_allocator.cpp:724:10
+#3 0x56149a2c6abb in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:53:3
+#4 0x56149a3a4316 in netsnmp_transport_free /src/net-snmp/snmplib/snmp_transport.c:242:5
+#5 0x56149a3147a1 in snmp_sess_add_ex /src/net-snmp/snmplib/snmp_api.c
+#6 0x56149a311fe9 in snmp_sess_add /src/net-snmp/snmplib/snmp_api.c:1943:12
+#7 0x56149a311fe9 in _sess_open /src/net-snmp/snmplib/snmp_api.c:1770:12
+#8 0x56149a311fe9 in snmp_sess_open /src/net-snmp/snmplib/snmp_api.c:1956:11
+#9 0x56149a3118ff in snmp_open /src/net-snmp/snmplib/snmp_api.c:1038:11
+#10 0x56149a30670f in LLVMFuzzerTestOneInput /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c:103:10
+#11 0x56149a1baf20 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#12 0x56149a1ba745 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#13 0x56149a1bbf25 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#14 0x56149a1bccb5 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#15 0x56149a1abafb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#16 0x56149a1d6ed2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#17 0x7f67d15f7082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#18 0x56149a19e37d in _start (out/libfuzzer-address-x86_64/snmp_scoped_pdu_parse_fuzzer+0x10737d)
+
+DEDUP_TOKEN: atomic_compare_exchange_strong<__sanitizer::atomic_uint8_t>--AtomicallySetQuarantineFlagIfAllocated--__asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType)
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+### Analysis
+
+The crash is a segmentation fault that occurs when `netsnmp_transport_free` attempts to `free()` a global static variable, `FuzzTransport`, which was not allocated on the heap.
+
+The analysis using GDB reveals a sequence of bugs in both the project code and the fuzz driver:
+
+1.  **Project Bug #1 (Incorrect Memory Management Logic):** The function `netsnmp_transport_free` decides whether to free a transport object `t` based on the condition `if (t->local == 0)`. However, the `local` field in the `netsnmp_transport` struct is a `char*` meant to store an address string, not an integer flag. Using a data pointer as a flag for memory management is a significant design flaw.
+
+2.  **Fuzz Driver Bug:** The fuzz driver attempts to prevent the library from freeing the static `FuzzTransport` object by setting `FuzzTransport.local = 1`. This is a bug because it assigns an integer value to a pointer-type field (`char *`), which is a type mismatch.
+
+3.  **Project Bug #2 (State Corruption):** Although the fuzzer sets `FuzzTransport.local` to a non-zero value (`(void*)1`), GDB analysis shows that the value is `0` (NULL) at the time of the crash. A GDB watchpoint confirms that `FuzzTransport.local` is overwritten and zeroed out by a `memmove` operation within the `snmp_sess_add_ex` function. This memory corruption nullifies the fuzzer's attempt to prevent the `free()` call.
+
+The crash is the direct result of the project's faulty logic. The library incorrectly attempts to `free()` a transport based on the state of a data pointer, and a separate memory corruption bug within the library resets this pointer, triggering the crash. The bug in the fuzz driver is an incorrect attempt to work around the project's flawed design.
+
+### Suggestions
+
+*   **For the Project:**
+1.  Refactor the `netsnmp_transport` struct to include a dedicated integer flag, for example, `int dynamically_allocated`, to track how the transport was allocated.
+2.  Modify `netsnmp_transport_free` to check this new flag instead of misusing the `t->local` pointer.
+3.  Investigate and fix the memory corruption in `snmp_sess_add_ex` that causes the `memmove` to overwrite unrelated global memory.
+
+*   **For the Fuzz Driver:**
+1.  Remove the line `FuzzTransport.local = 1;`.
+2.  Once the project is patched with a proper flag, the fuzzer should be updated to set that flag instead (e.g., `FuzzTransport.dynamically_allocated = 0;`).
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/net-snmp/testing/fuzzing/snmp_scoped_pdu_parse_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

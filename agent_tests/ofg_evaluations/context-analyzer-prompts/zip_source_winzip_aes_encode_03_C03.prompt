@@ -1,0 +1,1420 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libzip.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/libzip/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "zip.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "/src/libzip/lib/zipint.h"
+
+/* A custom source callback that always fails on read. */
+static zip_int64_t
+failing_source_callback(void *userdata, void *data, zip_uint64_t len, zip_source_cmd_t cmd) {
+(void)userdata;
+(void)data;
+(void)len;
+
+switch (cmd) {
+case ZIP_SOURCE_OPEN:
+return 0;
+case ZIP_SOURCE_READ:
+/* Signal an error. */
+return -1;
+case ZIP_SOURCE_CLOSE:
+return 0;
+case ZIP_SOURCE_STAT: {
+zip_stat_t *st = (zip_stat_t *)data;
+zip_stat_init(st);
+st->size = 1024;
+st->valid = ZIP_STAT_SIZE;
+return sizeof(*st);
+}
+case ZIP_SOURCE_ERROR:
+case ZIP_SOURCE_FREE:
+return 0;
+default:
+return -1;
+}
+}
+
+static void
+test_source(zip_source_t *enc_src, zip_t *za) {
+if (enc_src == NULL) {
+return;
+}
+
+/* Trigger ZIP_SOURCE_SUPPORTS */
+zip_source_supports(enc_src);
+
+/* Trigger ZIP_SOURCE_STAT */
+zip_stat_t st;
+zip_stat_init(&st);
+zip_source_stat(enc_src, &st);
+
+/* Trigger the default case by calling an unsupported command */
+zip_source_seek(enc_src, 10, SEEK_SET);
+
+/* Trigger ZIP_SOURCE_GET_FILE_ATTRIBUTES by adding the source to the archive */
+zip_file_add(za, "fuzz_entry", enc_src, ZIP_FL_ENC_GUESS);
+/* Note: We are not freeing enc_src here because zip_file_add takes ownership. */
+}
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 4) {
+return 0;
+}
+
+zip_source_t *src_to_encrypt;
+zip_source_t *enc_src;
+zip_t *za;
+char *password = NULL;
+zip_uint16_t encryption_method;
+char buffer[1024];
+int which_test = data[0] % 3;
+data++;
+size--;
+
+/* Create a zip_t archive context. */
+if ((za = zip_open_from_source(zip_source_buffer_create(NULL, 0, 0, NULL), 0, NULL)) == NULL) {
+return 0;
+}
+
+/* Use a portion of the input data as the password. */
+size_t pass_len = size > 256 ? 256 : size;
+password = (char *)malloc(pass_len + 1);
+if (password == NULL) {
+zip_close(za);
+return 0;
+}
+memcpy(password, data, pass_len);
+password[pass_len] = '\0';
+
+/* Select an encryption method based on the input data. */
+switch (data[0] % 3) {
+case 0:
+encryption_method = ZIP_EM_AES_128;
+break;
+case 1:
+encryption_method = ZIP_EM_AES_192;
+break;
+default:
+encryption_method = ZIP_EM_AES_256;
+break;
+}
+
+if (which_test == 0) {
+/* Test the standard read path */
+if ((src_to_encrypt = zip_source_buffer_create(data, size, 0, NULL)) == NULL) {
+free(password);
+zip_close(za);
+return 0;
+}
+enc_src = zip_source_winzip_aes_encode(za, src_to_encrypt, encryption_method, ZIP_CODEC_ENCODE, password);
+if (enc_src != NULL) {
+if (zip_source_open(enc_src) == 0) {
+while (zip_source_read(enc_src, buffer, sizeof(buffer)) > 0) {}
+zip_source_close(enc_src);
+}
+zip_source_free(enc_src);
+} else {
+zip_source_free(src_to_encrypt);
+}
+} else if (which_test == 1) {
+/* Test the error path */
+src_to_encrypt = zip_source_function_create(failing_source_callback, NULL, NULL);
+if (src_to_encrypt == NULL) {
+free(password);
+zip_close(za);
+return 0;
+}
+enc_src = zip_source_winzip_aes_encode(za, src_to_encrypt, encryption_method, ZIP_CODEC_ENCODE, password);
+if (enc_src != NULL) {
+if (zip_source_open(enc_src) == 0) {
+zip_source_read(enc_src, buffer, sizeof(buffer));
+/* Trigger ZIP_SOURCE_ERROR */
+zip_source_error(enc_src);
+zip_source_close(enc_src);
+}
+zip_source_free(enc_src);
+} else {
+zip_source_free(src_to_encrypt);
+}
+} else {
+/* Test STAT, SUPPORTS, GET_FILE_ATTRIBUTES, and default case */
+if ((src_to_encrypt = zip_source_buffer_create(data, size, 0, NULL)) == NULL) {
+free(password);
+zip_close(za);
+return 0;
+}
+enc_src = zip_source_winzip_aes_encode(za, src_to_encrypt, encryption_method, ZIP_CODEC_ENCODE, password);
+if (enc_src != NULL) {
+/* test_source takes ownership of enc_src if successful */
+test_source(enc_src, za);
+} else {
+zip_source_free(src_to_encrypt);
+}
+}
+
+free(password);
+zip_close(za);
+
+return 0;
+}
+
+#ifdef __cplusplus
+}
+#endif
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libzip
+function signature: zip_source_t * zip_source_winzip_aes_encode(zip_t *, zip_source_t *, zip_uint16_t, int, const char *)
+</input>
+
+<description>
+The function `zip_source_winzip_aes_encode` creates a new `zip_source` layer for encrypting data using WinZip AES encryption. It is not called directly but is returned as a function pointer by `_zip_get_encryption_implementation` when an AES encryption method and encoding operation are requested. It takes an existing `zip_source` as input and returns a new `zip_source` that, when read from, will provide the encrypted data from the original source. The function validates the encryption method and password before creating the necessary context for the layered source.
+</description>
+
+<requirements>
+
+<requirement>
+The `za` argument must be a valid pointer to a `zip_t` struct initialized by `zip_open` or `zip_open_from_source`. This is because the function uses this object for error reporting and to access the default password.
+</requirement>
+<requirement>
+The `src` argument must be a valid, non-NULL pointer to a `zip_source_t` struct. This is because the function performs a NULL check on this argument and uses it as the underlying data source for encryption.
+</requirement>
+<requirement>
+The `encryption_method` argument must be one of `ZIP_EM_AES_128` (0x0101), `ZIP_EM_AES_192` (0x0102), or `ZIP_EM_AES_256` (0x0103). The function will fail and return NULL if any other value is provided.
+</requirement>
+<requirement>
+The `password` argument must be a non-NULL, null-terminated string. A NULL password will cause the function to fail and return NULL.
+</requirement>
+<requirement>
+The `flags` argument is not directly used by `zip_source_winzip_aes_encode`, but the calling convention requires it to be `ZIP_CODEC_ENCODE`. This is because the function `_zip_get_encryption_implementation`, which returns the pointer to the target function, uses this flag to differentiate between encoding and decoding operations.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 1488840 byte(s) in 9795 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f3a25a in _zip_new /src/libzip/lib/zip_new.c:48:19
+#2 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#3 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#4 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#5 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_new--_zip_allocate_new
+Direct leak of 5016 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f3a25a in _zip_new /src/libzip/lib/zip_new.c:48:19
+#2 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#3 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#4 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#5 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_new--_zip_allocate_new
+Direct leak of 304 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f3a25a in _zip_new /src/libzip/lib/zip_new.c:48:19
+#2 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#3 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#4 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#5 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_new--_zip_allocate_new
+Indirect leak of 20180992 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec5609 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55d638f1580a in hash_resize /src/libzip/lib/zip_hash.c:104:43
+#2 0x55d638f1580a in _zip_hash_add /src/libzip/lib/zip_hash.c:215:14
+#3 0x55d638f1e8af in _zip_set_name /src/libzip/lib/zip_set_name.c:123:9
+#4 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#5 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#6 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--hash_resize--_zip_hash_add
+Indirect leak of 5045248 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f3598b in _zip_add_entry /src/libzip/lib/zip_add_entry.c:56:14
+#3 0x55d638f14e80 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:72:22
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--_zip_add_entry
+Indirect leak of 1182480 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f0ba3d in _zip_dirent_clone /src/libzip/lib/zip_dirent.c:218:32
+#2 0x55d638f1e813 in _zip_set_name /src/libzip/lib/zip_set_name.c:91:27
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_dirent_clone--_zip_set_name
+Indirect leak of 867152 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f25737 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f25737 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55d638f1f595 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+Indirect leak of 867152 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f25737 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f25737 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55d638f1f595 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+Indirect leak of 867152 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f259ae in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f2671e in zip_source_layered_create /src/libzip/lib/zip_source_layered.c:62:15
+#3 0x55d638f2671e in zip_source_layered /src/libzip/lib/zip_source_layered.c:45:12
+#4 0x55d638f34e27 in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:74:15
+#5 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_layered_create
+Indirect leak of 788320 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f72d in buffer_new /src/libzip/lib/zip_source_buffer.c:457:19
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 788320 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f72d in buffer_new /src/libzip/lib/zip_source_buffer.c:457:19
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 709488 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f34ce1 in winzip_aes_new /src/libzip/lib/zip_source_winzip_aes_encode.c:234:37
+#2 0x55d638f34ce1 in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:70:16
+#3 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#4 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#7 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#8 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--winzip_aes_new--zip_source_winzip_aes_encode
+Indirect leak of 630656 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f467 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:152:36
+#2 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#3 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#4 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#5 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--zip_source_buffer_fragment_with_attributes_create--zip_source_buffer_with_attributes_create
+Indirect leak of 630656 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f467 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:152:36
+#2 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#3 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#4 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#5 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#8 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#9 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--zip_source_buffer_fragment_with_attributes_create--zip_source_buffer_with_attributes_create
+Indirect leak of 394160 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f15a72 in _zip_hash_add /src/libzip/lib/zip_hash.c:236:42
+#2 0x55d638f1e8af in _zip_set_name /src/libzip/lib/zip_set_name.c:123:9
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_hash_add--_zip_set_name
+Indirect leak of 315328 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f2df68 in _zip_string_new /src/libzip/lib/zip_string.c:159:30
+#2 0x55d638f1e492 in _zip_set_name /src/libzip/lib/zip_set_name.c:62:20
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_string_new--_zip_set_name
+Indirect leak of 236496 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f154aa in _zip_hash_new /src/libzip/lib/zip_hash.c:170:31
+#2 0x55d638f3a26e in _zip_new /src/libzip/lib/zip_new.c:54:22
+#3 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#4 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#5 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#6 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#10 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_hash_new--_zip_new
+Indirect leak of 173263 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ead31a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x55d638f34cfc in winzip_aes_new /src/libzip/lib/zip_source_winzip_aes_encode.c:239:26
+#2 0x55d638f34cfc in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:70:16
+#3 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#4 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#7 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#8 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_strdup--winzip_aes_new--zip_source_winzip_aes_encode
+Indirect leak of 157664 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f1f7ba in buffer_grow_fragments /src/libzip/lib/zip_source_buffer.c:444:10
+#3 0x55d638f1f7ba in buffer_new /src/libzip/lib/zip_source_buffer.c:482:14
+#4 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#5 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#6 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#7 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#8 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--buffer_grow_fragments
+Indirect leak of 157664 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f1f798 in buffer_grow_fragments /src/libzip/lib/zip_source_buffer.c:440:10
+#3 0x55d638f1f798 in buffer_new /src/libzip/lib/zip_source_buffer.c:482:14
+#4 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#5 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#6 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#7 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#8 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#11 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#12 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--buffer_grow_fragments
+Indirect leak of 108394 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f2df81 in _zip_string_new /src/libzip/lib/zip_string.c:164:34
+#2 0x55d638f1e492 in _zip_set_name /src/libzip/lib/zip_set_name.c:62:20
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_string_new--_zip_set_name
+Indirect leak of 78832 byte(s) in 9854 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f7eb in buffer_new /src/libzip/lib/zip_source_buffer.c:472:41
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 67584 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec5609 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55d638f1580a in hash_resize /src/libzip/lib/zip_hash.c:104:43
+#2 0x55d638f1580a in _zip_hash_add /src/libzip/lib/zip_hash.c:215:14
+#3 0x55d638f1e8af in _zip_set_name /src/libzip/lib/zip_set_name.c:123:9
+#4 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#5 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#6 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#10 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--hash_resize--_zip_hash_add
+Indirect leak of 16896 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f3598b in _zip_add_entry /src/libzip/lib/zip_add_entry.c:56:14
+#3 0x55d638f14e80 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:72:22
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--_zip_add_entry
+Indirect leak of 8968 byte(s) in 59 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f3a25a in _zip_new /src/libzip/lib/zip_new.c:48:19
+#2 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#3 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#4 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#5 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dba675 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55d638dbb405 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_new--_zip_allocate_new
+Indirect leak of 4096 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec5609 in calloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:75:3
+#1 0x55d638f1580a in hash_resize /src/libzip/lib/zip_hash.c:104:43
+#2 0x55d638f1580a in _zip_hash_add /src/libzip/lib/zip_hash.c:215:14
+#3 0x55d638f1e8af in _zip_set_name /src/libzip/lib/zip_set_name.c:123:9
+#4 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#5 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#6 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_calloc--hash_resize--_zip_hash_add
+Indirect leak of 3960 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f0ba3d in _zip_dirent_clone /src/libzip/lib/zip_dirent.c:218:32
+#2 0x55d638f1e813 in _zip_set_name /src/libzip/lib/zip_set_name.c:91:27
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_dirent_clone--_zip_set_name
+Indirect leak of 2904 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f25737 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f25737 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55d638f1f595 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#10 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+Indirect leak of 2904 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f25737 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f25737 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55d638f1f595 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#10 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+Indirect leak of 2904 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f259ae in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f2671e in zip_source_layered_create /src/libzip/lib/zip_source_layered.c:62:15
+#3 0x55d638f2671e in zip_source_layered /src/libzip/lib/zip_source_layered.c:45:12
+#4 0x55d638f34e27 in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:74:15
+#5 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_layered_create
+Indirect leak of 2640 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f72d in buffer_new /src/libzip/lib/zip_source_buffer.c:457:19
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 2640 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f72d in buffer_new /src/libzip/lib/zip_source_buffer.c:457:19
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 2376 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f34ce1 in winzip_aes_new /src/libzip/lib/zip_source_winzip_aes_encode.c:234:37
+#2 0x55d638f34ce1 in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:70:16
+#3 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#4 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#7 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#8 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--winzip_aes_new--zip_source_winzip_aes_encode
+Indirect leak of 2112 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f467 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:152:36
+#2 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#3 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#4 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#5 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#8 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#9 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--zip_source_buffer_fragment_with_attributes_create--zip_source_buffer_with_attributes_create
+Indirect leak of 2112 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f467 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:152:36
+#2 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#3 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#4 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#5 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#8 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#9 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--zip_source_buffer_fragment_with_attributes_create--zip_source_buffer_with_attributes_create
+Indirect leak of 1320 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f15a72 in _zip_hash_add /src/libzip/lib/zip_hash.c:236:42
+#2 0x55d638f1e8af in _zip_set_name /src/libzip/lib/zip_set_name.c:123:9
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_hash_add--_zip_set_name
+Indirect leak of 1056 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f2df68 in _zip_string_new /src/libzip/lib/zip_string.c:159:30
+#2 0x55d638f1e492 in _zip_set_name /src/libzip/lib/zip_set_name.c:62:20
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_string_new--_zip_set_name
+Indirect leak of 1024 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f3598b in _zip_add_entry /src/libzip/lib/zip_add_entry.c:56:14
+#3 0x55d638f14e80 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:72:22
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--_zip_add_entry
+Indirect leak of 792 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f154aa in _zip_hash_new /src/libzip/lib/zip_hash.c:170:31
+#2 0x55d638f3a26e in _zip_new /src/libzip/lib/zip_new.c:54:22
+#3 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#4 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#5 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#6 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#10 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_hash_new--_zip_new
+Indirect leak of 528 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f1f798 in buffer_grow_fragments /src/libzip/lib/zip_source_buffer.c:440:10
+#3 0x55d638f1f798 in buffer_new /src/libzip/lib/zip_source_buffer.c:482:14
+#4 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#5 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#6 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#7 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#8 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#11 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#12 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--buffer_grow_fragments
+Indirect leak of 528 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f1f7ba in buffer_grow_fragments /src/libzip/lib/zip_source_buffer.c:444:10
+#3 0x55d638f1f7ba in buffer_new /src/libzip/lib/zip_source_buffer.c:482:14
+#4 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#5 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#6 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#7 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#8 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#11 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#12 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--buffer_grow_fragments
+Indirect leak of 363 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f2df81 in _zip_string_new /src/libzip/lib/zip_string.c:164:34
+#2 0x55d638f1e492 in _zip_set_name /src/libzip/lib/zip_set_name.c:62:20
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_string_new--_zip_set_name
+Indirect leak of 264 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f7eb in buffer_new /src/libzip/lib/zip_source_buffer.c:472:41
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#9 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 240 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f0ba3d in _zip_dirent_clone /src/libzip/lib/zip_dirent.c:218:32
+#2 0x55d638f1e813 in _zip_set_name /src/libzip/lib/zip_set_name.c:91:27
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_dirent_clone--_zip_set_name
+Indirect leak of 176 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f259ae in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f2671e in zip_source_layered_create /src/libzip/lib/zip_source_layered.c:62:15
+#3 0x55d638f2671e in zip_source_layered /src/libzip/lib/zip_source_layered.c:45:12
+#4 0x55d638f34e27 in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:74:15
+#5 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_layered_create
+Indirect leak of 176 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f25737 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f25737 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55d638f1f595 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+Indirect leak of 176 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f25737 in _zip_source_new /src/libzip/lib/zip_source_function.c:80:32
+#2 0x55d638f25737 in zip_source_function_create /src/libzip/lib/zip_source_function.c:54:15
+#3 0x55d638f1f595 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:169:15
+#4 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#5 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#6 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_source_new--zip_source_function_create
+Indirect leak of 160 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f72d in buffer_new /src/libzip/lib/zip_source_buffer.c:457:19
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 160 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f72d in buffer_new /src/libzip/lib/zip_source_buffer.c:457:19
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 144 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f34ce1 in winzip_aes_new /src/libzip/lib/zip_source_winzip_aes_encode.c:234:37
+#2 0x55d638f34ce1 in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:70:16
+#3 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#4 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#7 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#8 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--winzip_aes_new--zip_source_winzip_aes_encode
+Indirect leak of 140 byte(s) in 33 object(s) allocated from:
+#0 0x55d638ead31a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x55d638f34cfc in winzip_aes_new /src/libzip/lib/zip_source_winzip_aes_encode.c:239:26
+#2 0x55d638f34cfc in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:70:16
+#3 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#4 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55d638db8d56 in fuzzer::Fuzzer::RereadOutputCorpus(unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:433:11
+#7 0x55d638dbb34f in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:883:7
+#8 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_strdup--winzip_aes_new--zip_source_winzip_aes_encode
+Indirect leak of 128 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f467 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:152:36
+#2 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#3 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#4 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#5 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#8 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#9 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--zip_source_buffer_fragment_with_attributes_create--zip_source_buffer_with_attributes_create
+Indirect leak of 128 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f467 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:152:36
+#2 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#3 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#4 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#5 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#6 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#7 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#8 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#9 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#10 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#11 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--zip_source_buffer_fragment_with_attributes_create--zip_source_buffer_with_attributes_create
+Indirect leak of 80 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f15a72 in _zip_hash_add /src/libzip/lib/zip_hash.c:236:42
+#2 0x55d638f1e8af in _zip_set_name /src/libzip/lib/zip_set_name.c:123:9
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_hash_add--_zip_set_name
+Indirect leak of 64 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f2df68 in _zip_string_new /src/libzip/lib/zip_string.c:159:30
+#2 0x55d638f1e492 in _zip_set_name /src/libzip/lib/zip_set_name.c:62:20
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_string_new--_zip_set_name
+Indirect leak of 48 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f154aa in _zip_hash_new /src/libzip/lib/zip_hash.c:170:31
+#2 0x55d638f3a26e in _zip_new /src/libzip/lib/zip_new.c:54:22
+#3 0x55d638f18992 in _zip_allocate_new /src/libzip/lib/zip_open.c:633:15
+#4 0x55d638f18992 in _zip_open /src/libzip/lib/zip_open.c:199:15
+#5 0x55d638f184e8 in zip_open_from_source /src/libzip/lib/zip_open.c:146:18
+#6 0x55d638f04c56 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:15
+#7 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#8 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#9 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#10 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#11 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#12 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#13 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_hash_new--_zip_new
+Indirect leak of 32 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f1f7ba in buffer_grow_fragments /src/libzip/lib/zip_source_buffer.c:444:10
+#3 0x55d638f1f7ba in buffer_new /src/libzip/lib/zip_source_buffer.c:482:14
+#4 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#5 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#6 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#7 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#8 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#11 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#12 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--buffer_grow_fragments
+Indirect leak of 32 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec582c in realloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:82:3
+#1 0x55d638f1e33a in zip_realloc /src/libzip/lib/zip_realloc.c:53:23
+#2 0x55d638f1f798 in buffer_grow_fragments /src/libzip/lib/zip_source_buffer.c:440:10
+#3 0x55d638f1f798 in buffer_new /src/libzip/lib/zip_source_buffer.c:482:14
+#4 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#5 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#6 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#7 0x55d638f04ea0 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:149:31
+#8 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#9 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#10 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#11 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#12 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#13 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#14 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_realloc--zip_realloc--buffer_grow_fragments
+Indirect leak of 22 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f2df81 in _zip_string_new /src/libzip/lib/zip_string.c:164:34
+#2 0x55d638f1e492 in _zip_set_name /src/libzip/lib/zip_set_name.c:62:20
+#3 0x55d638f14d49 in _zip_file_replace /src/libzip/lib/zip_file_replace.c:78:17
+#4 0x55d638f04f22 in test_source /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:62:5
+#5 0x55d638f04f22 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:157:13
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--_zip_string_new--_zip_set_name
+Indirect leak of 16 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ec543f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x55d638f1f7eb in buffer_new /src/libzip/lib/zip_source_buffer.c:472:41
+#2 0x55d638f1f451 in zip_source_buffer_fragment_with_attributes_create /src/libzip/lib/zip_source_buffer.c:148:19
+#3 0x55d638f1f380 in zip_source_buffer_with_attributes_create /src/libzip/lib/zip_source_buffer.c
+#4 0x55d638f1f380 in zip_source_buffer_create /src/libzip/lib/zip_source_buffer.c:98:12
+#5 0x55d638f04c4a in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:83:36
+#6 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#9 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#10 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--buffer_new--zip_source_buffer_fragment_with_attributes_create
+Indirect leak of 13 byte(s) in 2 object(s) allocated from:
+#0 0x55d638ead31a in strdup /src/llvm-project/compiler-rt/lib/asan/asan_interceptors.cpp:570:3
+#1 0x55d638f34cfc in winzip_aes_new /src/libzip/lib/zip_source_winzip_aes_encode.c:239:26
+#2 0x55d638f34cfc in zip_source_winzip_aes_encode /src/libzip/lib/zip_source_winzip_aes_encode.c:70:16
+#3 0x55d638f04ec5 in LLVMFuzzerTestOneInput /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c:154:19
+#4 0x55d638db9670 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x55d638db8e95 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x55d638dbae22 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#7 0x55d638dbb112 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#8 0x55d638daa24b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x55d638dd5622 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f0a91af8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_strdup--winzip_aes_new--zip_source_winzip_aes_encode
+
+</crash-stacktrace>
+
+<crash-analysis>
+The memory leaks are caused by a bug in the `libzip` library, not the fuzzer.
+
+**Analysis:**
+The leak report shows that memory allocated by various `libzip` functions, including the main `zip_t` object created by `zip_open_from_source`, is not being freed. The fuzzer correctly calls `zip_close()` at the end of the `LLVMFuzzerTestOneInput` function, which is the documented way to release all resources associated with a `zip_t` archive. The fact that memory is still being leaked indicates that `zip_close()` is not correctly cleaning up all allocated resources.
+
+While there is a minor bug in the fuzzer's `which_test == 2` code path where it doesn't free a `zip_source_t` object if `zip_file_add()` fails, this is not the primary cause of the leaks reported. The most significant leaks, including the `zip_t` object itself, point to a bug in the `libzip` library.
+
+**Suggestion:**
+The `libzip` developers should investigate the `zip_close()` function to ensure that it correctly frees all memory associated with a `zip_t` archive, including all added sources and internal data structures. The fuzzer can also be improved by checking the return value of `zip_file_add()` and freeing the source on failure.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libzip/ossfuzz/zip_write_encrypt_pkware_file_fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

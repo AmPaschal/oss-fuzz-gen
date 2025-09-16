@@ -1,0 +1,639 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project crow.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/crow/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include "crow.h"
+#include <string>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+#include <fcntl.h>
+#include <iostream>
+#include <sstream>
+#include <csignal> // For SIGHUP
+
+// Headers for socket programming
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/un.h>
+#include <sys/time.h> // for timeval
+
+// Helper function to read a response from a socket with a timeout.
+// This is crucial to prevent the fuzzer from hanging and to ensure
+// we actually process the server's response.
+std::string read_response(int sock) {
+if (sock < 0) {
+return "";
+}
+
+// Set a short receive timeout to avoid blocking indefinitely.
+struct timeval tv;
+tv.tv_sec = 0;
+tv.tv_usec = 50000; // 50ms
+setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+char buffer[4096];
+std::string response;
+int n;
+// Read in a loop until the socket is closed or the timeout is hit.
+while ((n = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+buffer[n] = '\0';
+response.append(buffer);
+// Break if we are not reading full buffers, indicating end of current data.
+if (n < sizeof(buffer) - 1)
+break;
+}
+return response;
+}
+
+// The `run` function blocks, so we need a way to stop it.
+// We run it in a separate thread and stop it from the main thread.
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 1) {
+return 0;
+}
+FuzzedDataProvider provider(data, size);
+crow::SimpleApp app;
+
+// Add a standard route to satisfy the validation requirement.
+CROW_ROUTE(app, "/fuzz")
+([]{
+return "fuzz response";
+});
+
+// Add a WebSocket route to test upgrade and websocket logic.
+CROW_WEBSOCKET_ROUTE(app, "/ws")
+.onopen([](crow::websocket::connection& /*conn*/){})
+.onclose([](crow::websocket::connection& /*conn*/, const std::string& /*reason*/, uint16_t /*code*/){})
+.onmessage([](crow::websocket::connection& conn, const std::string& msg_data, bool is_binary){
+if (is_binary) {
+conn.send_binary(msg_data);
+} else {
+conn.send_text(msg_data);
+}
+});
+
+// Add a catch-all route to test 404 handling.
+CROW_CATCHALL_ROUTE(app)
+([](crow::response& res){
+res.code = 404;
+res.body = "Not Found";
+res.end();
+});
+
+// Fuzz server configuration
+if (provider.ConsumeBool()) {
+app.multithreaded();
+} else if (provider.ConsumeBool()) {
+app.concurrency(provider.ConsumeIntegralInRange<unsigned int>(2, 16));
+}
+
+// Fuzz tick function
+if (provider.ConsumeBool()) {
+app.tick(std::chrono::milliseconds(provider.ConsumeIntegralInRange<uint8_t>(5, 50)), []{});
+}
+
+// Fuzz signal handling
+if (provider.ConsumeBool()) {
+app.signal_add(SIGHUP);
+}
+
+if (provider.ConsumeBool()) {
+app.exception_handler([](crow::response& res) {
+res.code = 500;
+res.body = "Custom Internal Server Error";
+res.end();
+});
+}
+
+if (provider.ConsumeBool()) {
+// Fuzz blueprint registration
+crow::Blueprint bp(provider.ConsumeRandomLengthString(10));
+CROW_BP_ROUTE(bp, "/blueprint_route")
+([]{
+return "response from blueprint";
+});
+app.register_blueprint(bp);
+}
+
+uint8_t server_type = provider.ConsumeIntegralInRange<uint8_t>(0, 3);
+const char* unix_socket_path = "/tmp/crow_fuzz.sock";
+uint16_t port = provider.ConsumeIntegralInRange<uint16_t>(10000, 20000);
+
+switch (server_type) {
+case 0: // TCP Server
+app.bindaddr("127.0.0.1").port(port);
+break;
+case 1: // SSL Server
+#ifdef CROW_ENABLE_SSL
+app.bindaddr("127.0.0.1").port(port);
+// The build script ensures these files are available.
+app.ssl_file("server.pem", "server.key");
+#else
+// If SSL is not compiled, just run a TCP server to not waste cycles.
+app.bindaddr("127.0.0.1").port(port);
+#endif
+break;
+case 2: // Unix Socket Server
+unlink(unix_socket_path); // Clean up from previous runs
+app.local_socket_path(unix_socket_path);
+break;
+case 3: // Invalid bind address test
+app.bindaddr(provider.ConsumeRandomLengthString(32)).port(port);
+// This should cause run() to return early.
+// We run it directly to test this specific path.
+app.run();
+return 0; // End the fuzz case here.
+}
+
+app.timeout(provider.ConsumeIntegralInRange<uint32_t>(0, 2));
+
+std::thread server_thread([&]{
+int old_stderr = dup(STDERR_FILENO);
+int dev_null = open("/dev/null", O_WRONLY);
+if (dev_null != -1) {
+dup2(dev_null, STDERR_FILENO);
+close(dev_null);
+}
+
+app.run();
+
+if (old_stderr != -1) {
+dup2(old_stderr, STDERR_FILENO);
+close(old_stderr);
+}
+});
+
+app.wait_for_server_start(std::chrono::milliseconds(50));
+
+int sock = -1;
+bool connected = false;
+
+if (server_type <= 1) { // TCP or SSL
+sock = socket(AF_INET, SOCK_STREAM, 0);
+if (sock != -1) {
+struct sockaddr_in serv_addr;
+serv_addr.sin_family = AF_INET;
+serv_addr.sin_port = htons(port);
+inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
+connected = true;
+}
+}
+} else { // Unix Socket
+sock = socket(AF_UNIX, SOCK_STREAM, 0);
+if (sock != -1) {
+struct sockaddr_un serv_addr;
+serv_addr.sun_family = AF_UNIX;
+strncpy(serv_addr.sun_path, unix_socket_path, sizeof(serv_addr.sun_path) - 1);
+if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
+connected = true;
+}
+}
+}
+
+if (connected) {
+// Decide if this will be a WebSocket upgrade request
+bool is_websocket_request = provider.ConsumeBool();
+
+// --- First Request ---
+std::string method = provider.ConsumeBool() ? "GET" : "POST";
+std::string path = is_websocket_request ? "/ws" : provider.ConsumeBytesAsString(provider.ConsumeIntegralInRange<size_t>(1, 50));
+std::string http_version = "HTTP/1.1"; // Keep-alive is default in 1.1
+std::string body = provider.ConsumeRandomLengthString(256);
+
+std::ostringstream request_stream;
+request_stream << method << " " << path << " " << http_version << "\r\n"
+<< "Host: 127.0.0.1\r\n"
+<< "Content-Length: " << body.length() << "\r\n";
+
+if (is_websocket_request) {
+request_stream << "Connection: Upgrade\r\n"
+<< "Upgrade: websocket\r\n"
+<< "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+<< "Sec-WebSocket-Version: 13\r\n";
+} else {
+request_stream << "Connection: keep-alive\r\n";
+}
+
+request_stream << "\r\n" << body;
+std::string http_request = request_stream.str();
+
+send(sock, http_request.c_str(), http_request.length(), 0);
+std::string response1 = read_response(sock);
+
+// --- Follow-up Interaction ---
+if (is_websocket_request && response1.find(" 101 ") != std::string::npos) {
+// WebSocket handshake successful, send a frame
+std::string ws_payload = provider.ConsumeRandomLengthString(125);
+std::vector<uint8_t> frame;
+frame.push_back(0x81); // FIN + text frame
+frame.push_back(0x80 | ws_payload.length()); // MASK bit + length
+
+uint32_t mask_key = provider.ConsumeIntegral<uint32_t>();
+uint8_t mask_bytes[4];
+mask_bytes[0] = (mask_key >> 24) & 0xFF;
+mask_bytes[1] = (mask_key >> 16) & 0xFF;
+mask_bytes[2] = (mask_key >> 8) & 0xFF;
+mask_bytes[3] = mask_key & 0xFF;
+frame.insert(frame.end(), mask_bytes, mask_bytes + 4);
+
+for(size_t i = 0; i < ws_payload.length(); ++i) {
+frame.push_back(ws_payload[i] ^ mask_bytes[i % 4]);
+}
+
+send(sock, frame.data(), frame.size(), 0);
+read_response(sock); // Read the echoed frame
+} else if (!is_websocket_request) {
+// HTTP Keep-Alive: send a second request
+std::string path2 = "/fuzz";
+std::string body2 = provider.ConsumeRandomLengthString(100);
+std::ostringstream request2_stream;
+request2_stream << "GET " << path2 << " HTTP/1.1\r\n"
+<< "Host: 127.0.0.1\r\n"
+<< "Content-Length: " << body2.length() << "\r\n"
+<< "Connection: close\r\n" // Close after this one
+<< "\r\n" << body2;
+std::string http_request2 = request2_stream.str();
+send(sock, http_request2.c_str(), http_request2.length(), 0);
+read_response(sock);
+}
+}
+
+if (sock != -1) {
+close(sock);
+}
+
+app.stop();
+
+if (server_thread.joinable()) {
+server_thread.join();
+}
+
+if (server_type == 2) {
+unlink(unix_socket_path);
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: crow
+function signature: void crow::Crow<>::run()
+</input>
+
+<description>
+The crow::Crow<>::run() function is the main entry point for running a Crow application. It starts a server that listens for and handles HTTP requests. The function's behavior is configured through various member variables of the crow::Crow class, which can be set using a fluent API.
+
+The run() function first performs some setup tasks, such as adding blueprint and static directory routes. Then, it validates the router configuration by calling router_.validate(). This function ensures that every registered route has a handler. If a route is found without a handler, a std::runtime_error is thrown.
+
+After validation, the function determines which type of server to start based on the ssl_used_ and use_unix_ flags. It can start an SSL server, a Unix socket server, or a TCP server. The server is configured with the specified address, port, concurrency, timeout, and other settings. Finally, the server is started, and it begins listening for incoming connections.
+</description>
+
+<requirements>
+
+<requirement>
+The `bindaddr` member variable must be set to a valid IP address string. This is because it is used to create an asio::ip::address, and an invalid string will cause the function to return prematurely.
+</requirement>
+<requirement>
+At least one route with a handler must be registered with the router. This is because the `router_.validate()` function will throw a `std::runtime_error` if a route without a handler is found.
+</requirement>
+<requirement>
+If multithreading is used by calling `multithreaded()` or `concurrency()` with a value greater than 1, the concurrency level must be at least 2. This is to prevent potential issues with thread management within the server.
+</requirement>
+<requirement>
+If SSL is enabled by calling an ssl setup function like `ssl_file()`, a valid certificate and key file must be provided. This is to ensure the SSL context is properly initialized and avoid errors during server startup.
+</requirement>
+<requirement>
+If a Unix socket is used by calling `local_socket_path()`, a valid file system path must be provided for the socket. This is to ensure the server can bind to the specified socket.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: stack-use-after-scope on address 0x7fd59667c8f8 at pc 0x55ed59ff0b1d bp 0x7ffcae322c30 sp 0x7ffcae322c28
+READ of size 1 at 0x7fd59667c8f8 thread T0
+SCARINESS: 12 (1-byte-read-stack-use-after-scope)
+#0 0x55ed59ff0b1c in __is_long /usr/local/bin/../include/c++/v1/string:1773:29
+#1 0x55ed59ff0b1c in basic_string /usr/local/bin/../include/c++/v1/string:898:16
+#2 0x55ed59ff0b1c in static_dir /src/crow/include/crow/routing.h:1164:20
+#3 0x55ed59ff0b1c in crow::Crow<>::add_blueprint() /src/crow/include/crow/app.h:489:25
+#4 0x55ed59f60c0e in crow::Crow<>::run() /src/crow/include/crow/app.h:529:13
+#5 0x55ed59f5aec9 in LLVMFuzzerTestOneInput /src/crow/tests/fuzz/b64_fuzzer.cpp:144:17
+#6 0x55ed59e022a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#7 0x55ed59e01ac5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#8 0x55ed59e032a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#9 0x55ed59e04035 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#10 0x55ed59df2e7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#11 0x55ed59e1e252 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#12 0x7fd596a99082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#13 0x55ed59de56fd in _start (out/libfuzzer-address-x86_64/b64_fuzzer+0xdf6fd)
+
+DEDUP_TOKEN: __is_long--basic_string--static_dir
+Address 0x7fd59667c8f8 is located in stack of thread T0 at offset 4344 in frame
+#0 0x55ed59f5963f in LLVMFuzzerTestOneInput /src/crow/tests/fuzz/b64_fuzzer.cpp:50
+
+DEDUP_TOKEN: LLVMFuzzerTestOneInput
+This frame has 37 object(s):
+[32, 80) 'ref.tmp.i.i759'
+[112, 160) 'ref.tmp.i.i699'
+[192, 240) 'ref.tmp.i.i655'
+[272, 320) 'ref.tmp.i.i582'
+[352, 400) 'ref.tmp.i.i565'
+[432, 480) 'ref.tmp.i.i554'
+[512, 560) 'ref.tmp.i.i543'
+[592, 640) 'ref.tmp.i.i'
+[672, 4192) 'app' (line 55)
+[4320, 4528) 'bp' (line 110) <== Memory access at offset 4344 is inside this variable
+[4592, 4616) 'ref.tmp78' (line 110)
+[4656, 4680) 'ref.tmp85' (line 111)
+[4720, 4744) 'agg.tmp109'
+[4784, 4808) 'agg.tmp118'
+[4848, 4872) 'ref.tmp126' (line 130)
+[4912, 4936) 'ref.tmp129' (line 130)
+[4976, 5000) 'agg.tmp141'
+[5040, 5064) 'agg.tmp148'
+[5104, 5112) 'server_thread' (line 150)
+[5136, 5152) 'serv_addr' (line 174)
+[5168, 5278) 'serv_addr195' (line 185)
+[5312, 5336) 'method' (line 199)
+[5376, 5400) 'path' (line 200)
+[5440, 5464) 'http_version' (line 201)
+[5504, 5528) 'body' (line 202)
+[5568, 5832) 'request_stream' (line 204)
+[5904, 5928) 'http_request' (line 219)
+[5968, 5992) 'response1' (line 222)
+[6032, 6056) 'ws_payload' (line 227)
+[6096, 6120) 'frame' (line 228)
+[6160, 6164) 'mask_bytes' (line 233)
+[6176, 6200) 'agg.tmp.ensured'
+[6240, 6264) 'path2' (line 248)
+[6304, 6328) 'body2' (line 249)
+[6368, 6632) 'request2_stream' (line 250)
+[6704, 6728) 'http_request2' (line 256)
+[6768, 6792) 'agg.tmp.ensured380'
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+(longjmp and C++ exceptions *are* supported)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The root cause of the `stack-use-after-scope` crash is a bug in the Crow project's handling of blueprints. The investigation with GDB revealed the exact mechanism of the bug:
+
+1.  The fuzzer creates a `crow::Blueprint` object (`bp`) on the stack.
+2.  It calls `app.register_blueprint(bp)`.
+3.  GDB shows that this resolves to an overload `register_blueprint(Blueprint& blueprint)` in `crow/app.h`. This overload takes a non-const l-value reference to the blueprint.
+4.  This function then calls `router_.register_blueprint(blueprint)`, passing the reference along.
+5.  Inside `crow::Router::register_blueprint`, the code at line 1324, `blueprints_.emplace_back(&blueprint);`, stores the raw pointer of the stack-allocated `bp` object into its `blueprints_` member vector.
+6.  No copy of the blueprint object is ever made. The router stores a pointer to the original object on the fuzzer's stack.
+7.  When the `if` block in the fuzzer's `LLVMFuzzerTestOneInput` function scope ends, the `bp` object is destroyed, and its memory on the stack is deallocated.
+8.  The `blueprints_` vector inside the `crow::Router` object now contains a dangling pointer.
+9.  Later, when `app.run()` is called, the application attempts to use this dangling pointer, leading to the use-after-scope crash detected by ASan.
+
+The fuzz driver is correctly written to expose this type of memory safety vulnerability by using a stack-allocated object with a limited lifetime.
+
+**Suggestion for Patching:**
+
+The `register_blueprint` mechanism needs to be fundamentally changed to manage the lifetime of the blueprint object correctly. Storing a raw pointer to a user-provided stack object is unsafe.
+
+The fix is to ensure the `Router` takes ownership of the blueprint's data by making a deep copy.
+
+1.  Change the `crow::Router::blueprints_` member from a vector of raw pointers (`std::vector<Blueprint*>`) to a vector of owned objects, for example, `std::vector<Blueprint>` or `std::vector<std::unique_ptr<Blueprint>>`.
+2.  Modify the `register_blueprint` functions in both `crow::Crow` and `crow::Router` to perform a deep copy of the incoming blueprint object and store the copy in the `blueprints_` vector.
+
+For example, the `crow::Router::register_blueprint` could be changed to:
+
+```cpp
+// In crow::Router
+// Change member: std::vector<Blueprint> blueprints_;
+
+void register_blueprint(const Blueprint& blueprint)
+{
+// Make a copy and store it.
+blueprints_.push_back(blueprint);
+}
+```
+
+This requires that `Blueprint` has a correct and complete copy constructor, which was a point of investigation earlier. The developers must ensure that the copy constructor for `Blueprint` and any of its members (like `Rule`) correctly perform deep copies of all associated data.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/crow/tests/fuzz/b64_fuzzer.cpp
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/crow/tests/fuzz/b64_fuzzer.cpp`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

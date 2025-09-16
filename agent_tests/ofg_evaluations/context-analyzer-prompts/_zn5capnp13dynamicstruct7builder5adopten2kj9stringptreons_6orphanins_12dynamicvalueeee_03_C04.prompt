@@ -1,0 +1,502 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project capnproto.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/capnproto/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <fuzzer/FuzzedDataProvider.h>
+#include "capnp/dynamic.h"
+#include "capnp/message.h"
+#include "capnp/orphan.h"
+#include "capnp/schema.h"
+#include "capnp/schema-loader.h"
+#include "/src/capnproto/c++/src/capnp/test.capnp.h"
+#include "kj/exception.h"
+#include <iostream>
+#include <vector>
+
+using TestSchema = capnproto_test::capnp::test::TestAllTypes;
+using UnionSchema = capnproto_test::capnp::test::TestUnion;
+
+// Represents the different kinds of fields we want to create orphans for.
+enum class OrphanType {
+PRIMITIVE,
+TEXT,
+DATA,
+LIST,
+STRUCT,
+GROUP,
+NULL_ORPHAN
+};
+
+const std::vector<OrphanType> allOrphanTypes = {
+OrphanType::PRIMITIVE, OrphanType::TEXT, OrphanType::DATA,
+OrphanType::LIST,      OrphanType::STRUCT, OrphanType::GROUP};
+
+// Maps an orphan type to a compatible field name in the TestAllTypes schema.
+kj::StringPtr getFieldNameForOrphanType(OrphanType type) {
+switch (type) {
+case OrphanType::PRIMITIVE: return "int32Field";
+case OrphanType::TEXT:      return "textField";
+case OrphanType::DATA:      return "dataField";
+case OrphanType::LIST:      return "int32List";
+case OrphanType::STRUCT:    return "structField";
+case OrphanType::GROUP:     return "groupfield";
+default:                    return "voidField"; // Should not happen
+}
+}
+
+// Helper to create an orphan of a specific type.
+capnp::Orphan<capnp::DynamicValue> createOrphan(
+FuzzedDataProvider& provider, OrphanType type,
+capnp::MallocMessageBuilder& orphanMessage) {
+
+if (type == OrphanType::NULL_ORPHAN) {
+return capnp::Orphan<capnp::DynamicValue>();
+}
+
+auto schema = capnp::Schema::from<TestSchema>();
+
+switch (type) {
+case OrphanType::PRIMITIVE: {
+auto root = orphanMessage.initRoot<capnp::DynamicStruct>(schema);
+auto field = schema.getFieldByName("int32Field");
+root.set(field, provider.ConsumeIntegral<int32_t>());
+return root.disown(field);
+}
+case OrphanType::TEXT: {
+auto root = orphanMessage.initRoot<capnp::DynamicStruct>(schema);
+auto field = schema.getFieldByName("textField");
+root.set(field, capnp::Text::Reader(provider.ConsumeRandomLengthString(100)));
+return root.disown(field);
+}
+case OrphanType::DATA: {
+auto root = orphanMessage.initRoot<capnp::DynamicStruct>(schema);
+auto field = schema.getFieldByName("dataField");
+auto bytes = provider.ConsumeBytes<uint8_t>(provider.ConsumeIntegralInRange<size_t>(0, 128));
+root.set(field, capnp::Data::Reader(bytes.data(), bytes.size()));
+return root.disown(field);
+}
+case OrphanType::LIST: {
+auto root = orphanMessage.initRoot<capnp::DynamicStruct>(schema);
+auto field = schema.getFieldByName("int32List");
+size_t listSize = provider.ConsumeIntegralInRange<size_t>(0, 20);
+auto listBuilder = root.init(field, listSize).as<capnp::DynamicList>();
+for (size_t i = 0; i < listSize; ++i) {
+listBuilder.set(i, provider.ConsumeIntegral<int32_t>());
+}
+return root.disown(field);
+}
+case OrphanType::STRUCT: {
+auto root = orphanMessage.initRoot<capnp::DynamicStruct>(schema);
+auto field = schema.getFieldByName("structField");
+root.init(field);
+return root.disown(field);
+}
+case OrphanType::GROUP: {
+auto groupField = schema.getFieldByName("groupfield");
+auto groupSchema = groupField.getType().asStruct();
+auto orphan = orphanMessage.getOrphanage().newOrphan(groupSchema);
+auto orphanStructBuilder = orphan.get();
+orphanStructBuilder.set("groupInt32Field", provider.ConsumeIntegral<int32_t>());
+return orphan;
+}
+case OrphanType::NULL_ORPHAN:
+// Handled at the top.
+break;
+}
+// Should be unreachable
+return capnp::Orphan<capnp::DynamicValue>();
+}
+
+// Defines the test case to run.
+enum class TestMode {
+// Adopt a compatible orphan into a valid field.
+HAPPY_PATH,
+// Adopt a null orphan.
+NULL_ORPHAN,
+// Attempt to adopt into a field name that doesn't exist.
+INVALID_NAME,
+// Attempt to adopt an orphan of an incompatible type.
+TYPE_MISMATCH,
+// Test that adopting into a union field clears other fields.
+UNION_INVALIDATION
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+if (size < 1) return 0;
+FuzzedDataProvider provider(data, size);
+
+auto mode = provider.PickValueInArray<TestMode>({
+TestMode::HAPPY_PATH, TestMode::NULL_ORPHAN, TestMode::INVALID_NAME,
+TestMode::TYPE_MISMATCH, TestMode::UNION_INVALIDATION});
+
+capnp::MallocMessageBuilder message;
+capnp::MallocMessageBuilder orphanMessage;
+
+switch (mode) {
+case TestMode::HAPPY_PATH: {
+if (allOrphanTypes.empty()) return 0;
+auto orphanType = allOrphanTypes[provider.ConsumeIntegralInRange<size_t>(0, allOrphanTypes.size() - 1)];
+auto orphan = createOrphan(provider, orphanType, orphanMessage);
+auto schema = capnp::Schema::from<TestSchema>();
+auto root = message.initRoot<capnp::DynamicStruct>(schema);
+root.adopt(getFieldNameForOrphanType(orphanType), kj::mv(orphan));
+break;
+}
+case TestMode::NULL_ORPHAN: {
+if (allOrphanTypes.empty()) return 0;
+auto orphan = createOrphan(provider, OrphanType::NULL_ORPHAN, orphanMessage);
+auto schema = capnp::Schema::from<TestSchema>();
+auto root = message.initRoot<capnp::DynamicStruct>(schema);
+auto fieldName = getFieldNameForOrphanType(allOrphanTypes[provider.ConsumeIntegralInRange<size_t>(0, allOrphanTypes.size() - 1)]);
+root.adopt(fieldName, kj::mv(orphan));
+break;
+}
+case TestMode::INVALID_NAME: {
+auto orphan = createOrphan(provider, OrphanType::PRIMITIVE, orphanMessage);
+auto schema = capnp::Schema::from<TestSchema>();
+auto root = message.initRoot<capnp::DynamicStruct>(schema);
+auto invalidName = provider.ConsumeRandomLengthString(20);
+try {
+root.adopt(invalidName.c_str(), kj::mv(orphan));
+} catch (const kj::Exception&) {
+// Expected
+}
+break;
+}
+case TestMode::TYPE_MISMATCH: {
+if (allOrphanTypes.size() < 2) return 0;
+auto orphanType = allOrphanTypes[provider.ConsumeIntegralInRange<size_t>(0, allOrphanTypes.size() - 1)];
+auto fieldToAdoptIntoType = allOrphanTypes[provider.ConsumeIntegralInRange<size_t>(0, allOrphanTypes.size() - 1)];
+
+if (orphanType == fieldToAdoptIntoType) {
+// Ensure we have a mismatch.
+fieldToAdoptIntoType = (orphanType == OrphanType::PRIMITIVE) ? OrphanType::TEXT : OrphanType::PRIMITIVE;
+}
+
+auto orphan = createOrphan(provider, orphanType, orphanMessage);
+auto schema = capnp::Schema::from<TestSchema>();
+auto root = message.initRoot<capnp::DynamicStruct>(schema);
+auto fieldName = getFieldNameForOrphanType(fieldToAdoptIntoType);
+
+try {
+root.adopt(fieldName, kj::mv(orphan));
+} catch (const kj::Exception&) {
+// Expected
+}
+break;
+}
+case TestMode::UNION_INVALIDATION: {
+auto schema = capnp::Schema::from<UnionSchema>();
+auto root = message.initRoot<capnp::DynamicStruct>(schema);
+
+// Set an initial value in the union.
+root.set("u1f0", capnp::Text::Reader("initial value"));
+
+// Create an orphan for a *different* field in the same union.
+auto orphan = createOrphan(provider, OrphanType::DATA, orphanMessage);
+
+// Adopt the orphan. This should succeed and clear u1f0.
+root.adopt("u1f1", kj::mv(orphan));
+break;
+}
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: capnproto
+function signature: void capnp::DynamicStruct::Builder::adopt(StringPtr, DW_TAG_rvalue_reference_typeOrphan<capnp::DynamicValue>)
+</input>
+
+<description>
+The `adopt` function is a method of the `DynamicStruct::Builder` class. It adopts an orphan into the struct, associating it with the field specified by `name`. The `DynamicStruct::Builder` must be initialized with a valid schema that contains the specified field. The orphan must also be valid. The function first looks up the field in the schema using the provided name and then calls another `adopt` overload that takes a `StructSchema::Field` object.
+</description>
+
+<requirements>
+
+<requirement>
+A `StructSchema` object must be created, for example by using `Schema::from<AddressBook>()`. This is because the `DynamicStruct::Builder`'s `schema` member must be initialized, which is used by the `adopt` method to look up the field by name.
+</requirement>
+<requirement>
+A `MallocMessageBuilder` must be created. This is because a `DynamicStruct::Builder` is initialized from a message builder.
+</requirement>
+<requirement>
+A `DynamicStruct::Builder` must be initialized from the message builder using `initRoot<DynamicStruct>(schema)`. This is because the `adopt` method is a member function of `DynamicStruct::Builder`.
+</requirement>
+<requirement>
+The `name` argument must be a valid field name in the schema used to initialize the `DynamicStruct::Builder`. This is because the function calls `schema.getFieldByName(name)`, which will throw an exception if the field is not found.
+</requirement>
+<requirement>
+The `orphan` argument must be a valid `Orphan<DynamicValue>`. It can be created by initializing a field in another `DynamicStruct::Builder` and then calling `disown` on that field. This is because the `adopt` method expects a valid orphan to adopt.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: ABRT on unknown address 0x000000000010 (pc 0x7fc04403500b bp 0x7ffdeac4f890 sp 0x7ffdeac4f4c0 T0)
+SCARINESS: 10 (signal)
+#0 0x7fc04403500b in raise (/lib/x86_64-linux-gnu/libc.so.6+0x4300b) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#1 0x7fc044014858 in abort (/lib/x86_64-linux-gnu/libc.so.6+0x22858) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#2 0x55a6928d1305 in abort_message (out/libfuzzer-address-x86_64/capnp-llvm-fuzzer-testcase+0x48a305)
+#3 0x55a6928b34ca in demangling_terminate_handler() cxa_default_handlers.cpp
+#4 0x55a6928d0e62 in std::__terminate(void (*)()) (out/libfuzzer-address-x86_64/capnp-llvm-fuzzer-testcase+0x489e62)
+#5 0x55a6928d3145 in __cxxabiv1::failed_throw(__cxxabiv1::__cxa_exception*) cxa_exception.cpp
+#6 0x55a6928d312f in __cxa_throw (out/libfuzzer-address-x86_64/capnp-llvm-fuzzer-testcase+0x48c12f)
+#7 0x55a69289a885 in kj::ExceptionCallback::RootExceptionCallback::onRecoverableException(kj::Exception&&) /src/capnproto/c++/src/kj/exception.c++:1292:7
+#8 0x55a6928a0266 in kj::_::Debug::Fault::~Fault() /src/capnproto/c++/src/kj/debug.c++:362:5
+#9 0x55a6927eb5e2 in capnp::DynamicValue::Reader::AsImpl<int, (capnp::Kind)0>::apply(capnp::DynamicValue::Reader const&) /src/capnproto/c++/src/capnp/dynamic.c++:1800:1
+#10 0x55a6927c69e5 in as<int> /src/capnproto/c++/src/capnp/dynamic.h:668:43
+#11 0x55a6927c69e5 in capnp::DynamicStruct::Builder::set(capnp::StructSchema::Field, capnp::DynamicValue::Reader const&) /src/capnproto/c++/src/capnp/dynamic.c++:535:9
+#12 0x55a6927d01a3 in capnp::DynamicStruct::Builder::adopt(capnp::StructSchema::Field, capnp::Orphan<capnp::DynamicValue>&&) /src/capnproto/c++/src/capnp/dynamic.c++:779:11
+#13 0x55a6927d99f4 in capnp::DynamicStruct::Builder::adopt(kj::StringPtr, capnp::Orphan<capnp::DynamicValue>&&) /src/capnproto/c++/src/capnp/dynamic.c++:1030:3
+#14 0x55a6926c69a5 in LLVMFuzzerTestOneInput /src/capnproto/c++/src/capnp/llvm-fuzzer-testcase.c++:147:12
+#15 0x55a692577db0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#16 0x55a6925775d5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#17 0x55a692578db5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#18 0x55a692579b45 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#19 0x55a69256898b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#20 0x55a692593d62 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#21 0x7fc044016082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#22 0x55a69255b20d in _start (out/libfuzzer-address-x86_64/capnp-llvm-fuzzer-testcase+0x11420d)
+
+DEDUP_TOKEN: raise--abort--abort_message
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The crash is caused by a bug in the Cap'n Proto library, not the fuzz driver.
+
+1.  The fuzzer creates an orphan of a primitive type (`int32`) using `DynamicStruct::Builder::disown()`. This is a valid use of the API.
+2.  It then attempts to adopt this orphan into a compatible field (`int32Field`) using `DynamicStruct::Builder::adopt()`.
+3.  The `adopt` method calls `set(field, orphan.getReader())`.
+4.  The core of the bug is that `orphan.getReader()` returns a `DynamicValue::Reader` object whose `type` is incorrectly set to `UNKNOWN` instead of `INT`.
+5.  This incorrect `UNKNOWN` type allows the `Reader` to bypass an initial type check at the beginning of the `set` method.
+6.  However, the code then proceeds to a `switch` statement to handle the specific field type. For an `INT32` field, it calls `value.as<int32_t>()`.
+7.  The `as<int32_t>()` method expects a reader whose type is numeric. When it checks the reader's type and finds `UNKNOWN`, it throws the "Value type mismatch" exception, leading to the abort.
+
+The fuzzer is correctly using the library's API. The bug lies within the library's implementation of `Orphan<DynamicValue>::getReader()`, which fails to correctly construct a `DynamicValue::Reader` from an orphan of a primitive type.
+
+**Suggestion for Patching:**
+
+The Cap'n Proto library needs to be fixed. The implementation of `Orphan<DynamicValue>::getReader()` (or the underlying mechanism it uses) should be corrected to ensure that when it's called on an orphan containing a primitive value (like an `int32`), it constructs a `DynamicValue::Reader` with the corresponding correct type (e.g., `DynamicValue::INT`) and value, not `DynamicValue::UNKNOWN`.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/capnproto/c++/src/capnp/llvm-fuzzer-testcase.c++
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/capnproto/c++/src/capnp/llvm-fuzzer-testcase.c++`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

@@ -1,0 +1,1016 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libsrtp.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <limits.h>
+
+#include "srtp.h"
+#include "srtp_priv.h"
+#include "fuzzer.h"
+#include "mt19937.h"
+#include "testmem.h"
+
+#include "/src/libsrtp/crypto/include/auth.h"
+#include "cipher_types.h"
+
+/* Global variables */
+static bool g_no_align = false;  /* Can be enabled with --no_align */
+static bool g_post_init = false; /* Set to true once past initialization phase */
+static bool g_write_input = false;
+
+#ifdef FUZZ_32BIT
+#include <sys/mman.h>
+static bool g_no_mmap = false;            /* Can be enabled with --no_mmap */
+static void *g_mmap_allocation = NULL;    /* Keeps current mmap() allocation address */
+static size_t g_mmap_allocation_size = 0; /* Keeps current mmap() allocation size */
+#endif
+
+/* Custom allocator functions */
+
+static void *fuzz_alloc(const size_t size, const bool do_zero) {
+void *ret = NULL;
+#ifdef FUZZ_32BIT
+bool do_malloc = true;
+#endif
+bool do_mmap, mmap_high = true;
+
+if (size == 0) {
+size_t ret_val;
+ret_val = 0x01 + (fuzz_mt19937_get() % 1024);
+return (void *)ret_val;
+}
+
+if (g_post_init == true) {
+do_mmap = (fuzz_mt19937_get() % 64) == 0 ? true : false;
+if (do_mmap == true) {
+mmap_high = (fuzz_mt19937_get() % 2) == 0 ? true : false;
+}
+} else {
+do_mmap = false;
+}
+
+#ifdef FUZZ_32BIT
+if (g_mmap_allocation == NULL && g_no_mmap == false && do_mmap == true) {
+void *mmap_address;
+if (mmap_high == true) {
+mmap_address = (void *)0xFFFF0000;
+} else {
+mmap_address = (void *)0x00010000;
+}
+g_mmap_allocation_size = size;
+
+ret = mmap(mmap_address, g_mmap_allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+if (ret == MAP_FAILED) {
+ret = NULL;
+g_mmap_allocation_size = 0;
+}
+g_mmap_allocation = ret;
+do_malloc = false;
+}
+
+if (do_malloc == true)
+#endif
+{
+ret = malloc(size);
+}
+
+if (ret != NULL && do_zero) {
+memset(ret, 0, size);
+}
+
+return ret;
+}
+
+static void *fuzz_alloc_succeed(const size_t size, const bool do_zero) {
+void *ret = fuzz_alloc(size, do_zero);
+if (ret == NULL) {
+if (do_zero == false) {
+ret = malloc(size);
+} else {
+ret = calloc(1, size);
+}
+}
+
+return ret;
+}
+
+void *fuzz_calloc(const size_t nmemb, const size_t size) {
+if (g_post_init == true) {
+if ((fuzz_mt19937_get() % 64) == 0) {
+return NULL;
+}
+}
+
+return fuzz_alloc(nmemb * size, true);
+}
+
+static bool fuzz_is_special_pointer(void *ptr) {
+if ((size_t)ptr >= 0x01 && (size_t)ptr < (0x01 + 1024)) {
+return true;
+} else {
+return false;
+}
+}
+
+void fuzz_free(void *ptr) {
+if (fuzz_is_special_pointer(ptr) == true) {
+return;
+}
+
+#ifdef FUZZ_32BIT
+if (g_post_init == true && ptr != NULL && ptr == g_mmap_allocation) {
+if (munmap(g_mmap_allocation, g_mmap_allocation_size) == -1) {
+abort();
+}
+g_mmap_allocation = NULL;
+} else
+#endif
+{
+free(ptr);
+}
+}
+
+static srtp_err_status_t fuzz_srtp_protect(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) {
+size_t out_len = *len + SRTP_MAX_TRAILER_LEN;
+srtp_err_status_t s = srtp_protect(srtp_sender, hdr, *len, hdr, &out_len, mki);
+*len = out_len;
+return s;
+}
+
+static srtp_err_status_t fuzz_srtp_unprotect(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) { return srtp_unprotect(srtp_sender, hdr, *len, hdr, len); }
+
+static srtp_err_status_t fuzz_srtp_protect_rtcp(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) {
+size_t out_len = *len + SRTP_MAX_SRTCP_TRAILER_LEN;
+srtp_err_status_t s = srtp_protect_rtcp(srtp_sender, hdr, *len, hdr, &out_len, mki);
+*len = out_len;
+return s;
+}
+
+static srtp_err_status_t fuzz_srtp_unprotect_rtcp(srtp_t srtp_sender, void *hdr, size_t *len, size_t mki) { return srtp_unprotect_rtcp(srtp_sender, hdr, *len, hdr, len); }
+
+/* Get protect length functions */
+
+static srtp_err_status_t fuzz_srtp_get_protect_length(const srtp_t srtp_ctx, size_t mki, size_t *length) { return srtp_get_protect_trailer_length(srtp_ctx, mki, length); }
+
+static srtp_err_status_t fuzz_srtp_get_protect_rtcp_length(const srtp_t srtp_ctx, size_t mki, size_t *length) { return srtp_get_protect_rtcp_trailer_length(srtp_ctx, mki, length); }
+
+static uint8_t *extract_key(const uint8_t **data, size_t *size, const size_t key_size) {
+uint8_t *ret;
+if (*size < key_size) {
+return NULL;
+}
+
+ret = fuzz_alloc_succeed(key_size, false);
+EXTRACT(ret, *data, *size, key_size);
+
+return ret;
+}
+
+static srtp_master_key_t *extract_master_key(const uint8_t **data, size_t *size, const size_t key_size, bool simulate, bool *success) {
+srtp_master_key_t *ret = NULL;
+uint16_t mki_id_size;
+
+if (simulate == true) {
+*success = false;
+}
+
+EXTRACT_IF(&mki_id_size, *data, *size, sizeof(mki_id_size));
+
+if (*size < key_size + mki_id_size) {
+goto end;
+}
+
+if (simulate == true) {
+*data += key_size + mki_id_size;
+*size -= key_size + mki_id_size;
+*success = true;
+goto end;
+}
+
+ret = fuzz_alloc_succeed(sizeof(srtp_master_key_t), false);
+ret->key = fuzz_alloc_succeed(key_size, false);
+ret->mki_id = fuzz_alloc_succeed(mki_id_size, false);
+
+EXTRACT(ret->key, *data, *size, key_size);
+EXTRACT(ret->mki_id, *data, *size, mki_id_size);
+end:
+return ret;
+}
+
+static srtp_master_key_t **extract_master_keys(const uint8_t **data, size_t *size, const size_t key_size, size_t *num_master_keys) {
+const uint8_t *data_orig = *data;
+size_t size_orig = *size;
+size_t i = 0;
+
+srtp_master_key_t **ret = NULL;
+
+*num_master_keys = 0;
+
+while (1) {
+uint8_t do_extract_master_key;
+bool success;
+if (*size < sizeof(do_extract_master_key)) {
+goto next;
+}
+EXTRACT(&do_extract_master_key, *data, *size, sizeof(do_extract_master_key));
+
+if ((do_extract_master_key % 2) == 0) {
+break;
+}
+
+extract_master_key(data, size, key_size, true, &success);
+
+if (success == false) {
+break;
+}
+
+(*num_master_keys)++;
+}
+
+next:
+*data = data_orig;
+*size = size_orig;
+
+ret = fuzz_alloc_succeed(*num_master_keys * sizeof(srtp_master_key_t *), false);
+
+for (i = 0; i < *num_master_keys; i++) {
+uint8_t do_extract_master_key;
+EXTRACT_IF(&do_extract_master_key, *data, *size, sizeof(do_extract_master_key));
+
+if ((do_extract_master_key % 2) == 0) {
+break;
+}
+
+ret[i] = extract_master_key(data, size, key_size, false, NULL);
+
+if (ret[i] == NULL) {
+abort();
+}
+}
+
+end:
+return ret;
+}
+
+static srtp_policy_t *extract_policy(const uint8_t **data, size_t *size) {
+srtp_policy_t *policy = NULL;
+struct {
+uint8_t srtp_crypto_policy_func;
+size_t window_size;
+uint8_t allow_repeat_tx;
+uint8_t ssrc_type;
+uint32_t ssrc_value;
+uint8_t num_xtn_hdr;
+uint8_t do_extract_key;
+uint8_t do_extract_master_keys;
+} params;
+
+EXTRACT_IF(&params, *data, *size, sizeof(params));
+
+params.srtp_crypto_policy_func %= sizeof(fuzz_srtp_crypto_policies) / sizeof(fuzz_srtp_crypto_policies[0]);
+params.allow_repeat_tx %= 2;
+params.ssrc_type %= sizeof(fuzz_ssrc_type_map) / sizeof(fuzz_ssrc_type_map[0]);
+
+policy = fuzz_alloc_succeed(sizeof(*policy), true);
+
+fuzz_srtp_crypto_policies[params.srtp_crypto_policy_func].crypto_policy_func(&policy->rtp);
+fuzz_srtp_crypto_policies[params.srtp_crypto_policy_func].crypto_policy_func(&policy->rtcp);
+
+if (policy->rtp.cipher_key_len > MAX_KEY_LEN) {
+abort();
+}
+
+policy->ssrc.type = fuzz_ssrc_type_map[params.ssrc_type].srtp_ssrc_type;
+policy->ssrc.value = params.ssrc_value;
+
+if ((params.do_extract_key % 2) == 0) {
+policy->key = extract_key(data, size, policy->rtp.cipher_key_len);
+
+if (policy->key == NULL) {
+fuzz_free(policy);
+return NULL;
+}
+}
+
+if (params.num_xtn_hdr != 0) {
+const size_t xtn_hdr_size = params.num_xtn_hdr * sizeof(int);
+if (*size < xtn_hdr_size) {
+fuzz_free(policy->key);
+fuzz_free(policy);
+return NULL;
+}
+policy->enc_xtn_hdr = fuzz_alloc_succeed(xtn_hdr_size, false);
+EXTRACT(policy->enc_xtn_hdr, *data, *size, xtn_hdr_size);
+policy->enc_xtn_hdr_count = params.num_xtn_hdr;
+}
+
+if ((params.do_extract_master_keys % 2) == 0) {
+policy->keys = extract_master_keys(data, size, policy->rtp.cipher_key_len, &policy->num_master_keys);
+if (policy->keys == NULL) {
+fuzz_free(policy->key);
+fuzz_free(policy->enc_xtn_hdr);
+fuzz_free(policy);
+return NULL;
+}
+}
+
+policy->window_size = params.window_size;
+policy->allow_repeat_tx = params.allow_repeat_tx;
+policy->next = NULL;
+
+end:
+return policy;
+}
+
+static srtp_policy_t *extract_policies(const uint8_t **data, size_t *size) {
+srtp_policy_t *curpolicy = NULL, *policy_chain = NULL;
+
+curpolicy = extract_policy(data, size);
+if (curpolicy == NULL) {
+return NULL;
+}
+
+policy_chain = curpolicy;
+
+while (1) {
+uint8_t do_extract_policy;
+EXTRACT_IF(&do_extract_policy, *data, *size, sizeof(do_extract_policy));
+
+if ((do_extract_policy % 2) == 0) {
+break;
+}
+
+curpolicy->next = extract_policy(data, size);
+if (curpolicy->next == NULL) {
+break;
+}
+curpolicy = curpolicy->next;
+}
+
+end:
+return policy_chain;
+}
+
+static uint32_t *extract_remove_stream_ssrc(const uint8_t **data, size_t *size, uint8_t *num_remove_stream) {
+uint32_t *ret = NULL;
+uint8_t _num_remove_stream;
+size_t total_size;
+
+*num_remove_stream = 0;
+
+EXTRACT_IF(&_num_remove_stream, *data, *size, sizeof(_num_remove_stream));
+
+if (_num_remove_stream == 0) {
+goto end;
+}
+
+total_size = _num_remove_stream * sizeof(uint32_t);
+
+if (*size < total_size) {
+goto end;
+}
+
+ret = fuzz_alloc_succeed(total_size, false);
+EXTRACT(ret, *data, *size, total_size);
+
+*num_remove_stream = _num_remove_stream;
+
+end:
+return ret;
+}
+
+static uint32_t *extract_set_roc(const uint8_t **data, size_t *size, uint8_t *num_set_roc) {
+uint32_t *ret = NULL;
+uint8_t _num_set_roc;
+size_t total_size;
+
+*num_set_roc = 0;
+EXTRACT_IF(&_num_set_roc, *data, *size, sizeof(_num_set_roc));
+if (_num_set_roc == 0) {
+goto end;
+}
+
+total_size = _num_set_roc * sizeof(uint32_t) * 2;
+
+if (*size < total_size) {
+goto end;
+}
+
+ret = fuzz_alloc_succeed(total_size, false);
+EXTRACT(ret, *data, *size, total_size);
+
+*num_set_roc = _num_set_roc;
+
+end:
+return ret;
+}
+
+static void free_policies(srtp_policy_t *curpolicy) {
+size_t i;
+while (curpolicy) {
+srtp_policy_t *next = curpolicy->next;
+
+fuzz_free(curpolicy->key);
+
+for (i = 0; i < curpolicy->num_master_keys; i++) {
+fuzz_free(curpolicy->keys[i]->key);
+fuzz_free(curpolicy->keys[i]->mki_id);
+fuzz_free(curpolicy->keys[i]);
+}
+
+fuzz_free(curpolicy->keys);
+fuzz_free(curpolicy->enc_xtn_hdr);
+fuzz_free(curpolicy);
+
+curpolicy = next;
+}
+}
+
+static uint8_t *run_srtp_func(const srtp_t srtp_ctx, const uint8_t **data, size_t *size) {
+uint8_t *ret = NULL;
+uint8_t *copy = NULL, *copy_2 = NULL;
+
+struct {
+uint16_t size;
+uint8_t srtp_func;
+uint32_t mki;
+uint8_t stretch;
+} params_1;
+
+struct {
+uint8_t srtp_func;
+uint32_t mki;
+} params_2;
+size_t ret_size;
+
+EXTRACT_IF(&params_1, *data, *size, sizeof(params_1));
+params_1.srtp_func %= sizeof(srtp_funcs) / sizeof(srtp_funcs[0]);
+
+if (*size < params_1.size) {
+goto end;
+}
+
+if (g_no_align == false) {
+params_1.size -= params_1.size % 4;
+}
+
+if (params_1.size == 0) {
+goto end;
+}
+
+ret_size = params_1.size;
+if (srtp_funcs[params_1.srtp_func].protect == true) {
+size_t alloc_size;
+
+if (srtp_funcs[params_1.srtp_func].get_length(srtp_ctx, params_1.mki, &alloc_size) != srtp_err_status_ok) {
+goto end;
+}
+
+copy = fuzz_alloc_succeed(ret_size + alloc_size, false);
+} else {
+copy = fuzz_alloc_succeed(ret_size, false);
+}
+
+EXTRACT(copy, *data, *size, params_1.size);
+
+if (srtp_funcs[params_1.srtp_func].srtp_func(srtp_ctx, copy, &ret_size, params_1.mki) != srtp_err_status_ok) {
+fuzz_free(copy);
+goto end;
+}
+
+fuzz_testmem(copy, ret_size);
+ret = copy;
+
+EXTRACT_IF(&params_2, *data, *size, sizeof(params_2));
+params_2.srtp_func %= sizeof(srtp_funcs) / sizeof(srtp_funcs[0]);
+
+if (ret_size == 0) {
+goto end;
+}
+
+if (srtp_funcs[params_2.srtp_func].protect == true) {
+size_t alloc_size;
+
+if (srtp_funcs[params_2.srtp_func].get_length(srtp_ctx, params_2.mki, &alloc_size) != srtp_err_status_ok) {
+goto end;
+}
+
+copy_2 = fuzz_alloc_succeed(ret_size + alloc_size, false);
+} else {
+copy_2 = fuzz_alloc_succeed(ret_size, false);
+}
+
+memcpy(copy_2, copy, ret_size);
+fuzz_free(copy);
+copy = copy_2;
+
+if (srtp_funcs[params_2.srtp_func].srtp_func(srtp_ctx, copy, &ret_size, params_2.mki) != srtp_err_status_ok) {
+fuzz_free(copy);
+ret = NULL;
+goto end;
+}
+
+fuzz_testmem(copy, ret_size);
+ret = copy;
+
+end:
+return ret;
+}
+
+void fuzz_srtp_event_handler(srtp_event_data_t *data) {
+fuzz_testmem(data, sizeof(srtp_event_data_t));
+if (data->session != NULL) {
+fuzz_testmem(data->session, sizeof(*data->session));
+}
+}
+
+static void fuzz_write_input(const uint8_t *data, size_t size) {
+FILE *fp = fopen("input.bin", "wb");
+if (fp == NULL) {
+abort();
+}
+if (size != 0 && fwrite(data, size, 1, fp) != 1) {
+abort();
+}
+fclose(fp);
+}
+
+srtp_err_status_t srtp_replace_auth_type(const srtp_auth_type_t *, srtp_auth_type_id_t);
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+char **_argv = *argv;
+int i;
+bool no_custom_event_handler = false;
+
+if (srtp_init() != srtp_err_status_ok) {
+abort();
+}
+
+for (i = 0; i < *argc; i++) {
+if (strcmp("--no_align", _argv[i]) == 0) {
+g_no_align = true;
+} else if (strcmp("--no_custom_event_handler", _argv[i]) == 0) {
+no_custom_event_handler = true;
+} else if (strcmp("--write_input", _argv[i]) == 0) {
+g_write_input = true;
+}
+#ifdef FUZZ_32BIT
+else if (strcmp("--no_mmap", _argv[i]) == 0) {
+g_no_mmap = true;
+}
+#endif
+else if (strncmp("--", _argv[i], 2) == 0) {
+exit(0);
+}
+}
+
+if (no_custom_event_handler == false) {
+if (srtp_install_event_handler(fuzz_srtp_event_handler) != srtp_err_status_ok) {
+abort();
+}
+}
+
+g_post_init = true;
+return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+uint8_t num_remove_stream;
+uint32_t *remove_stream_ssrc = NULL;
+uint8_t num_set_roc;
+uint32_t *set_roc = NULL;
+srtp_t srtp_ctx = NULL;
+srtp_policy_t *policy_chain = NULL, *policy_chain_2 = NULL;
+uint32_t randseed;
+const uint8_t *initial_data = data;
+size_t initial_size = size;
+
+struct FuzzAuthParams {
+srtp_auth_type_id_t id_to_replace;
+uint8_t corruption_flags;
+uint16_t test_key_len;
+uint16_t test_data_len;
+uint16_t test_tag_len;
+};
+
+if (size > sizeof(struct FuzzAuthParams)) {
+const struct FuzzAuthParams *params = (const struct FuzzAuthParams *)data;
+const uint8_t *fuzz_ptr = data + sizeof(struct FuzzAuthParams);
+size_t fuzz_size = size - sizeof(struct FuzzAuthParams);
+
+extern const srtp_auth_type_t srtp_hmac;
+static srtp_auth_type_t new_auth_type;
+static srtp_auth_test_case_t new_test_case;
+uint8_t *test_key = NULL;
+uint8_t *test_data = NULL;
+uint8_t *test_tag = NULL;
+
+memcpy(&new_auth_type, &srtp_hmac, sizeof(srtp_auth_type_t));
+new_auth_type.id = params->id_to_replace;
+
+if (params->corruption_flags & 0x01) new_auth_type.alloc = NULL;
+if (params->corruption_flags & 0x02) new_auth_type.dealloc = NULL;
+if (params->corruption_flags & 0x04) new_auth_type.init = NULL;
+if (params->corruption_flags & 0x08) new_auth_type.compute = NULL;
+if (params->corruption_flags & 0x10) new_auth_type.update = NULL;
+if (params->corruption_flags & 0x20) new_auth_type.start = NULL;
+if (params->corruption_flags & 0x40) new_auth_type.test_data = NULL;
+if (params->corruption_flags & 0x80) {
+size_t needed = (size_t)params->test_key_len + params->test_data_len + params->test_tag_len;
+if (fuzz_size >= needed) {
+test_key = fuzz_alloc_succeed(params->test_key_len, false);
+memcpy(test_key, fuzz_ptr, params->test_key_len);
+fuzz_ptr += params->test_key_len;
+
+test_data = fuzz_alloc_succeed(params->test_data_len, false);
+memcpy(test_data, fuzz_ptr, params->test_data_len);
+fuzz_ptr += params->test_data_len;
+
+test_tag = fuzz_alloc_succeed(params->test_tag_len, false);
+memcpy(test_tag, fuzz_ptr, params->test_tag_len);
+
+new_test_case.key_length_octets = params->test_key_len;
+new_test_case.key = test_key;
+new_test_case.data_length_octets = params->test_data_len;
+new_test_case.data = test_data;
+new_test_case.tag_length_octets = params->test_tag_len;
+new_test_case.tag = test_tag;
+new_test_case.next_test_case = NULL;
+new_auth_type.test_data = &new_test_case;
+}
+}
+
+srtp_replace_auth_type(&new_auth_type, params->id_to_replace);
+
+fuzz_free(test_key);
+fuzz_free(test_data);
+fuzz_free(test_tag);
+
+/* Advance the main data pointer past the consumed bytes */
+size_t consumed = (fuzz_ptr - data);
+data += consumed;
+size -= consumed;
+}
+
+#ifdef FUZZ_32BIT
+fuzz_free(g_mmap_allocation);
+#endif
+
+if (g_write_input == true) {
+fuzz_write_input(initial_data, initial_size);
+}
+
+EXTRACT_IF(&randseed, data, size, sizeof(randseed));
+fuzz_mt19937_init(randseed);
+srand(randseed);
+
+if ((policy_chain = extract_policies(&data, &size)) == NULL) {
+goto end;
+}
+if ((policy_chain_2 = extract_policies(&data, &size)) == NULL) {
+goto end;
+}
+
+if (srtp_create(&srtp_ctx, policy_chain) != srtp_err_status_ok) {
+goto end;
+}
+
+remove_stream_ssrc = extract_remove_stream_ssrc(&data, &size, &num_remove_stream);
+set_roc = extract_set_roc(&data, &size, &num_set_roc);
+
+{
+uint8_t *ret;
+int i = 0, j = 0;
+
+while ((ret = run_srtp_func(srtp_ctx, &data, &size)) != NULL) {
+fuzz_free(ret);
+
+if (i < num_remove_stream) {
+if (srtp_stream_remove(srtp_ctx, remove_stream_ssrc[i]) != srtp_err_status_ok) {
+goto end;
+}
+i++;
+}
+
+if (j < num_set_roc * 2) {
+uint32_t roc;
+if (srtp_stream_set_roc(srtp_ctx, set_roc[j], set_roc[j + 1]) != srtp_err_status_ok) {
+goto end;
+}
+if (srtp_stream_get_roc(srtp_ctx, set_roc[j + 1], &roc) != srtp_err_status_ok) {
+goto end;
+}
+j += 2;
+}
+
+if (policy_chain_2 != NULL) {
+free_policies(policy_chain_2);
+policy_chain_2 = NULL;
+}
+}
+}
+
+end:
+free_policies(policy_chain);
+free_policies(policy_chain_2);
+fuzz_free(remove_stream_ssrc);
+fuzz_free(set_roc);
+if (srtp_ctx != NULL) {
+srtp_dealloc(srtp_ctx);
+}
+fuzz_mt19937_destroy();
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libsrtp
+function signature: srtp_err_status_t srtp_replace_auth_type(const srtp_auth_type_t *, srtp_auth_type_id_t)
+</input>
+
+<description>
+The function `srtp_replace_auth_type` is a wrapper around `srtp_crypto_kernel_do_load_auth_type`. Its purpose is to replace an existing authentication type implementation in the SRTP crypto kernel with a new one. The function takes two arguments: a pointer to a `srtp_auth_type_t` struct which defines the new authentication type, and an ID for that authentication type.
+
+The core logic resides in `srtp_crypto_kernel_do_load_auth_type`. This function performs several checks. It ensures that the provided `srtp_auth_type_t` pointer is not null and that its internal ID matches the provided ID. Critically, it runs a self-test on the new authentication type using the test data provided within the `srtp_auth_type_t` struct itself. This self-test involves allocating, initializing, and using the function pointers within the struct to compute and verify authentication tags against known-good test cases.
+
+If the self-test passes, the function proceeds to check if an authentication type with the given ID already exists in the kernel's list of authentication types. If it does, and the `replace` flag is true (which it is for `srtp_replace_auth_type`), it will replace the old type with the new one. If it doesn't exist, it adds the new type to the list. The function's correct execution is therefore highly dependent on the `new_at` argument being a pointer to a valid and correctly populated `srtp_auth_type_t` structure, with valid function pointers and test data. The `id` must also be a valid `srtp_auth_type_id_t`. The global `crypto_kernel` must also be initialized by calling `srtp_crypto_kernel_init` prior to calling this function.
+</description>
+
+<requirements>
+<requirement>
+The first argument, `new_at`, must not be a NULL pointer. This is to prevent a null pointer dereference inside the wrapped function `srtp_crypto_kernel_do_load_auth_type`.
+</requirement>
+<requirement>
+The `id` member of the `srtp_auth_type_t` struct pointed to by `new_at` must match the second argument, `id`. This is an explicit check within `srtp_crypto_kernel_do_load_auth_type` to ensure consistency.
+</requirement>
+<requirement>
+The `new_at` argument must point to a `srtp_auth_type_t` struct with valid function pointers for `alloc`, `dealloc`, `init`, `compute`, `update`, and `start`. These pointers are used in the self-test and for the auth type's operation, and if invalid, will lead to crashes.
+</requirement>
+<requirement>
+The `test_data` member of the `srtp_auth_type_t` struct must point to a valid, null-terminated linked list of `srtp_auth_test_case_t` structs. The self-test procedure iterates through this list, so an invalid list could cause a crash.
+</requirement>
+<requirement>
+The second argument, `id`, should be one of the values from the `srtp_auth_type_id_t` enum. Using an invalid ID may lead to unexpected behavior as the function expects to match this ID with an existing or new auth type.
+</requirement>
+<requirement>
+The function `srtp_crypto_kernel_init()` must be called before `srtp_replace_auth_type`. This is because `srtp_crypto_kernel_init` initializes the `crypto_kernel`, which `srtp_replace_auth_type` modifies.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x000000000000 bp 0x7ffe69980fd0 sp 0x7ffe69980ed8 T0)
+==18==Hint: pc points to the zero page.
+==18==The signal is caused by a READ memory access.
+==18==Hint: address points to the zero page.
+SCARINESS: 10 (null-deref)
+#0 0x0  (<unknown module>)
+#1 0x5588e61cd732 in srtp_crypto_kernel_do_load_auth_type /src/libsrtp/crypto/kernel/crypto_kernel.c:369:14
+#2 0x5588e61cd732 in srtp_replace_auth_type /src/libsrtp/crypto/kernel/crypto_kernel.c:424:12
+#3 0x5588e61a741a in LLVMFuzzerTestOneInput /src/libsrtp/fuzzer/fuzzer.c:644:5
+#4 0x5588e605b310 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#5 0x5588e605ab35 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#6 0x5588e605cac2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#7 0x5588e605cdb2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#8 0x5588e604beeb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#9 0x5588e60772c2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#10 0x7f059116f082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: srtp_crypto_kernel_do_load_auth_type--srtp_replace_auth_type
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is caused by a bug in the `srtp` project.
+
+**Analysis:**
+The fuzzer creates a `srtp_auth_type_t` struct and can set its function pointers (`alloc`, `dealloc`, `init`, etc.) to NULL. This struct is then passed to `srtp_replace_auth_type`, which in turn calls `srtp_crypto_kernel_do_load_auth_type`. This function calls `srtp_auth_type_self_test`, which calls `srtp_auth_type_test`.
+
+Inside `srtp_auth_type_test`, the macro `srtp_auth_type_alloc` is used. This macro expands to `((at)->alloc((a), (klen), (outlen)))`. If the `alloc` function pointer in the `srtp_auth_type_t` struct (`at`) is NULL, this results in a call to a NULL function pointer, causing a segmentation fault with the program counter at 0x0.
+
+The project code does not validate that the function pointers within the `srtp_auth_type_t` struct are non-NULL before attempting to call them.
+
+**Suggestion:**
+The `srtp_crypto_kernel_do_load_auth_type` function should be patched to validate the function pointers in the `srtp_auth_type_t` struct before calling `srtp_auth_type_self_test`. A simple check for NULL on the `alloc`, `dealloc`, `init`, `compute`, `update`, and `start` function pointers would prevent this crash.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libsrtp/fuzzer/fuzzer.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libsrtp/fuzzer/fuzzer.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

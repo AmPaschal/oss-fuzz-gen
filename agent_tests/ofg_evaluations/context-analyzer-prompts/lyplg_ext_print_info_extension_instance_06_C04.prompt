@@ -1,0 +1,569 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project libyang.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "libyang.h"
+#include "plugins_exts.h"
+#include "printer_internal.h"
+#include "out.h"
+#include "ly_common.h"
+#include "tree_schema.h"
+#include "tree_edit.h"
+#include "xpath.h"
+
+// Helper to consume data from the fuzzer input buffer.
+static int consume_bytes(const uint8_t **data, size_t *size, void *dest, size_t dest_size) {
+if (*size < dest_size) {
+return 0;
+}
+if (dest) {
+memcpy(dest, *data, dest_size);
+}
+*data += dest_size;
+*size -= dest_size;
+return 1;
+}
+
+// Helper to consume a string from the fuzzer input buffer.
+static char *consume_string(const uint8_t **data, size_t *size) {
+uint8_t str_len;
+if (!consume_bytes(data, size, &str_len, sizeof(str_len))) {
+return NULL;
+}
+str_len %= 128; // Limit string length
+if (*size < str_len) {
+return NULL;
+}
+char *str = malloc(str_len + 1);
+if (!str) {
+return NULL;
+}
+if (consume_bytes(data, size, str, str_len)) {
+str[str_len] = '\0';
+return str;
+}
+free(str);
+return NULL;
+}
+
+// A list of statements the fuzzer knows how to construct.
+static const enum ly_stmt all_stmts[] = {
+LY_STMT_ARGUMENT, LY_STMT_CONTACT, LY_STMT_DESCRIPTION, LY_STMT_MUST,
+LY_STMT_ORGANIZATION, LY_STMT_REFERENCE, LY_STMT_STATUS, LY_STMT_UNITS,
+LY_STMT_VALUE, LY_STMT_CONFIG, LY_STMT_MANDATORY, LY_STMT_TYPE
+};
+#define NUM_ALL_STMTS (sizeof(all_stmts) / sizeof(all_stmts[0]))
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+struct ly_ctx *ctx = NULL;
+struct lys_module *mod = NULL;
+char *out_str = NULL;
+struct ly_out *out = NULL;
+struct lysc_ext_instance ext = {0};
+ly_bool flag = 0;
+uint8_t num_substmts = 0;
+int ret = 0;
+
+if (ly_ctx_new(NULL, 0, &ctx) != LY_SUCCESS) {
+return 0;
+}
+
+const char *schema = "module fuzz_module { yang-version 1.1; namespace \"urn:fuzz\"; prefix f; }";
+if (lys_parse_mem(ctx, schema, LYS_IN_YANG, &mod) != LY_SUCCESS) {
+goto cleanup;
+}
+
+if (ly_out_new_memory(&out_str, 0, &out) != LY_SUCCESS) {
+goto cleanup;
+}
+struct lyspr_ctx printer_ctx = {
+.out = out,
+.module = mod,
+.level = 0,
+.options = 0,
+.flags = 0
+};
+
+ext.module = mod;
+
+if (!consume_bytes(&data, &size, &num_substmts, sizeof(num_substmts))) {
+goto cleanup;
+}
+num_substmts %= 16;
+
+bool stop_processing = false;
+for (uint8_t i = 0; i < num_substmts; ++i) {
+uint8_t choice;
+if (!consume_bytes(&data, &size, &choice, sizeof(choice))) {
+break;
+}
+
+struct lysc_ext_substmt *substmt;
+LY_ARRAY_NEW_GOTO(ctx, ext.substmts, substmt, ret, cleanup);
+substmt->stmt = all_stmts[choice % NUM_ALL_STMTS];
+substmt->storage_p = NULL;
+
+switch (substmt->stmt) {
+case LY_STMT_ARGUMENT:
+case LY_STMT_CONTACT:
+case LY_STMT_DESCRIPTION:
+case LY_STMT_ORGANIZATION:
+case LY_STMT_REFERENCE:
+case LY_STMT_UNITS: {
+char **str_p = calloc(1, sizeof(char*));
+if (!str_p) {
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+*str_p = consume_string(&data, &size);
+if (*str_p) {
+substmt->storage_p = (void**)str_p;
+} else {
+free(str_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+stop_processing = true;
+}
+break;
+}
+case LY_STMT_STATUS:
+case LY_STMT_CONFIG:
+case LY_STMT_MANDATORY: {
+uint16_t **u16_p = calloc(1, sizeof(uint16_t*));
+if (!u16_p) {
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+*u16_p = malloc(sizeof(uint16_t));
+if (!*u16_p) {
+free(u16_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+if (consume_bytes(&data, &size, *u16_p, sizeof(uint16_t))) {
+substmt->storage_p = (void**)u16_p;
+} else {
+free(*u16_p);
+free(u16_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+stop_processing = true;
+}
+break;
+}
+case LY_STMT_VALUE: {
+int64_t **i64_p = calloc(1, sizeof(int64_t*));
+if (!i64_p) {
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+*i64_p = malloc(sizeof(int64_t));
+if (!*i64_p) {
+free(i64_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+if (consume_bytes(&data, &size, *i64_p, sizeof(int64_t))) {
+substmt->storage_p = (void**)i64_p;
+} else {
+free(*i64_p);
+free(i64_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+stop_processing = true;
+}
+break;
+}
+case LY_STMT_MUST: {
+struct lysc_must **must_p = calloc(1, sizeof(struct lysc_must*));
+if (!must_p) {
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+*must_p = calloc(1, sizeof(struct lysc_must));
+if (!*must_p) {
+free(must_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+(*must_p)->cond = NULL;
+(*must_p)->dsc = consume_string(&data, &size);
+(*must_p)->ref = consume_string(&data, &size);
+(*must_p)->emsg = consume_string(&data, &size);
+(*must_p)->eapptag = consume_string(&data, &size);
+substmt->storage_p = (void**)must_p;
+break;
+}
+case LY_STMT_TYPE: {
+struct lysc_type **type_p = calloc(1, sizeof(struct lysc_type*));
+if (!type_p) {
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+*type_p = calloc(1, sizeof(struct lysc_type));
+if (!*type_p) {
+free(type_p);
+LY_ARRAY_DECREMENT(ext.substmts);
+goto cleanup;
+}
+(*type_p)->name = consume_string(&data, &size);
+substmt->storage_p = (void**)type_p;
+break;
+}
+default:
+// Should not be reached due to restricted all_stmts array.
+LY_ARRAY_DECREMENT(ext.substmts);
+break;
+}
+
+if (stop_processing) {
+break;
+}
+}
+
+lyplg_ext_print_info_extension_instance(&printer_ctx, &ext, &flag);
+
+cleanup:
+if (ext.substmts) {
+for (uint32_t i = 0; i < LY_ARRAY_COUNT(ext.substmts); ++i) {
+void **storage_p = ext.substmts[i].storage_p;
+if (!storage_p) {
+continue;
+}
+void *storage = *storage_p;
+if (!storage) {
+free(storage_p);
+continue;
+}
+
+switch (ext.substmts[i].stmt) {
+case LY_STMT_ARGUMENT:
+case LY_STMT_CONTACT:
+case LY_STMT_DESCRIPTION:
+case LY_STMT_ORGANIZATION:
+case LY_STMT_REFERENCE:
+case LY_STMT_UNITS:
+free(storage);
+break;
+case LY_STMT_MUST: {
+struct lysc_must *must = (struct lysc_must *)storage;
+free((void *)must->dsc);
+free((void *)must->ref);
+free((void *)must->emsg);
+free((void *)must->eapptag);
+free(must);
+break;
+}
+case LY_STMT_TYPE: {
+struct lysc_type *type = (struct lysc_type *)storage;
+free((void *)type->name);
+free(type);
+break;
+}
+default:
+free(storage);
+break;
+}
+free(storage_p);
+}
+free(ext.substmts);
+}
+ly_out_free(out, NULL, 0);
+free(out_str);
+ly_ctx_destroy(ctx);
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: libyang
+function signature: void lyplg_ext_print_info_extension_instance(struct lyspr_ctx *, const struct lysc_ext_instance *, ly_bool *)
+</input>
+
+<description>
+The function `lyplg_ext_print_info_extension_instance` iterates through the substatements of a compiled extension instance (`ext`) and prints them to the output specified in the printer context (`ctx`). It is a generic printer function used by various extension plugins. The function's main logic is a `switch` statement that, for each substatement type, casts the storage pointer to a specific data structure and calls a corresponding printing function. The function's safety and correctness are highly dependent on the `ext` argument being a valid, fully compiled extension instance where each substatement's `storage_p` points to a valid object of the type expected by the `stmt` value.
+</description>
+
+<requirements>
+
+<requirement>
+The `ctx` argument must be a valid pointer to a `struct lyspr_ctx` object. Its `out` member must be a valid pointer to a `struct ly_out` object, as it is dereferenced and passed to various printing functions like `ypr_open`.</requirement>
+<requirement>
+The `ext` argument must be a valid pointer to a `struct lysc_ext_instance` object. It must not be NULL, as its `substmts` member is dereferenced and iterated over.</requirement>
+<requirement>
+The `ext->substmts` member must be a valid sized array of `struct lysc_ext_substmt`. The function uses `LY_ARRAY_FOR` to iterate over it, which relies on the array's size information being correct to prevent out-of-bounds access.</requirement>
+<requirement>
+For each element in the `ext->substmts` array, the `storage_p` member must be a valid pointer to memory containing data whose type corresponds to the `stmt` member. Many cases in the `switch` statement dereference `storage_p` without a prior NULL check, assuming it points to valid data.</requirement>
+<requirement>
+The `flag` argument must be a valid pointer to a `ly_bool` variable. It is dereferenced in multiple function calls (e.g., `ypr_open`, `ypr_config`) and must not be NULL.</requirement>
+<requirement>
+For substatements where `storage_p` points to a list or array of objects (e.g., LY_STMT_NOTIFICATION, LY_STMT_MUST), the list/array must be correctly terminated or have a valid size. The function uses `LY_LIST_FOR` and `LY_ARRAY_FOR` to iterate, and incorrect list/array structure can lead to crashes.</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: attempting free on address which was not malloc()-ed: 0x503000011c88 in thread T0
+SCARINESS: 40 (bad-free)
+#0 0x5608a7dd8ed6 in free /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:52:3
+#1 0x5608a7e18c6e in LLVMFuzzerTestOneInput /src/libyang/build/../tests/fuzz/lys_parse_mem.c:268:9
+#2 0x5608a7ccd3a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x5608a7cccbc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x5608a7cce3a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x5608a7ccf135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x5608a7cbdf7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x5608a7ce9352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f0ba6ec6082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#9 0x5608a7cb07fd in _start (out/libfuzzer-address-x86_64/lys_parse_mem+0x1807fd)
+
+DEDUP_TOKEN: __interceptor_free--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+0x503000011c88 is located 8 bytes inside of 24-byte region [0x503000011c80,0x503000011c98)
+allocated by thread T0 here:
+#0 0x5608a7dd916f in malloc /src/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:68:3
+#1 0x5608a7e18e9b in LLVMFuzzerTestOneInput /src/libyang/build/../tests/fuzz/lys_parse_mem.c:104:9
+#2 0x5608a7ccd3a0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x5608a7cccbc5 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x5608a7cce3a5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#5 0x5608a7ccf135 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#6 0x5608a7cbdf7b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x5608a7ce9352 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f0ba6ec6082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: __interceptor_malloc--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The crash is an AddressSanitizer `bad-free` error, which occurs when `free()` is called on an address that was not returned by `malloc()` or a related allocation function.
+
+1.  **The Allocation:** The ASan report indicates that the memory in question is a 24-byte block allocated at `lys_parse_mem.c:175`. This line corresponds to the allocation of a `struct lysc_must` within the fuzzer's logic: `*must_p = calloc(1, sizeof(struct lysc_must));`.
+
+2.  **The Crash:** The crash happens at `lys_parse_mem.c:268` (the `case` statement) which leads to the `free(storage)` call at line 272. The address being freed (`0x...c88`) is 8 bytes *inside* the 24-byte block allocated earlier (`[0x...c80, 0x...c98)`). This means the pointer being freed is not the original pointer returned by `calloc`, but an internal pointer to the struct.
+
+3.  **The Culprit:** The fuzzer allocates the `struct lysc_must` and stores a pointer to it in the `ext.substmts` array. This `ext` structure is then passed by reference to the project function `lyplg_ext_print_info_extension_instance` at line 250. This is the only code that executes between the allocation and the cleanup loop where the `free` occurs. The project function is evidently corrupting the pointer stored inside the `ext` structure, causing it to point 8 bytes into the allocated memory block. When the fuzzer's cleanup logic later attempts to `free` this corrupted pointer, ASan detects the error and terminates the program.
+
+The fuzzer's allocation and deallocation logic is fundamentally correct; it is operating on data that has been corrupted by the project code. Therefore, the bug lies within the `libyang` project.
+
+**Suggestion for Patching the Project:**
+
+The project function `lyplg_ext_print_info_extension_instance` should be carefully audited. The investigation should focus on how it processes the `lysc_ext_instance` structure, particularly substatements of type `LY_STMT_MUST`. The function likely performs an incorrect pointer calculation or an out-of-bounds write that modifies the `storage_p` pointer within the `ext.substmts` array passed to it. The function must be fixed to handle the provided data structures without causing such side effects.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/libyang/tests/fuzz/lys_parse_mem.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/libyang/tests/fuzz/lys_parse_mem.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

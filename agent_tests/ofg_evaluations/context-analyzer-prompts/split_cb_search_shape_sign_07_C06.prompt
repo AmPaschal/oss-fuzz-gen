@@ -1,0 +1,443 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project speex.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/speex/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#define FIXED_POINT 1
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include <cstdint>
+#include <cmath>
+#include <numeric>
+
+#include "speex/speex.h"
+#include "speex/speex_bits.h"
+#include "speex/speex_types.h"
+
+// The internal header cb_search.h does not have extern "C" guards,
+// so we must wrap it to prevent C++ name mangling.
+extern "C" {
+#include "/src/speex/libspeex/cb_search.h"
+}
+
+// hexc_table is a codebook defined in hexc_table.c, which will be linked
+// as part of the speex library. We declare it here to use it.
+extern "C" const signed char hexc_table[];
+// The size of hexc_table is 1024, as seen from hexc_10_32_table.c
+const int hexc_table_size = 1024;
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+FuzzedDataProvider provider(data, size);
+
+// Fuzz the parameters for the codebook search to explore different code paths.
+split_cb_params params;
+
+// Fuzz subvect_size. Include values that are and are not multiples of 4
+// to test both SSE and non-SSE paths in compute_weighted_codebook.
+const int subvect_size_options[] = {4, 8, 10, 16};
+params.subvect_size = provider.PickValueInArray(subvect_size_options);
+
+// The size of the codebook is (1<<shape_bits). The total size of the
+// weighted codebook is (1<<shape_bits) * subvect_size. This must be
+// less than or equal to the size of hexc_table.
+int max_codebook_size = hexc_table_size / params.subvect_size;
+if (max_codebook_size == 0) {
+return 0; // Should not happen with the chosen subvect_size values
+}
+
+// Calculate max_shape_bits = floor(log2(max_codebook_size)) using
+// robust integer arithmetic to prevent floating point precision issues.
+int max_shape_bits = 0;
+if (max_codebook_size >= 2) {
+unsigned int temp = max_codebook_size;
+while (temp > 1) {
+temp >>= 1;
+max_shape_bits++;
+}
+}
+
+if (max_shape_bits < 1) {
+return 0;
+}
+params.shape_bits = provider.ConsumeIntegralInRange<int>(1, max_shape_bits);
+
+params.nb_subvect = provider.ConsumeIntegralInRange<int>(1, 8);
+params.shape_cb = hexc_table;
+params.have_sign = provider.ConsumeBool();
+
+const int nsf = params.subvect_size * params.nb_subvect;
+const int p = provider.ConsumeIntegralInRange<int>(1, 16);
+const int complexity = provider.ConsumeIntegralInRange<int>(1, 10);
+const int update_target = provider.ConsumeBool();
+
+// Check if there is enough data to fill all the required buffers.
+const size_t required_data_size =
+(nsf * sizeof(spx_word16_t)) + // target
+(p * sizeof(spx_coef_t) * 3) + // ak, awk1, awk2
+(nsf * sizeof(spx_sig_t)) +    // exc
+(nsf * sizeof(spx_word16_t));  // r
+if (provider.remaining_bytes() < required_data_size) {
+return 0;
+}
+
+std::vector<spx_word16_t> target(nsf);
+provider.ConsumeData(target.data(), target.size() * sizeof(spx_word16_t));
+
+std::vector<spx_coef_t> ak(p);
+provider.ConsumeData(ak.data(), ak.size() * sizeof(spx_coef_t));
+
+std::vector<spx_coef_t> awk1(p);
+provider.ConsumeData(awk1.data(), awk1.size() * sizeof(spx_coef_t));
+
+std::vector<spx_coef_t> awk2(p);
+provider.ConsumeData(awk2.data(), awk2.size() * sizeof(spx_coef_t));
+
+std::vector<spx_sig_t> exc(nsf);
+provider.ConsumeData(exc.data(), exc.size() * sizeof(spx_sig_t));
+
+std::vector<spx_word16_t> r(nsf);
+provider.ConsumeData(r.data(), r.size() * sizeof(spx_word16_t));
+
+// The function uses a custom stack for internal allocations. The dynamic
+// calculation of the required size is complex and error-prone, leading to
+// crashes. As seen in `speexenc.c`, the project's own code uses a large,
+// fixed-size stack. We adopt the same robust strategy here.
+const size_t fixed_stack_size = 40000;
+std::vector<char> stack(fixed_stack_size);
+
+SpeexBits bits;
+speex_bits_init(&bits);
+
+split_cb_search_shape_sign(
+target.data(),
+ak.data(),
+awk1.data(),
+awk2.data(),
+&params,
+p,
+nsf,
+exc.data(),
+r.data(),
+&bits,
+stack.data(),
+complexity,
+update_target
+);
+
+speex_bits_destroy(&bits);
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: speex
+function signature: void split_cb_search_shape_sign(spx_word16_t *, spx_coef_t *, spx_coef_t *, spx_coef_t *, const void *, int, int, spx_sig_t *, spx_word16_t *, SpeexBits *, char *, int, int)
+</input>
+
+<description>
+The function `split_cb_search_shape_sign` is a core component of the Speex codec, responsible for searching a codebook to find the best representation of a target signal. It takes a variety of inputs, including the target signal, LPC coefficients, and codebook parameters. The function iteratively searches through subvectors of the signal, calculating the error for different codebook entries and updating the target signal and excitation buffer accordingly. The `par` argument is a void pointer that is cast to a `split_cb_params` struct, which contains crucial parameters for the codebook search, such as the subvector size, the number of subvectors, the codebook itself, the number of bits used for the codebook search, and a flag to indicate the presence of a sign bit. The complexity argument controls the depth of the search, and the `update_target` argument determines whether the target signal should be modified by the function. The function makes use of several helper functions, such as `compute_weighted_codebook`, `vq_nbest_sign`, `vq_nbest`, and `target_update`, to perform its task. The final result of the search is a set of indices that represent the best codebook entries for each subvector, which are then packed into the `SpeexBits` structure.
+</description>
+
+<requirements>
+
+<requirement>
+The `par` argument must be a valid pointer to a `split_cb_params` struct. This is because the function casts this void pointer to a `split_cb_params` pointer and accesses its members.
+</requirement>
+<requirement>
+The `subvect_size` and `nb_subvect` members of the `split_cb_params` struct should be initialized such that their product equals the `nsf` argument. This is to ensure that the entire frame is processed correctly and to avoid out-of-bounds access.
+</requirement>
+<requirement>
+The `shape_cb` member of the `split_cb_params` struct must point to a valid, initialized codebook. This is because the function uses this codebook to perform the search.
+</requirement>
+<requirement>
+The `shape_bits` member of the `split_cb_params` struct must be consistent with the size of the `shape_cb` codebook. This is because the size of the codebook is calculated as `1 << shape_bits`.
+</requirement>
+<requirement>
+The `complexity` argument should be an integer between 1 and 10. This is because the function clamps the value of `complexity` to this range.
+</requirement>
+<requirement>
+The `nsf` argument must be a multiple of the `subvect_size` from the `split_cb_params` struct. This is to ensure correct processing of the input frame in subvectors.
+</requirement>
+<requirement>
+The `p` argument, representing the number of LPC coefficients, should be less than or equal to the size of the `ak`, `awk1`, and `awk2` arrays. This is to prevent out-of-bounds access when these arrays are used.
+</requirement>
+
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+AddressSanitizer: SEGV on unknown address 0x55819acde44c (pc 0x55818fc73adf bp 0x7ffd344cf910 sp 0x7ffd344ce9a0 T0)
+==18==The signal is caused by a READ memory access.
+SCARINESS: 20 (wild-addr-read)
+#0 0x55818fc73adf in split_cb_search_shape_sign /src/speex/libspeex/cb_search.c:443:20
+#1 0x55818fc71419 in LLVMFuzzerTestOneInput /src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc:106:5
+#2 0x55818fb25340 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#3 0x55818fb24b65 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#4 0x55818fb26af2 in fuzzer::Fuzzer::ReadAndExecuteSeedCorpora(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:829:7
+#5 0x55818fb26de2 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:867:3
+#6 0x55818fb15f1b in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#7 0x55818fb412f2 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#8 0x7f63971e2082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+#9 0x55818fb0879d in _start (out/libfuzzer-address-x86_64/speex_decode_fuzzer_fixed+0x4b79d)
+
+DEDUP_TOKEN: split_cb_search_shape_sign--LLVMFuzzerTestOneInput--fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)
+AddressSanitizer can not provide additional info.
+
+</crash-stacktrace>
+
+<crash-analysis>
+**Analysis:**
+
+The crash is a segmentation fault resulting from an out-of-bounds read within the `split_cb_search_shape_sign` function in `cb_search.c:443`. The problematic line of code is:
+`g = sign * shape_cb[rind * subvect_size + m];`
+
+Using GDB, the values of the relevant variables at the time of the crash were determined:
+*   `rind = 107`
+*   `subvect_size = 10`
+*   `m = 0`
+*   `shape_cb` points to the global `hexc_table`.
+
+The memory access index is calculated as `107 * 10 + 0 = 1070`. The fuzz driver correctly notes that `hexc_table` has a size of 1024, meaning valid indices are from 0 to 1023. The access at index 1070 is therefore out of bounds.
+
+The value of `rind` is derived from the `best_index` array, which is populated by the `vq_nbest` function. The number of entries in the shape codebook (`nb_shape`) is 64 (since `shape_bits` is 6). Therefore, `vq_nbest` should only return indices in the range [0, 63]. The returned index of 107 is invalid and indicates a bug within the `vq_nbest` function's logic, as it is not respecting the bounds of the codebook it is searching. The fuzz driver correctly sets up the parameters; the bug is in the project's code.
+
+**Suggestion:**
+
+The root cause is that the `vq_nbest` function returns an out-of-range index. The function's implementation should be corrected to ensure it never returns an index greater than or equal to the `nb_shape` parameter.
+
+As a more immediate and defensive fix, a check should be added in `split_cb_search_shape_sign` immediately after the call to `vq_nbest` to validate the contents of the `best_index` array. Any index that is out of bounds (i.e., `>= nb_shape`) should be clamped or handled as an error to prevent the subsequent out-of-bounds read.
+
+Example patch for `split_cb_search_shape_sign`:
+```c
+/* Find the best candidates in the codebook */
+vq_nbest(t, resp, subvect_size, nb_shape, best_index, best_dist, nb_best, stack);
+
+/* Add a check to prevent out-of-bounds access */
+for (k=0; k<nb_best; k++)
+{
+if (best_index[k] >= nb_shape)
+{
+/* This is an invalid index, handle it gracefully.
+Forcing it to a valid index like 0 is a simple way to prevent a crash. */
+best_index[k] = 0;
+}
+}
+
+/* The rest of the function follows... */
+```
+This will prevent the crash, but a thorough review of `vq_nbest` is recommended to fix the underlying issue.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/speex/contrib/oss-fuzz/speexdec_fuzzer.cc`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>

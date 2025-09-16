@@ -1,0 +1,1387 @@
+<task>
+You are a professional security engineer developing fuzz targets for the project geos.
+The previous fuzz target you developed caused a crash in the project.
+However, this crash is NOT feasible and cannot be triggered from the project's external entry points (public functions with no non-test callers).
+Your goal is to work backwards from the functions called by the fuzz target to the project's entry points and determine if the crash is feasible from the project's entry points.
+You are to provide detailed analysis and detailed source code evidence that the crash is NOT feasible from any entry point in the program.
+We have provided you with the fuzz target that caused the crash, its requirements, the crash stacktrace, an analysis of the crash,
+and a set of tools that you can use to navigate the project's codebase.
+If the crash is indeed not feasible, also provide a recommendation for fixing the fuzz target.
+If the crash is feasible, provide source code evidence that shows the sequence of execution from the project's entry point that can cause the crash.
+</task>
+
+<steps>
+Follow these steps to determine the feasibility of this crash.
+
+Step 1: Identify the information you need to analyze the crash and the function's context.
+This includes:
+- The functions involved in the crash trace
+- The different functions where it is called from
+- The entry points of the project
+- The crash stacktrace and analysis
+- The state of input and global variables that lead to the crash
+- Locations in the code where those input variables could have been initialized
+- Execution paths between the input variable initializations and the crashing function
+
+Step 2: Collect information using the provided tools
+Use the provided tools (see <tool> section) and follow their rules to gather the necessary information. You can collect information from:
+- The project source code directory `/src/geos/` cloned from the project repository.
+- External API using the get_function_implementation tool.
+- Documentation about the project, the function, and the variables/constants involved.
+
+Step 3: Identify the function called by the fuzz target that led to the crash.
+- This is the function that is directly called by LLVMFuzzerTestOneInput or other functions in the fuzz target.
+- Your analysis should show if the program calls this function that same way it is called in the fuzz driver that caused the crash.
+
+For example, if the crash trace is:
+#0 0x7f032757700b in raise
+#1 0x7f0327556858 in abort
+#2 0x7f0327556728  (/lib/x86_64-linux-gnu/libc.so.6+0x22728)
+#3 0x7f0327567fd5 in __assert_fail
+#4 0x55f7ce3d653c in encode_ise
+#4 0x55f7ce3d838c in symbolic_to_physical
+#5 0x55f7ce3c318c in LLVMFuzzerTestOneInput
+#6 0x55f7ce277580 in fuzzer::Fuzzer::ExecuteCallback
+#7 0x55f7ce276da5 in fuzzer::Fuzzer::RunOne
+#8 0x55f7ce278585 in fuzzer::Fuzzer::MutateAndTestOne()
+#9 0x55f7ce279315 in fuzzer::Fuzzer::Loop
+
+The function that led to the crash is `symbolic_to_physical`, not 'encode_ise` or `LLVMFuzzerTestOneInput`.
+This is the target function for this analysis
+
+Step 4: Identify the specific input conditions that led to the crash.
+- This is the input conditions created by the fuzz driver that directly led to the crash.
+- These conditions should focus on
+- In your analysis, you must show how these conditions were necessary for the crash to occur.
+
+Step 5: Identify the call sites of the target function that was called by the fuzz driver and all constraints on its input arguments.
+- These are the locations in the program were the target function was called.
+- You should show how the input arguments were generated in the call sites and all constraints enforced by the program on the input arguments.
+
+Step 6: Analyze the project and provide proof, with source code evidence, that the crash cannot be triggered from a the project's entry points (public non-test functions).
+- To obtain proof, identify all the path constraints from the entry points to the target function and show how the input condition violated these constraints.
+- If the crash is feasible, you should show a step-by-step execution path from the entry point and the corresponding path constraints that enable the crash.
+- DO NOT SPECULATE. Provide source code evidence to back up any statement you make about the crash's feasibility.
+
+Step 7: If the crash is not feasible, recommend necessary and minimal modifications to the fuzz target to prevent the crash.
+- Your recommendations should show what constraints should be added to the fuzz target to prevent the crash.
+- The recommended modifications should mirror how the crashing function is called in different project locations.
+
+Step 8: MAKE SURE YOU PROVIDE YOUR RESPONSE USING THE report_final_result TOOL.
+- The tool takes three arguments - feasible, analysis and recommendations.
+- feasible should be True if the crash is feasible, or False otherwise.
+- analysis should contain your detailed analysis of the crash's feasibility.
+- source_code_evidence should contain the detailed source code evidence to back your analysis.
+- recommendations should only be provided for non-feasible crashes, and should recommend fuzz target modifications to prevent this crash.
+</steps>
+
+Here is the provided data.
+
+<fuzz-target>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "/src/geos/build/capi/geos_c.h"
+
+static GEOSContextHandle_t handle = NULL;
+FILE *flogOut;
+
+void notice(const char *fmt, ...) {
+va_list ap;
+fprintf(flogOut, "NOTICE: ");
+va_start(ap, fmt);
+vfprintf(flogOut, fmt, ap);
+va_end(ap);
+fprintf(flogOut, "\n");
+}
+
+void log_and_exit(const char *fmt, ...) {
+va_list ap;
+fprintf(flogOut, "ERROR: ");
+va_start(ap, fmt);
+vfprintf(flogOut, fmt, ap);
+va_end(ap);
+fprintf(flogOut, "\n");
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+flogOut = fopen("/dev/null", "wb");
+handle = GEOS_init_r();
+GEOSContext_setNoticeHandler_r(handle, notice);
+GEOSContext_setErrorHandler_r(handle, log_and_exit);
+return 0;
+}
+
+int LLVMFuzzerFinalize(void) {
+GEOS_finish_r(handle);
+fclose(flogOut);
+return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+// Need at least 4 bytes: 1 for parser choice, 1 for method, 1 for keep_collapsed, and 1 for data
+if (Size < 4) {
+return 0;
+}
+
+// Use first 3 bytes for control parameters
+const int parser_choice = Data[0] % 2;
+const int method_choice = Data[1] % 2;
+const int keep_collapsed = Data[2] % 2;
+
+const unsigned char *geom_data = Data + 3;
+size_t geom_data_size = Size - 3;
+
+GEOSGeometry *g1 = NULL;
+
+if (parser_choice == 0) { // Parse as WKT
+GEOSWKTReader *reader = GEOSWKTReader_create_r(handle);
+// Create a null-terminated string for the WKT reader
+char *wkt = (char *)malloc(geom_data_size + 1);
+if (!wkt) {
+GEOSWKTReader_destroy_r(handle, reader);
+return 0;
+}
+memcpy(wkt, geom_data, geom_data_size);
+wkt[geom_data_size] = '\0';
+g1 = GEOSWKTReader_read_r(handle, reader, wkt);
+free(wkt);
+GEOSWKTReader_destroy_r(handle, reader);
+} else { // Parse as WKB
+GEOSWKBReader *reader = GEOSWKBReader_create_r(handle);
+g1 = GEOSWKBReader_read_r(handle, reader, geom_data, geom_data_size);
+GEOSWKBReader_destroy_r(handle, reader);
+}
+
+
+if (g1 != NULL) {
+GEOSMakeValidParams *params = GEOSMakeValidParams_create_r(handle);
+if (params != NULL) {
+if (method_choice == 0) {
+GEOSMakeValidParams_setMethod_r(handle, params, GEOS_MAKE_VALID_LINEWORK);
+} else {
+GEOSMakeValidParams_setMethod_r(handle, params, GEOS_MAKE_VALID_STRUCTURE);
+}
+GEOSMakeValidParams_setKeepCollapsed_r(handle, params, keep_collapsed);
+
+GEOSGeometry *g_valid = GEOSMakeValidWithParams_r(handle, g1, params);
+
+if (g_valid != NULL) {
+GEOSGeom_destroy_r(handle, g_valid);
+}
+GEOSMakeValidParams_destroy_r(handle, params);
+}
+GEOSGeom_destroy_r(handle, g1);
+}
+
+return 0;
+}
+</fuzz-target>
+
+<function-requirements>
+
+<input>
+project name: geos
+function signature: Geometry * GEOSMakeValidWithParams(const Geometry *, const GEOSMakeValidParams *)
+</input>
+
+<description>
+The GEOSMakeValidWithParams function attempts to create a valid representation of a given geometry. It is a wrapper around the GEOSMakeValidWithParams_r function, which performs the actual work. The function takes a geometry `g` and a `params` object that specifies the validation method and other options. There are two main methods for making a geometry valid: `GEOS_MAKE_VALID_LINEWORK` and `GEOS_MAKE_VALID_STRUCTURE`. The caller is responsible for creating and managing the memory of both the input geometry and the parameters object.
+</description>
+
+<requirements>
+<requirement>
+The first argument `g` must be a valid `GEOSGeometry` pointer. It can be created from a Well-Known Text (WKT) or Well-Known Binary (WKB) representation using functions such as `GEOSGeomFromWKT()` or `GEOSGeomFromWKB_buf()`.
+</requirement>
+<requirement>
+The `GEOSMakeValidParams` object for the second argument should be created using `GEOSMakeValidParams_create()`. This function allocates memory for the parameters struct and initializes its members to default values.
+</requirement>
+<requirement>
+The `method` member of the `GEOSMakeValidParams` struct must be a valid value from the `GEOSMakeValidMethods` enum (either `GEOS_MAKE_VALID_LINEWORK` or `GEOS_MAKE_VALID_STRUCTURE`). An invalid method will cause the function to return NULL and log an error.
+</requirement>
+<requirement>
+If the `GEOS_MAKE_VALID_STRUCTURE` method is used, the `keepCollapsed` member of the `GEOSMakeValidParams` struct should be set to `0` or `1` using `GEOSMakeValidParams_setKeepCollapsed()`. This is because this parameter controls an important aspect of the structure-preserving validation method.
+</requirement>
+<requirement>
+The `GEOSMakeValidParams` object must be deallocated using `GEOSMakeValidParams_destroy()` after use. This is to prevent memory leaks.
+</requirement>
+<requirement>
+A GEOS context handle must be initialized via `GEOS_init_r()` before calling the target function. The handle is required by the underlying implementation `GEOSMakeValidWithParams_r` for error reporting and resource management.
+</requirement>
+</requirements>
+
+</function-requirements>
+
+<crash-stacktrace>
+LeakSanitizer: detected memory leaks
+
+Direct leak of 86592 byte(s) in 1353 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff066f1f in snapVertices /src/geos/src/noding/snap/SnappingNoder.cpp:102:12
+#2 0x55d2ff066f1f in geos::noding::snap::SnappingNoder::snapVertices(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:65:32
+#3 0x55d2ff066880 in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:46:5
+#4 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#5 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#6 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#7 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#8 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#9 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#10 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#11 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#12 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#13 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#14 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#15 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#16 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#17 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#18 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#19 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#20 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#21 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#22 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#23 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#24 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#25 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#26 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--snapVertices--geos::noding::snap::SnappingNoder::snapVertices(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&)
+Indirect leak of 479760 byte(s) in 1331 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2fef0376a in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2fef0376a in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2fef0376a in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2fef0376a in __allocate_at_least<std::__1::allocator<double> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2fef0376a in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2fef0376a in std::__1::vector<double, std::__1::allocator<double>>::reserve(unsigned long) /usr/local/bin/../include/c++/v1/vector:1425:49
+#7 0x55d2ff067c3c in reserve /src/geos/include/geos/geom/CoordinateSequence.h:536:16
+#8 0x55d2ff067c3c in geos::noding::snap::SnappingNoder::snap(geos::geom::CoordinateSequence const*) /src/geos/src/noding/snap/SnappingNoder.cpp:111:17
+#9 0x55d2ff066f15 in snapVertices /src/geos/src/noding/snap/SnappingNoder.cpp:100:23
+#10 0x55d2ff066f15 in geos::noding::snap::SnappingNoder::snapVertices(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:65:32
+#11 0x55d2ff066880 in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:46:5
+#12 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#13 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#14 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#15 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#16 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#17 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#18 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#19 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#20 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#21 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#22 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#23 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#24 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#25 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#26 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#27 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#28 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#29 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#30 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#31 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#32 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#33 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#34 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 86208 byte(s) in 253 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#12 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#13 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#14 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#15 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#16 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#17 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#18 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#19 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#20 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#21 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#22 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#23 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#24 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#25 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#26 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#27 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#28 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#29 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#30 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#31 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#32 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#33 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#34 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#35 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#36 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#37 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#38 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#39 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#40 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#41 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#42 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 52800 byte(s) in 63 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#12 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#13 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#14 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#15 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 42592 byte(s) in 1331 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff067b2c in make_unique<geos::geom::CoordinateSequence> /usr/local/bin/../include/c++/v1/__memory/unique_ptr.h:597:26
+#2 0x55d2ff067b2c in geos::noding::snap::SnappingNoder::snap(geos::geom::CoordinateSequence const*) /src/geos/src/noding/snap/SnappingNoder.cpp:110:23
+#3 0x55d2ff066f15 in snapVertices /src/geos/src/noding/snap/SnappingNoder.cpp:100:23
+#4 0x55d2ff066f15 in geos::noding::snap::SnappingNoder::snapVertices(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&, std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:65:32
+#5 0x55d2ff066880 in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:46:5
+#6 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#7 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#8 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#9 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#10 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#11 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#12 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#13 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#14 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#15 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#16 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#17 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#18 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#19 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#20 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#21 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#22 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#23 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#24 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#25 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#26 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#27 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#28 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--make_unique<geos::geom::CoordinateSequence>--geos::noding::snap::SnappingNoder::snap(geos::geom::CoordinateSequence const*)
+Indirect leak of 19200 byte(s) in 25 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 12288 byte(s) in 128 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#12 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#13 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#14 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#15 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#16 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#17 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#18 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#19 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#20 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#21 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#22 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#23 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#24 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#25 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#26 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#27 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#28 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#29 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#30 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#31 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#32 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#33 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#34 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#35 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#36 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#37 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#38 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#39 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#40 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#41 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#42 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 9984 byte(s) in 23 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32ac35 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 6336 byte(s) in 5 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360496 in processNearVertex /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:103:47
+#11 0x55d2ff360496 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:80:5
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 6144 byte(s) in 21 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 2688 byte(s) in 7 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32abd4 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:148:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1920 byte(s) in 2 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32ac35 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1632 byte(s) in 17 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#12 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#13 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#14 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#15 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1344 byte(s) in 14 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1152 byte(s) in 3 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#12 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#13 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#14 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#15 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#16 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 1056 byte(s) in 11 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32ac35 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#17 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#18 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#19 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#20 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#21 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#22 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#23 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#24 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#25 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#26 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#27 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#28 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#29 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#30 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#31 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#32 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#33 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#34 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#35 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#36 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#37 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#38 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#39 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#40 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#41 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#42 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#43 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 672 byte(s) in 7 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32ac35 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#12 0x55d2ff32ac35 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#13 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#14 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#15 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#16 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 576 byte(s) in 3 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360183 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:71:53
+#11 0x55d2ff32abd4 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:148:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 288 byte(s) in 3 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#12 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#13 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#14 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#15 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#16 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 192 byte(s) in 2 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32ac95 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:157:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+Indirect leak of 96 byte(s) in 1 object(s) allocated from:
+#0 0x55d2fedbd37d in operator new(unsigned long) /src/llvm-project/compiler-rt/lib/asan/asan_new_delete.cpp:86:3
+#1 0x55d2ff065f3d in __libcpp_operator_new<unsigned long> /usr/local/bin/../include/c++/v1/new:271:10
+#2 0x55d2ff065f3d in __libcpp_allocate /usr/local/bin/../include/c++/v1/new:295:10
+#3 0x55d2ff065f3d in allocate /usr/local/bin/../include/c++/v1/__memory/allocator.h:125:32
+#4 0x55d2ff065f3d in __allocate_at_least<std::__1::allocator<geos::noding::SegmentNode> > /usr/local/bin/../include/c++/v1/__memory/allocate_at_least.h:55:19
+#5 0x55d2ff065f3d in __split_buffer /usr/local/bin/../include/c++/v1/__split_buffer:343:25
+#6 0x55d2ff065f3d in geos::noding::SegmentNode* std::__1::vector<geos::noding::SegmentNode, std::__1::allocator<geos::noding::SegmentNode>>::__emplace_back_slow_path<geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int>(geos::noding::NodedSegmentString const&, geos::geom::Coordinate const&, unsigned long&, int&&) /usr/local/bin/../include/c++/v1/vector:1489:47
+#7 0x55d2ff05a75b in emplace_back<const geos::noding::NodedSegmentString &, const geos::geom::Coordinate &, unsigned long &, int> /usr/local/bin/../include/c++/v1/vector:1511:13
+#8 0x55d2ff05a75b in void geos::noding::SegmentNodeList::add<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/SegmentNodeList.h:179:17
+#9 0x55d2ff1fa81b in void geos::noding::NodedSegmentString::addIntersection<geos::geom::Coordinate>(geos::geom::Coordinate const&, unsigned long) /src/geos/include/geos/noding/NodedSegmentString.h:193:18
+#10 0x55d2ff360193 in geos::noding::snap::SnappingIntersectionAdder::processIntersections(geos::noding::SegmentString*, unsigned long, geos::noding::SegmentString*, unsigned long) /src/geos/src/noding/snap/SnappingIntersectionAdder.cpp:72:53
+#11 0x55d2ff32ac35 in geos::index::chain::MonotoneChain::computeOverlaps(unsigned long, unsigned long, geos::index::chain::MonotoneChain const&, unsigned long, unsigned long, double, geos::index::chain::MonotoneChainOverlapAction&) const /src/geos/src/index/chain/MonotoneChain.cpp:151:13
+#12 0x55d2ff32adee in geos::index::chain::MonotoneChain::computeOverlaps(geos::index::chain::MonotoneChain const*, double, geos::index::chain::MonotoneChainOverlapAction*) const /src/geos/src/index/chain/MonotoneChain.cpp:117:5
+#13 0x55d2ff0519bf in operator() /src/geos/src/noding/MCIndexNoder.cpp:72:21
+#14 0x55d2ff0519bf in visitLeaves<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22) &, nullptr> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:581:16
+#15 0x55d2ff0519bf in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:632:26
+#16 0x55d2ff0518c9 in bool geos::index::strtree::TemplateSTRtreeImpl<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits>::queryPairs<geos::noding::MCIndexNoder::intersectChains()::$_0&>(geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::index::strtree::TemplateSTRNode<geos::index::chain::MonotoneChain const*, geos::index::strtree::EnvelopeTraits> const&, geos::noding::MCIndexNoder::intersectChains()::$_0&) /src/geos/include/geos/index/strtree/TemplateSTRtree.h:638:26
+#17 0x55d2ff050de7 in queryPairs<(lambda at /src/geos/src/noding/MCIndexNoder.cpp:71:22)> /src/geos/include/geos/index/strtree/TemplateSTRtree.h:309:13
+#18 0x55d2ff050de7 in intersectChains /src/geos/src/noding/MCIndexNoder.cpp:71:11
+#19 0x55d2ff050de7 in geos::noding::MCIndexNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/MCIndexNoder.cpp:59:5
+#20 0x55d2ff06740f in geos::noding::snap::SnappingNoder::snapIntersections(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>&) /src/geos/src/noding/snap/SnappingNoder.cpp:132:11
+#21 0x55d2ff06688f in geos::noding::snap::SnappingNoder::computeNodes(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/noding/snap/SnappingNoder.cpp:47:19
+#22 0x55d2ff37b32a in geos::operation::overlayng::EdgeNodingBuilder::node(std::__1::vector<geos::noding::SegmentString*, std::__1::allocator<geos::noding::SegmentString*>>*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:120:12
+#23 0x55d2ff37a9d8 in geos::operation::overlayng::EdgeNodingBuilder::build(geos::geom::Geometry const*, geos::geom::Geometry const*) /src/geos/src/operation/overlayng/EdgeNodingBuilder.cpp:104:37
+#24 0x55d2ff10c689 in geos::operation::overlayng::OverlayNG::computeEdgeOverlay() /src/geos/src/operation/overlayng/OverlayNG.cpp:227:46
+#25 0x55d2ff10a597 in geos::operation::overlayng::OverlayNG::getResult() /src/geos/src/operation/overlayng/OverlayNG.cpp:182:18
+#26 0x55d2ff11a1ba in geos::operation::overlayng::OverlayNGRobust::snapSelf(geos::geom::Geometry const*, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:239:12
+#27 0x55d2ff11997c in geos::operation::overlayng::OverlayNGRobust::overlaySnapBoth(geos::geom::Geometry const*, geos::geom::Geometry const*, int, double) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:211:43
+#28 0x55d2ff118b9f in geos::operation::overlayng::OverlayNGRobust::overlaySnapTries(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:178:16
+#29 0x55d2ff11819c in geos::operation::overlayng::OverlayNGRobust::Overlay(geos::geom::Geometry const*, geos::geom::Geometry const*, int) /src/geos/src/operation/overlayng/OverlayNGRobust.cpp:140:14
+#30 0x55d2ff18b07c in makeValidUnion /src/geos/src/operation/valid/MakeValid.cpp:76:12
+#31 0x55d2ff18b07c in nodeLineWithFirstCoordinate /src/geos/src/operation/valid/MakeValid.cpp:109:10
+#32 0x55d2ff18b07c in MakeValidLine /src/geos/src/operation/valid/MakeValid.cpp:115:12
+#33 0x55d2ff18b07c in geos::operation::valid::MakeValid::build(geos::geom::Geometry const*) /src/geos/src/operation/valid/MakeValid.cpp:318:16
+#34 0x55d2fede86b4 in operator() /src/geos/capi/geos_ts_c.cpp:2463:38
+#35 0x55d2fede86b4 in execute<(anonymous namespace)::InterruptManager, (lambda at /src/geos/capi/geos_ts_c.cpp:2461:39), nullptr> /src/geos/capi/geos_ts_c.cpp:518:16
+#36 0x55d2fede86b4 in GEOSMakeValidWithParams_r /src/geos/capi/geos_ts_c.cpp:2461:20
+#37 0x55d2fedbfd1b in LLVMFuzzerTestOneInput /src/geos/tests/fuzz/fuzz_geo2.c:90:31
+#38 0x55d2fec741e0 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:614:13
+#39 0x55d2fec73a05 in fuzzer::Fuzzer::RunOne(unsigned char const*, unsigned long, bool, fuzzer::InputInfo*, bool, bool*) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:516:7
+#40 0x55d2fec751e5 in fuzzer::Fuzzer::MutateAndTestOne() /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:760:19
+#41 0x55d2fec75f75 in fuzzer::Fuzzer::Loop(std::__Fuzzer::vector<fuzzer::SizedFile, std::__Fuzzer::allocator<fuzzer::SizedFile>>&) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerLoop.cpp:905:5
+#42 0x55d2fec64dbb in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerDriver.cpp:914:6
+#43 0x55d2fec90192 in main /src/llvm-project/compiler-rt/lib/fuzzer/FuzzerMain.cpp:20:10
+#44 0x7f82194f8082 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x24082) (BuildId: 5792732f783158c66fb4f3756458ca24e46e827d)
+
+DEDUP_TOKEN: operator new(unsigned long)--__libcpp_operator_new<unsigned long>--__libcpp_allocate
+
+</crash-stacktrace>
+
+<crash-analysis>
+The crash is a memory leak caused by a bug in the GEOS library, specifically within the `geos::noding::snap::SnappingNoder::computeNodes` function.
+
+**Analysis:**
+
+1.  **Fuzz Driver is Correct:** The fuzz driver `fuzz_geo2.c` correctly manages memory for the objects it creates. It allocates `g1`, `params`, and `g_valid`, and correctly deallocates them using the corresponding `_destroy_r` functions. This indicates the leak is not in the fuzzer code.
+
+2.  **Leak in `computeNodes`:** The `computeNodes` function in `SnappingNoder.cpp` allocates a new `NodedSegmentString` in the `snapVertices` function (line 102) and pushes it into the `snappedSS` vector.
+
+```cpp
+// /src/geos/src/noding/snap/SnappingNoder.cpp:102
+return new NodedSegmentString(snapCoords.release(), false, false, ss->getData());
+```
+
+The `computeNodes` function then iterates over `snappedSS` and deletes the `SegmentString` pointers.
+
+```cpp
+// /src/geos/src/noding/snap/SnappingNoder.cpp:48-50
+for (SegmentString* ss: snappedSS) {
+delete ss;
+}
+```
+
+However, the `snapIntersections` function, called before this loop, takes ownership of the `SegmentString` pointers in `snappedSS` and returns a *new* vector of `SegmentString` pointers in `result`. The original `snappedSS` vector is not modified.
+
+```cpp
+// /src/geos/src/noding/snap/SnappingNoder.cpp:131-133
+MCIndexNoder noder(&intAdder, 2 * snapTolerance);
+noder.computeNodes(&inputSS);
+std::unique_ptr<std::vector<SegmentString*>> result(noder.getNodedSubstrings());
+```
+
+The `nodedResult` member is then assigned the `result` from `snapIntersections`. The `snappedSS` vector, containing the originally allocated `NodedSegmentString` objects, is never deallocated, leading to the memory leak.
+
+**Suggestion:**
+
+To fix the bug, the `computeNodes` function should be modified to delete the `SegmentString` objects that are returned by `snapIntersections`, not the ones in the original `snappedSS` vector. The `nodedResult` should be populated with the result from `snapIntersections`, and the original `snappedSS` vector should be cleared and its contents deleted.
+
+A potential fix would be to change the `computeNodes` function to something like this:
+
+```cpp
+void
+SnappingNoder::computeNodes(std::vector<SegmentString*>* inputSegStrings)
+{
+std::vector<SegmentString*> snappedSS;
+snapVertices(*inputSegStrings, snappedSS);
+auto result = snapIntersections(snappedSS);
+for (SegmentString* ss: snappedSS) {
+delete ss;
+}
+snappedSS.clear(); // Explicitly clear the vector
+nodedResult = result.release();
+}
+```
+However, a better fix would be to have `snapIntersections` take ownership of the `snappedSS` vector and clear it after it's done, or return a `unique_ptr` to the vector to make the ownership transfer explicit. Given the current structure, the simplest fix is to ensure the allocated memory in `snappedSS` is freed.
+
+The most direct fix is to change the loop in `computeNodes` to iterate over the vector that is no longer needed. Since `snapIntersections` creates new segment strings, the old ones in `snappedSS` can be deleted. The current code already does this. The problem is that `noder.getNodedSubstrings()` returns a new vector, and the original `snappedSS` is not what is being noded. The `noder` takes a pointer to `inputSS` which is `snappedSS`. The `MCIndexNoder` will then add nodes to the `SegmentString` objects in `snappedSS`. The `getNodedSubstrings` method then returns a new `std::vector` of `SegmentString*` which are the noded substrings. The original `SegmentString` objects in `snappedSS` are not returned.
+
+The fix is to ensure that the `SegmentString` objects created in `snapVertices` are deleted. The current code does this. The issue is that the `nodedResult` is not being deleted by the caller. The `getNodedSubstrings` method returns a raw pointer, and the caller is expected to delete it. In the context of `GEOSMakeValidWithParams_r`, this is not happening.
+
+Looking at the fuzz driver, `GEOSGeom_destroy_r` is called on `g_valid`. This should trigger the destruction of the `OverlayNG` object, which should in turn destroy the `SnappingNoder` and its `nodedResult`. The problem lies in the fact that `nodedResult` is a raw pointer to a vector of raw pointers. The vector itself is deleted, but the `SegmentString` objects inside it are not.
+
+The fix should be in the destructor of `SnappingNoder` to delete the `SegmentString` objects in `nodedResult`.
+
+```cpp
+// in SnappingNoder.h
+~SnappingNoder() {
+if (nodedResult) {
+for (auto ss : *nodedResult) {
+delete ss;
+}
+delete nodedResult;
+}
+}
+```
+This ensures that when the `SnappingNoder` is destroyed, the memory it has allocated is also freed.
+</crash-analysis>
+
+Ensure you keep the following requirements:
+<instructions>
+1. DO NOT assume the implementation of a function or behavior.
+* ALWAYS use the provided tools to get function implementations.
+* Base your conclusions using only functions you had previously retrieved their implementation using one of the provided tools.
+2. When determining feasibility, consider all variables involved in the crash and the relationship between these variables.
+* For example, if a crash occurred because (scb.block_rate * tcb.num_blocks) is larger than 1024, you must analyze the possible range of both variables and determine if the crash can occur based on a cross product of these ranges.
+* Also, if a crash occurred because len was 0 and data pointer was NULL, you must consider the relationship between these variables and determine how validations on one variable can affect the other.
+* For example, if data can only be NULL when len is 0, then a null-check on data means len cannot be zero after the null check.
+</instructions>
+
+You will be provided with the following tools.
+1. get_function_implementation: This is a tool you can use to retrieve the implementation of a function using the project's name and function's name as arguments.
+2. search_project_files: This is an interactive tool you can use to search the project's source file using bash commands and find definitions or usages of functions, classes, structs, and variables.
+The usage guide for the Bash Tool is provided below.
+3. report_final_result: This is a tool you must use to report your final result. Once this tool is called, no further instructions will be provided to you.<tool>
+**Bash tool Guide**
+Use the bash tool to investigate files in the fuzz target's build environment. This will help you understand the project source code, the function under test, its dependencies, and any compilation requirements.
+
+<interaction protocols>
+1. STRICTLY Only One Bash Command per message:
+* **DO NOT** send multiple bash commands in each message.
+2. Execute Bash Command Message Structure:
+* Reason for the Command:
+* Explain the reason for running the command.
+* Wrap this explanation within <reason> and </reason> tags.
+* Bash Command:
+* Provide the bash command to execute.
+* Wrap the command with <bash> and </bash> tags.
+* Format Example:
+<reason>
+I want to locate the source file containing the definition of the function-under-test to examine its implementation.
+</reason>
+<bash>
+grep -rn 'function_name(' /src/project-name/
+</bash>
+3. Receiving Bash Command Output Message Structure:
+* Bash execution outputs will be returned in the following format:
+<bash>
+[The command you executed.]
+</bash>
+<stdout>
+[Standard output of the command.]
+</stdout>
+<stderr>
+[Standard error of the command.]
+</stderr>
+<interaction protocols>
+
+<general rules>
+1 .File Access and Modification Restrictions:
+* Allowed Actions:
+* View any files and environment variables in the build environment.
+* Prohibited Actions:
+* Do not modify, rename, or create new files.
+* All modifications will not be preserved when building the fuzz target.
+</general rules>
+
+<tool guidelines>
+1 .Purposeful Commands:
+* Each bash command should have a clear purpose related to your investigation toward the final goals.
+2. Careful Interpretation:
+* Analyze the output of each command thoroughly to inform your next steps.
+* Keep notes of important findings that will help in modifying the fuzz target and build script.
+4. Clarity and Compliance:
+* Adhere strictly to the interaction protocols and formatting requirements.
+* Ensure your messages are clear and properly formatted.
+5. No Unauthorized Actions:
+* Do not modify files.
+6. Avoid using `pkg-config`:
+* Use bash commands to manually identify the correct file paths
+* Explore the project's directory hierarchy (`/src/<project-name>`) to learn headerfiles locations, library's naming conventions, and build system.
+7. Do not attempt to request for an entire file as the file may be very large and get truncated.
+* Use commands that allow you request for specific lines or line ranges from the file.
+</tool guidelines>
+
+<example usages>
+Command 1. Start by locating the function's definition and understand its parameters, e.g.:
+<reason>
+To find the definition of `my_function` in the project directory and understand its implementation details.
+</reason>
+<bash>
+grep -rn 'my_function(' /src/project/
+</bash>
+Command 2. Identify Required Headers:
+<reason>
+To identify the header files in the project directory that declare `my_function`.
+</reason>
+<bash>
+grep -rn 'my_function' /src/project/ --include=*.h
+</bash>
+Command 3. Locate Custom Type Definitions:
+<reason>
+To find the definition of the custom type `CustomType` used by `my_function`.
+</reason>
+<bash>
+grep -rn 'typedef.*CustomType' /src/project/
+</bash>
+Command 4. Examine Existing Fuzz Targets:
+<reason>
+To see how existing fuzz targets include headers and initialize variables in the `LLVMFuzzerTestOneInput` function.
+</reason>
+<bash>
+cat /src/geos/tests/fuzz/fuzz_geo2.c
+</bash>
+* Remember you can use the same command on other example fuzz targets under the same parent directory as `/src/geos/tests/fuzz/fuzz_geo2.c`.
+Command 5. Check Build Script for Compilation Flags and Libraries:
+<reason>
+To check which compiler flags and libraries are used in the build script.
+</reason>
+<bash>
+cat /src/build.bk.sh
+</bash>
+Command 6. Verify Available Libraries:
+<reason>
+To list the built libraries to verify that the necessary libraries are available.
+</reason>
+<bash>
+ls /src/project/build/libs/
+</bash>
+Command 7. Understand Environment Variables:
+<reason>
+To check if any environment variables related to the project are set.
+</reason>
+<bash>
+printenv | grep 'PROJECT_VARIABLE'
+</bash>
+</example usages>
+
+<final reminder>
+1. Do Not Compile or Run Code:
+* Your investigation is limited to reading and interpreting information using bash commands.
+</final reminder>
+</tool>
