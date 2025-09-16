@@ -278,22 +278,16 @@ def _fuzzing_pipeline(benchmark: Benchmark, model: models.LLM,
         Enhancer(trial=trial, llm=model, args=args)
     ]
     analysis_agents = [
-                              SemanticAnalyzer(trial=trial,
-                                               llm=model,
-                                               args=args),
-                              CoverageAnalyzer(trial=trial,
-                                               llm=model,
-                                               args=args),
-                              CrashAnalyzer(trial=trial, llm=model, args=args),
-                          ]
+        SemanticAnalyzer(trial=trial, llm=model, args=args),
+        CoverageAnalyzer(trial=trial, llm=model, args=args),
+        CrashAnalyzer(trial=trial, llm=model, args=args),
+    ]
     if model.supports_adk_agents:
       analysis_agents.append(
-
-        ContextAnalyzer(trial=trial,
-                        llm=model,
-                        args=args,
-                        benchmark=benchmark),
-      )
+          ContextAnalyzer(trial=trial,
+                          llm=model,
+                          args=args,
+                          benchmark=benchmark),)
     p = pipeline.Pipeline(args=args,
                           trial=trial,
                           writing_stage_agents=writer_agents,

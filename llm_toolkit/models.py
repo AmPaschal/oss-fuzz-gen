@@ -63,7 +63,7 @@ class LLM:
 
   _max_attempts = 5  # Maximum number of attempts to get prediction response
 
-  supports_adk_agents: bool = False # True if this LLM can be used with ADK agents
+  supports_adk_agents: bool = False  # True if this LLM can be used with ADK agents
 
   def __init__(
       self,
@@ -242,7 +242,7 @@ class GPT(LLM):
   @property
   def litellm_name(self):
     return f'openai/{self.name}'
-  
+
   def get_model(self) -> Any:
     """Returns the underlying model instance."""
     # Placeholder: No suitable implementation/usage yet.
@@ -429,6 +429,7 @@ class GPT4o(GPT):
   name = 'gpt-4o'
   MAX_INPUT_TOKEN = 128000
   _gpt_ai_model = 'gpt-4o'
+
 
 class GPT5(GPT):
   """OpenAI's GPT-5 model."""

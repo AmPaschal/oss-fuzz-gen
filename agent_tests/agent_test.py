@@ -107,14 +107,14 @@ def parse_args() -> argparse.Namespace:
                       default=100,
                       help='Max trial round for agents.')
   parser.add_argument('-td',
-                    '--template-directory',
-                    type=str,
-                    default=prompt_builder.AGENT_TEMPLATE_DIR)
+                      '--template-directory',
+                      type=str,
+                      default=prompt_builder.AGENT_TEMPLATE_DIR)
   parser.add_argument('-e',
                       '--introspector-endpoint',
                       type=str,
                       default=introspector.DEFAULT_INTROSPECTOR_ENDPOINT)
-  
+
   parser.add_argument('-l',
                       '--model',
                       default=models.DefaultModel.name,
@@ -228,9 +228,9 @@ if __name__ == '__main__':
   args = parse_args()
 
   model = models.LLM.setup(
-        ai_binary='',
-        name=args.model,
-    )
+      ai_binary='',
+      name=args.model,
+  )
 
   introspector.set_introspector_endpoints(args.introspector_endpoint)
 
@@ -240,8 +240,8 @@ if __name__ == '__main__':
   benchmarks = benchmarklib.Benchmark.from_yaml(args.benchmark_yaml)
 
   test_benchmark = [
-      benchmark for benchmark in benchmarks
-      if getattr(benchmark, 'function_name', '').lower() == args.function_name.lower()
+      benchmark for benchmark in benchmarks if getattr(
+          benchmark, 'function_name', '').lower() == args.function_name.lower()
   ]
 
   if not test_benchmark:

@@ -29,8 +29,8 @@ import requests
 from google.adk import agents, runners, sessions
 from google.adk.models.lite_llm import LiteLlm  # For multi-model support
 from google.adk.tools import ToolContext
-from google.genai import errors, types
 from google.api_core.exceptions import GoogleAPICallError
+from google.genai import errors, types
 
 import logger
 import utils
@@ -345,7 +345,7 @@ class ADKBaseAgent(BaseAgent):
     elif isinstance(llm, GPT):
       model = LiteLlm(model=llm.litellm_name)
     else:
-      raise ValueError(f'ADK Agents does not support this model yet')      
+      raise ValueError(f'ADK Agents does not support this model yet')
 
     # Create the agent using the ADK library
     adk_agent = agents.LlmAgent(
@@ -427,8 +427,10 @@ class ADKBaseAgent(BaseAgent):
 
       return final_response
 
-    return self.llm.with_retry_on_error(lambda: asyncio.run(_call()),
-                                        [errors.ClientError, GoogleAPICallError, ValueError, openai.OpenAIError, openai.RateLimitError])
+    return self.llm.with_retry_on_error(lambda: asyncio.run(_call()), [
+        errors.ClientError, GoogleAPICallError, ValueError, openai.OpenAIError,
+        openai.RateLimitError
+    ])
 
   def log_llm_prompt(self, prompt: str) -> None:
     self.round += 1

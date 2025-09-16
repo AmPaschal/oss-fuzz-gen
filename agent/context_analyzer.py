@@ -42,7 +42,8 @@ class ContextAnalyzer(base_agent.ADKBaseAgent):
                benchmark: benchmarklib.Benchmark,
                name: str = ''):
 
-    builder = prompt_builder.ContextAnalyzerTemplateBuilder(llm, benchmark, args.template_directory)
+    builder = prompt_builder.ContextAnalyzerTemplateBuilder(
+        llm, benchmark, args.template_directory)
     description = builder.get_description().gettext()
     instruction = builder.get_instruction().gettext()
     tools = [
