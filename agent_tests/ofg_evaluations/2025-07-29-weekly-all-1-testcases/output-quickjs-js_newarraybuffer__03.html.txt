@@ -1,0 +1,131 @@
+
+	
+<description>
+The `JS_NewArrayBuffer` function is a C API function in QuickJS used to create a JavaScript `ArrayBuffer` object from a C buffer. It is a wrapper around the internal `js_array_buffer_constructor3` function. It takes a `JSContext`, a pointer to a byte buffer, the buffer's length, a function pointer to a custom deallocator for the buffer, an opaque pointer that will be passed to the deallocator, and a boolean flag to indicate if the array buffer is shared.
+
+The function is used in the test262 runner (`run-test262.c`) to create a shared `ArrayBuffer` for inter-thread communication. In this usage, the buffer is obtained from an existing `ArrayBuffer` and the deallocation function is `NULL`, as the buffer's lifetime is managed by the original `ArrayBuffer`.
+
+The analysis of the function and its callees reveals several requirements for its inputs to ensure correct execution and avoid crashes. The most important one is the size of the buffer, which must not exceed `INT32_MAX`. Also, the relationship between the buffer and its size must be consistent. The custom deallocator, if provided, must be able to handle the provided buffer. Finally, to properly test the shared array buffer functionality, the runtime must be configured with the appropriate shared array buffer functions.
+</description>
+<requirements>
+<requirement>
+The `ctx` argument must be a valid `JSContext` created by `JS_NewContext`.
+This is a fundamental requirement for most QuickJS API functions, as the context holds the state of the JavaScript engine.
+</requirement>
+<requirement>
+The `len` argument must be less than or equal to `INT32_MAX`.
+The underlying function `js_array_buffer_constructor3` has a check that throws a `RangeError` if the length is greater than `INT32_MAX`.
+</requirement>
+<requirement>
+The `buf` and `len` arguments must be consistent.
+The `len` argument must represent the actual allocated size of the `buf` buffer to avoid out-of-bounds memory accesses.
+</requirement>
+<requirement>
+The `free_func` argument can be `NULL`. If not `NULL`, it must be a valid function that can deallocate the buffer passed as the `buf` argument.
+This is important for proper memory management and to avoid memory leaks or double frees.
+</requirement>
+<requirement>
+To test the shared `ArrayBuffer` functionality, `JS_SetSharedArrayBufferFunctions` should be called on the runtime associated with the context.
+If the `sab_dup` function is not set, the shared buffer duplication logic will be skipped, leading to incomplete testing of the shared array buffer functionality.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+JSValue JS_NewArrayBuffer(JSContext *, uint8_t *, size_t, JSFreeArrayBufferDataFunc *, void *, BOOL)
+</function_signature>
+<project_name>
+quickjs
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+
+#include "/src/quickjs/quickjs.h"
+#include "/src/quickjs/quickjs-libc.h"
+#include "/src/quickjs/cutils.h"
+
+static JSRuntime *rt = NULL;
+static JSContext *ctx = NULL;
+
+// Dummy implementations for shared array buffer functions
+static void *sab_alloc(void *opaque, size_t size) {
+    return malloc(size);
+}
+
+static void sab_free(void *opaque, void *ptr) {
+    free(ptr);
+}
+
+static void sab_dup(void *opaque, void *ptr) {
+    // Not needed for this fuzz target
+}
+
+static void my_free_func(JSRuntime *rt, void *opaque, void *ptr) {
+    free(ptr);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (rt == NULL) {
+        rt = JS_NewRuntime();
+        if (!rt)
+            return 0;
+        // Set a memory limit to prevent OOM crashes
+        JS_SetMemoryLimit(rt, 128 * 1024 * 1024);
+        
+        // Set up shared array buffer functions
+        JSSharedArrayBufferFunctions sf;
+        memset(&sf, 0, sizeof(sf));
+        sf.sab_alloc = sab_alloc;
+        sf.sab_free = sab_free;
+        sf.sab_dup = sab_dup;
+        JS_SetSharedArrayBufferFunctions(rt, &sf);
+
+        ctx = JS_NewContext(rt);
+        if (!ctx) {
+            JS_FreeRuntime(rt);
+            rt = NULL;
+            return 0;
+        }
+    }
+
+    if (size < 1) {
+        return 0;
+    }
+
+    BOOL is_shared = data[0] & 1;
+    uint8_t *buf_data = (uint8_t *)data + 1;
+    size_t buf_size = size - 1;
+
+    // The length must not exceed INT32_MAX
+    if (buf_size > INT32_MAX) {
+        buf_size = INT32_MAX;
+    }
+
+    // To avoid QuickJS attempting to free the fuzzer's constant input buffer,
+    // we allocate a new buffer and copy the data. We then provide a custom
+    // free function to release this buffer.
+    uint8_t *fuzz_buf = malloc(buf_size);
+    if (!fuzz_buf) {
+        return 0;
+    }
+    memcpy(fuzz_buf, buf_data, buf_size);
+
+    JSValue val = JS_NewArrayBuffer(ctx, fuzz_buf, buf_size, my_free_func, NULL, is_shared);
+
+    if (!JS_IsException(val)) {
+        JS_FreeValue(ctx, val);
+    } else {
+        // The buffer is not adopted on exception, so we must free it here.
+        free(fuzz_buf);
+        JSValue ex = JS_GetException(ctx);
+        JS_FreeValue(ctx, ex);
+    }
+
+    return 0;
+}
+	

@@ -1,0 +1,122 @@
+
+	
+<description>
+The `jq_util_input_next_input` function is responsible for reading and parsing the next JSON object from the input stream. It can handle both raw and parsed input, and it can also slurp the entire input into a single jv object. The function's behavior is primarily controlled by the state object, which is initialized in the `main` function and configured based on the command-line arguments.
+</description>
+<requirements>
+<requirement>
+The `jq_util_input_state` object should be initialized by calling `jq_util_input_init(NULL, NULL)`. This is the standard way to initialize the struct as seen in `main.c`.
+</requirement>
+<requirement>
+The `current_input` member of the `jq_util_input_state` struct should be a valid `FILE` pointer. The function `jq_util_input_read_more`, which is called by the target function, will attempt to read from this file pointer, so it must be valid to avoid crashes.
+</requirement>
+<requirement>
+The `parser` member of the `jq_util_input_state` struct can be either `NULL` or a valid pointer to a `jv_parser` struct. To test both raw and parsed input scenarios, the fuzzer should be able to set this member to both `NULL` and a valid parser created with `jv_parser_new()`.
+</requirement>
+<requirement>
+The `slurped` member of `jq_util_input_state` should be a valid `jv` object. When slurping is enabled, all input is read into this member, so it must be properly initialized to avoid memory corruption.
+</requirement>
+<requirement>
+The `buf_valid_len` member should always be less than or equal to the size of `buf`, which is 4096. This is crucial to prevent buffer overflows when the function accesses the `buf` array.
+</requirement>
+<requirement>
+The content of the file pointed to by `current_input` should be fuzzed. This is the primary source of input for the function, and fuzzing its content will effectively test the function's parsing and processing logic.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+jv jq_util_input_next_input(jq_util_input_state *)
+</function_signature>
+<project_name>
+jq
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "/src/jq/src/jq.h"
+#include "jv.h"
+
+// This is the intended callback for jq_set_input_cb
+jv jq_util_input_next_input_cb(jq_state *jq, void *data);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1) {
+    return 0;
+  }
+
+  const uint8_t options = data[0];
+  const uint8_t *input_data = data + 1;
+  const size_t input_size = size - 1;
+
+  if (input_size == 0) {
+    return 0;
+  }
+
+  // Create a temporary file to hold the fuzzer input
+  char temp_filename[] = "/tmp/jq_fuzz_input-XXXXXX";
+  int fd = mkstemp(temp_filename);
+  if (fd < 0) {
+    return 0;
+  }
+  
+  // Write the fuzzer data to the temporary file
+  FILE *temp_file = fdopen(fd, "w");
+  if (!temp_file) {
+    close(fd);
+    unlink(temp_filename);
+    return 0;
+  }
+  fwrite(input_data, 1, input_size, temp_file);
+  fclose(temp_file);
+
+  jq_state *jq = jq_init();
+  if (!jq) {
+    unlink(temp_filename);
+    return 0;
+  }
+
+  jq_util_input_state *input_state = jq_util_input_init(NULL, NULL);
+  if (!input_state) {
+    jq_teardown(&jq);
+    unlink(temp_filename);
+    return 0;
+  }
+  
+  // Use the public API to add the temporary file as an input source
+  jq_util_input_add_input(input_state, temp_filename);
+
+  // Decide whether to use a parser based on fuzzer input.
+  if (options & 0x01) {
+    int parser_flags = (options & 0x02) ? JV_PARSE_SEQ : 0;
+    jq_util_input_set_parser(input_state, jv_parser_new(parser_flags), (options & 0x04) ? 1 : 0);
+  } else {
+    jq_util_input_set_parser(input_state, NULL, (options & 0x04) ? 1 : 0);
+  }
+
+  // Set the input callback, which will indirectly call our target function.
+  jq_set_input_cb(jq, jq_util_input_next_input_cb, input_state);
+
+  // Compile a simple program to drive the input.
+  if (jq_compile(jq, ".")) {
+    // Repeatedly call jq_next to trigger the input callback.
+    jv result;
+    while (jv_is_valid(result = jq_next(jq))) {
+      jv_free(result);
+    }
+    jv_free(result); // Free the final invalid value.
+  }
+
+  jq_teardown(&jq);
+  jq_util_input_free(&input_state);
+  unlink(temp_filename); // Clean up the temporary file
+
+  return 0;
+}
+	

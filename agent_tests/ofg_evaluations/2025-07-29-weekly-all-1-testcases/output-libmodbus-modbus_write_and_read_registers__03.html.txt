@@ -1,0 +1,202 @@
+
+	
+<description>
+The function `modbus_write_and_read_registers` writes a block of contiguous registers and reads another block of contiguous registers in a single transaction. It takes a pointer to a `modbus_t` context, the write and read starting addresses, the number of registers to write and read, a pointer to the data to write, and a pointer to a location to store the read data.
+</description>
+<requirements>
+
+<requirement>
+The first argument, a pointer to a modbus_t object, must not be NULL. This is because the function will crash if it tries to dereference a NULL pointer.
+</requirement>
+<requirement>
+The `write_nb` argument must be greater than 0 and less than or equal to MODBUS_MAX_WR_WRITE_REGISTERS (121). This is to prevent a buffer overflow when writing the registers.
+</requirement>
+<requirement>
+The `read_nb` argument must be greater than 0 and less than or equal to MODBUS_MAX_WR_READ_REGISTERS (125). This is to prevent a buffer overflow when reading the registers.
+</requirement>
+<requirement>
+The `src` argument must be a valid pointer to an array of uint16_t of at least `write_nb` elements. This is because the function reads `write_nb` elements from this array.
+</requirement>
+<requirement>
+The `dest` argument must be a valid pointer to an array of uint16_t of at least `read_nb` elements. This is because the function writes `read_nb` elements to this array.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_write_and_read_registers(modbus_t *, int, int, const uint16_t *, int, int, uint16_t *)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/src/modbus.h"
+#include "unit-test.h"
+
+#define PORT 8080
+#define kMinInputLength sizeof(FuzzParams)
+#define kMaxInputLength MODBUS_RTU_MAX_ADU_LENGTH
+
+struct Fuzzer {
+  uint16_t port;
+  char *file;
+
+  const uint8_t *buffer;
+  size_t size;
+
+  pthread_t thread;
+  int socket;
+};
+typedef struct Fuzzer Fuzzer;
+
+// Struct to hold parameters extracted from fuzzer data
+typedef struct {
+  int write_addr;
+  int write_nb;
+  int read_addr;
+  int read_nb;
+} FuzzParams;
+
+int client(Fuzzer *fuzzer);
+
+void fuzzinit(Fuzzer *fuzzer) {
+  struct sockaddr_in server_addr;
+  fuzzer->socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(fuzzer->port);
+  server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  setsockopt(fuzzer->socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+  bind(fuzzer->socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  listen(fuzzer->socket, 1);
+}
+
+void *Server(void *args) {
+
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  {
+    int client;
+    char clientData[10240];
+    struct sockaddr_in clientAddr;
+    uint32_t clientSZ = sizeof(clientAddr);
+
+    client = accept(fuzzer->socket, (struct sockaddr *)&clientAddr, &clientSZ);
+
+    // The server needs to handle the combined write-read request.
+    // A simple echo of the input should be sufficient for the client
+    // to parse a response, even if it's not a valid modbus response.
+    // The client-side parsing is what we are fuzzing.
+    recv(client, clientData, sizeof(clientData), 0);
+    send(client, fuzzer->buffer, fuzzer->size, 0);
+
+    shutdown(client, SHUT_RDWR);
+    close(client);
+  }
+  pthread_exit(NULL);
+}
+
+void clean(Fuzzer *fuzzer) {
+  { // Server
+    shutdown(fuzzer->socket, SHUT_RDWR);
+    close(fuzzer->socket);
+  }
+  free(fuzzer);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+  if (size < kMinInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  fuzzinit(fuzzer);
+
+  pthread_create(&fuzzer->thread, NULL, Server, fuzzer);
+  client(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* To Avoid UAF*/
+
+  clean(fuzzer);
+  return 0;
+}
+
+int client(Fuzzer *fuzzer) {
+  modbus_t *ctx = NULL;
+  int rc = 0;
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+  if (ctx == NULL) {
+    return -1;
+  }
+
+  // Set a response timeout to prevent the fuzzer from hanging
+  modbus_set_response_timeout(ctx, 0, 200000); // 0.2 seconds
+
+  if (modbus_connect(ctx) == -1) {
+    modbus_free(ctx);
+    return -1;
+  }
+
+  // Extract parameters from the fuzzing data
+  const FuzzParams *params = (const FuzzParams *)fuzzer->buffer;
+
+  // Constrain write_nb and read_nb based on requirements
+  int write_nb = (params->write_nb % (MODBUS_MAX_WR_WRITE_REGISTERS + 1));
+  if (write_nb == 0) {
+    write_nb = 1;
+  }
+
+  int read_nb = (params->read_nb % (MODBUS_MAX_WR_READ_REGISTERS + 1));
+  if (read_nb == 0) {
+    read_nb = 1;
+  }
+
+  int write_addr = params->write_addr;
+  int read_addr = params->read_addr;
+
+  // Ensure there is enough data for the src buffer
+  size_t data_offset = sizeof(FuzzParams);
+  if (fuzzer->size < data_offset + (size_t)write_nb * sizeof(uint16_t)) {
+    goto cleanup;
+  }
+
+  const uint16_t *src = (const uint16_t *)(fuzzer->buffer + data_offset);
+
+  // Allocate destination buffer for read data
+  uint16_t *dest = (uint16_t *)malloc(read_nb * sizeof(uint16_t));
+  if (dest == NULL) {
+    goto cleanup;
+  }
+
+  // Call the function under test
+  rc = modbus_write_and_read_registers(ctx, write_addr, write_nb, src, read_addr, read_nb, dest);
+
+  free(dest);
+
+cleanup:
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return rc;
+}
+	

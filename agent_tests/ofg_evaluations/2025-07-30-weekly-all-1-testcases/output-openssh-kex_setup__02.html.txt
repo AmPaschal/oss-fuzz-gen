@@ -1,0 +1,213 @@
+
+	
+<description>
+The kex_setup function is used to set up the key exchange for an SSH connection. It takes a pointer to a ssh structure and an array of strings representing the cryptographic proposals for the connection. The function first calls kex_ready to prepare the kex structure and then kex_send_kexinit to send the key exchange initialization packet to the remote peer. If either of these steps fails, the function will clean up and return an error. The ssh structure must be initialized before calling this function, typically by using ssh_packet_set_connection. The proposal array must be of size PROPOSAL_MAX (10) and contain valid, null-terminated strings that specify the desired cryptographic algorithms for key exchange, host key, encryption, and MAC.
+</description>
+<requirements>
+
+<requirement>
+The first argument, a pointer to a struct ssh, must be initialized by calling ssh_packet_set_connection. This function allocates and initializes the necessary memory for the ssh structure, which is essential for the kex_setup function to operate correctly.
+</requirement>
+<requirement>
+The second argument, proposal, must be an array of 10 null-terminated strings. This is because the code uses a fixed-size array of size PROPOSAL_MAX, which is defined as 10 in kex.h, and the elements are expected to be strings.
+</requirement>
+<requirement>
+The elements of the proposal array should be initialized with the values from the KEX_CLIENT macro defined in myproposal.h. This ensures that the proposal contains a valid set of default cryptographic algorithms that are supported by the library.
+</requirement>
+<requirement>
+The ssh->kex pointer should be initialized before calling kex_setup. This is because kex_free is called on ssh->kex if kex_send_kexinit fails, and a dangling pointer would lead to a crash.
+</requirement>
+<requirement>
+The value of proposal[PROPOSAL_SERVER_HOST_KEY_ALGS] must be a null-terminated string containing a comma-separated list of supported host key algorithms. This is because the string is parsed by the server to negotiate the host key algorithm.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_setup(struct ssh *, char **)
+</function_signature>
+<project_name>
+openssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <string>
+#include <vector>
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern "C" {
+#include "includes.h"
+#include "ssh_api.h"
+#include "kex.h"
+#include "log.h"
+#include "sshkey.h"
+#include "xmalloc.h"
+#include "myproposal.h"
+#include "sshbuf.h"
+
+#include "fixed-keys.h"
+
+/*
+ * The following key management functions are adapted from the existing
+ * kex_fuzz.cc harness to provide pre-defined host keys for testing.
+ */
+struct shared_state {
+	size_t nkeys;
+	struct sshkey **privkeys, **pubkeys;
+};
+
+static void
+store_key(struct shared_state *st, struct sshkey *pubkey,
+    struct sshkey *privkey)
+{
+	if (st == NULL || pubkey->type < 0 || pubkey->type > INT_MAX ||
+	    privkey->type != pubkey->type ||
+	    ((size_t)pubkey->type < st->nkeys &&
+	    st->pubkeys[pubkey->type] != NULL))
+		abort();
+	if ((size_t)pubkey->type >= st->nkeys) {
+		st->pubkeys = (struct sshkey **)xrecallocarray(st->pubkeys,
+		    st->nkeys, pubkey->type + 1, sizeof(*st->pubkeys));
+		st->privkeys = (struct sshkey **)xrecallocarray(st->privkeys,
+		    st->nkeys, privkey->type + 1, sizeof(*st->privkeys));
+		st->nkeys = privkey->type + 1;
+	}
+	st->pubkeys[pubkey->type] = pubkey;
+	st->privkeys[privkey->type] = privkey;
+}
+
+static int
+prepare_key(struct shared_state *st, int kt)
+{
+	const char *pubstr = NULL, *privstr = NULL;
+	char *tmp, *cp;
+	struct sshkey *privkey = NULL, *pubkey = NULL;
+	struct sshbuf *b = NULL;
+	int r;
+
+	switch (kt) {
+	case KEY_RSA:
+		pubstr = PUB_RSA;
+		privstr = PRIV_RSA;
+		break;
+	case KEY_ECDSA:
+		pubstr = PUB_ECDSA;
+		privstr = PRIV_ECDSA;
+		break;
+	case KEY_ED25519:
+		pubstr = PUB_ED25519;
+		privstr = PRIV_ED25519;
+		break;
+	default:
+		abort();
+	}
+	if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+		abort();
+	if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0)
+		abort();
+	sshbuf_free(b);
+	tmp = cp = xstrdup(pubstr);
+	if ((pubkey = sshkey_new(KEY_UNSPEC)) == NULL)
+		abort();
+	if ((r = sshkey_read(pubkey, &cp)) != 0)
+		abort();
+	free(tmp);
+
+	store_key(st, pubkey, privkey);
+	return 0;
+}
+
+static int
+prepare_keys(struct shared_state *st)
+{
+	if (prepare_key(st, KEY_RSA) != 0 ||
+	    prepare_key(st, KEY_ECDSA) != 0 ||
+	    prepare_key(st, KEY_ED25519) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static struct sshkey *
+get_pubkey(struct shared_state *st, int keytype)
+{
+	if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys ||
+	    st->pubkeys == NULL || st->pubkeys[keytype] == NULL)
+		abort();
+	return st->pubkeys[keytype];
+}
+
+static struct sshkey *
+get_privkey(struct shared_state *st, int keytype)
+{
+	if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys ||
+	    st->privkeys == NULL || st->privkeys[keytype] == NULL)
+		abort();
+	return st->privkeys[keytype];
+}
+
+static struct shared_state *st = NULL;
+
+static void
+initialize_state(void)
+{
+	if (st == NULL) {
+		log_init("kex_fuzz", SYSLOG_LEVEL_QUIET,
+		    SYSLOG_FACILITY_AUTH, 1);
+		st = (struct shared_state *)xcalloc(1, sizeof(*st));
+		if (prepare_keys(st) != 0)
+			abort();
+	}
+}
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	FuzzedDataProvider provider(data, size);
+	initialize_state();
+
+	char *proposal[PROPOSAL_MAX];
+	std::vector<std::string> proposal_backing_store;
+	proposal_backing_store.reserve(PROPOSAL_MAX);
+
+	for (size_t i = 0; i < PROPOSAL_MAX; i++) {
+		proposal_backing_store.push_back(
+		    provider.ConsumeRandomLengthString(256));
+		proposal[i] = (char *)proposal_backing_store.back().c_str();
+	}
+
+	struct kex_params kex_params;
+	memcpy(kex_params.proposal, proposal, sizeof(kex_params.proposal));
+
+	struct ssh *ssh = NULL;
+	const bool is_server = provider.ConsumeBool();
+
+	if (ssh_init(&ssh, is_server, &kex_params) != 0)
+		return 0;
+
+	const int key_types[] = {KEY_RSA, KEY_ECDSA, KEY_ED25519};
+	const int key_type = provider.PickValueInArray(key_types);
+	struct sshkey *hostkey = is_server ?
+	    get_privkey(st, key_type) : get_pubkey(st, key_type);
+
+	if (ssh_add_hostkey(ssh, hostkey) != 0) {
+		ssh_free(ssh);
+		return 0;
+	}
+
+	kex_setup(ssh, proposal);
+
+	ssh_free(ssh);
+	return 0;
+}
+
+} // extern "C"
+	

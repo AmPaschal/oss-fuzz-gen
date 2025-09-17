@@ -1,0 +1,264 @@
+
+	
+<description>
+The `mbedtls_ssl_write_early_data` function is used by a TLS 1.3 client to send data to the server before the handshake is fully complete. This is only possible if the client is resuming a session and the server has indicated that it will accept early data. The function will attempt to send the provided data, but may not be able to if the server rejects early data, the maximum amount of early data has been sent, or the handshake has progressed past the point where early data is allowed. The caller must be prepared to handle the `MBEDTLS_ERR_SSL_CANNOT_WRITE_EARLY_DATA` error and fall back to a normal handshake.
+</description>
+<requirements>
+
+<requirement>
+The `mbedtls_ssl_context` must be configured as a client with TLS 1.3 and early data enabled. This is done by calling `mbedtls_ssl_config_defaults`, `mbedtls_ssl_conf_min_tls_version`, `mbedtls_ssl_conf_max_tls_version`, and `mbedtls_ssl_conf_early_data` on the associated `mbedtls_ssl_config` structure.
+</requirement>
+<requirement>
+A valid session with a PSK and an indication that the server accepts early data must be loaded into the context using `mbedtls_ssl_set_session`. This session is obtained from a previous successful TLS 1.3 handshake.
+</requirement>
+<requirement>
+The transport type must be stream-based (MBEDTLS_SSL_TRANSPORT_STREAM). The function will return an error if the transport type is datagram-based.
+</requirement>
+<requirement>
+The `buf` parameter should be a valid pointer to a buffer of at least `len` bytes, or NULL if `len` is 0. This buffer contains the application data to be sent and can be fuzzed.
+</requirement>
+<requirement>
+The `len` parameter specifies the number of bytes to send from `buf`. This value can be 0. The actual number of bytes sent may be less than `len` if the maximum early data size for the session is exceeded.
+</requirement>
+<requirement>
+The caller must be prepared to handle the `MBEDTLS_ERR_SSL_CANNOT_WRITE_EARLY_DATA` return code. This indicates that early data cannot be sent at the current time, and the application should proceed with a regular handshake using `mbedtls_ssl_handshake`.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mbedtls_ssl_write_early_data(mbedtls_ssl_context *, const unsigned char *, size_t)
+</function_signature>
+<project_name>
+mbedtls
+</project_name>
+
+	Fuzz target source:
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ssl.h"
+#include "test/certs.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Start of inlined common.h and common.c content */
+
+typedef struct {
+  const uint8_t *Data;
+  size_t Size;
+  size_t Offset;
+} fuzzBufferOffset_t;
+
+int dummy_init(void);
+int dummy_entropy(void *data, unsigned char *output, size_t len);
+int dummy_random(void *p_rng, unsigned char *output, size_t output_len);
+int dummy_send(void *ctx, const unsigned char *buf, size_t len);
+int fuzz_recv(void *ctx, unsigned char *buf, size_t len);
+
+static int dummy_initialized = 0;
+
+int dummy_init(void) {
+  dummy_initialized = 1;
+  return 0;
+}
+
+int dummy_entropy(void *data, unsigned char *output, size_t len) {
+  (void)data;
+  memset(output, 0x2a, len);
+  return 0;
+}
+
+int dummy_random(void *p_rng, unsigned char *output, size_t output_len) {
+  (void)p_rng;
+  size_t i;
+  for (i = 0; i < output_len; i++) {
+    output[i] = (unsigned char)rand();
+  }
+  return 0;
+}
+
+int dummy_send(void *ctx, const unsigned char *buf, size_t len) {
+  (void)ctx;
+  (void)buf;
+  (void)len;
+  if (dummy_initialized == 0) {
+    dummy_init();
+  }
+  return len;
+}
+
+int fuzz_recv(void *ctx, unsigned char *buf, size_t len) {
+  fuzzBufferOffset_t *biomem = (fuzzBufferOffset_t *)ctx;
+  if (biomem->Size == 0) {
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+  if (len > biomem->Size - biomem->Offset) {
+    len = biomem->Size - biomem->Offset;
+  }
+  if (len > 0) {
+    memcpy(buf, biomem->Data + biomem->Offset, len);
+    biomem->Offset += len;
+  }
+  return len;
+}
+
+/* End of inlined common.h and common.c content */
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+
+#if defined(MBEDTLS_SSL_CLI_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C) && defined(MBEDTLS_SSL_PROTO_TLS1_3) && defined(MBEDTLS_SSL_EARLY_DATA) && defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+
+static int initialized = 0;
+static mbedtls_x509_crt cacert;
+const char *pers = "fuzz_client_early_data";
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+  if (initialized == 0) {
+    mbedtls_x509_crt_init(&cacert);
+    if (mbedtls_x509_crt_parse(&cacert, (const unsigned char *)mbedtls_test_cas_pem, mbedtls_test_cas_pem_len) != 0) {
+      return 1;
+    }
+    dummy_init();
+    initialized = 1;
+  }
+
+  if (Size < 4) {
+    return 0;
+  }
+  const size_t bio1_size = (Data[0] << 8 | Data[1]) % (Size / 2 + 1);
+  const size_t early_data_len = (Data[2] << 8 | Data[3]) % (Size / 2 + 1);
+  if (bio1_size + early_data_len >= Size) {
+    return 0;
+  }
+  const uint8_t *early_data_buf = Data + bio1_size;
+  const uint8_t *bio2_data = Data + bio1_size + early_data_len;
+  const size_t bio2_size = Size - bio1_size - early_data_len;
+
+  fuzzBufferOffset_t bio1, bio2;
+  bio1.Data = Data;
+  bio1.Size = bio1_size;
+  bio1.Offset = 0;
+
+  bio2.Data = bio2_data;
+  bio2.Size = bio2_size;
+  bio2.Offset = 0;
+
+  mbedtls_ssl_session saved_session;
+  mbedtls_ssl_session_init(&saved_session);
+
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  mbedtls_entropy_init(&entropy);
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) {
+    goto cleanup_crypto;
+  }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+  if (mbedtls_ctr_drbg_seed(&ctr_drbg, dummy_entropy, &entropy, (const unsigned char *)pers, strlen(pers)) != 0) {
+    goto cleanup_crypto;
+  }
+
+  /* Stage 1: Perform a handshake to get a session */
+  {
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+
+    if (mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+      mbedtls_ssl_config_free(&conf);
+      mbedtls_ssl_free(&ssl);
+      goto cleanup_crypto;
+    }
+
+    mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+    mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+
+    if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+      mbedtls_ssl_config_free(&conf);
+      mbedtls_ssl_free(&ssl);
+      goto cleanup_crypto;
+    }
+
+    mbedtls_ssl_set_bio(&ssl, &bio1, dummy_send, fuzz_recv, NULL);
+
+    if (mbedtls_ssl_handshake(&ssl) == 0) {
+      mbedtls_ssl_get_session(&ssl, &saved_session);
+    }
+
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ssl_free(&ssl);
+  }
+
+  /* Stage 2: Use the session to attempt sending early data */
+  {
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+
+    if (mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+      mbedtls_ssl_config_free(&conf);
+      mbedtls_ssl_free(&ssl);
+      goto cleanup_session;
+    }
+
+    mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+    mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_early_data(&conf, MBEDTLS_SSL_EARLY_DATA_ENABLED);
+
+    if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+      mbedtls_ssl_config_free(&conf);
+      mbedtls_ssl_free(&ssl);
+      goto cleanup_session;
+    }
+
+    if (mbedtls_ssl_set_session(&ssl, &saved_session) != 0) {
+      mbedtls_ssl_config_free(&conf);
+      mbedtls_ssl_free(&ssl);
+      goto cleanup_session;
+    }
+
+    mbedtls_ssl_set_bio(&ssl, &bio2, dummy_send, fuzz_recv, NULL);
+
+    /* --- Call the function under test --- */
+    int ret = mbedtls_ssl_write_early_data(&ssl, early_data_buf, early_data_len);
+    (void)ret;
+
+    /* Always attempt to complete the handshake */
+    mbedtls_ssl_handshake(&ssl);
+
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ssl_free(&ssl);
+  }
+
+cleanup_session:
+  mbedtls_ssl_session_free(&saved_session);
+cleanup_crypto:
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  mbedtls_psa_crypto_free();
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+  mbedtls_entropy_free(&entropy);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+
+  return 0;
+}
+#else
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+  (void)Data;
+  (void)Size;
+  return 0;
+}
+#endif /* MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && ... */
+	

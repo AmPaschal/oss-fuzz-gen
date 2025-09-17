@@ -1,0 +1,205 @@
+
+	
+<description>
+The function `modbus_write_and_read_registers` writes a block of contiguous registers and reads another block of contiguous registers in a single transaction. It takes a pointer to a `modbus_t` context object, the starting address to write to, the number of registers to write, a pointer to the data to write, the starting address to read from, the number of registers to read, and a pointer to a buffer to store the read data.
+</description>
+<requirements>
+<requirement>
+The `write_nb` argument must be greater than 0 and less than or equal to 121. This is to prevent an error (`EMBMDATA`) from being returned by the function.
+</requirement>
+<requirement>
+The `read_nb` argument must be greater than 0 and less than or equal to 125. This is to prevent an error (`EMBMDATA`) from being returned by the function.
+</requirement>
+<requirement>
+The `src` argument must be a valid pointer to an array of `uint16_t` with a size of at least `write_nb`. This is to prevent a segmentation fault when the function attempts to access the data to be written.
+</requirement>
+<requirement>
+The `dest` argument must be a valid pointer to an array of `uint16_t` with a size of at least `read_nb`. This is to prevent a segmentation fault when the function attempts to store the read data.
+</requirement>
+<requirement>
+The `ctx` argument should be a valid `modbus_t` context, initialized by calling `modbus_new_tcp`, `modbus_new_tcp_pi`, or `modbus_new_rtu`. A connection must be established using `modbus_connect` before calling this function.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_write_and_read_registers(modbus_t *ctx, int write_addr, int write_nb, const uint16_t *src, int read_addr, int read_nb, uint16_t *dest)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+/* Copyright 2022 Google LLC
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+      http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/src/modbus.h"
+#include "unit-test.h"
+
+#define PORT 8080
+#define kMinInputLength 16
+#define kMaxInputLength MODBUS_RTU_MAX_ADU_LENGTH
+
+struct Fuzzer {
+  uint16_t port;
+  char *file;
+
+  FILE *inFile;
+  uint64_t size;
+  const uint8_t *buffer;
+
+  pthread_t thread;
+  int socket;
+};
+typedef struct Fuzzer Fuzzer;
+
+int client(Fuzzer *fuzzer);
+
+void fuzzinit(Fuzzer *fuzzer) {
+  struct sockaddr_in server_addr;
+  fuzzer->socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(fuzzer->port);
+  server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  setsockopt(fuzzer->socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+  bind(fuzzer->socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  listen(fuzzer->socket, 1);
+}
+
+void *Server(void *args) {
+
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  {
+    int client_socket;
+    char clientData[10240];
+    struct sockaddr_in clientAddr;
+    uint32_t clientSZ = sizeof(clientAddr);
+
+    client_socket = accept(fuzzer->socket, (struct sockaddr *)&clientAddr, &clientSZ);
+    if (client_socket < 0) {
+        pthread_exit(NULL);
+    }
+
+    /* Receive request from client */
+    ssize_t req_len = recv(client_socket, clientData, sizeof(clientData), 0);
+    if (req_len > 0) {
+        /* Send a response back. Use the fuzzer input as a canned response. */
+        send(client_socket, fuzzer->buffer, fuzzer->size, 0);
+    }
+
+    shutdown(client_socket, SHUT_RDWR);
+    close(client_socket);
+  }
+  pthread_exit(NULL);
+}
+
+void clean(Fuzzer *fuzzer) {
+  { // Server
+    shutdown(fuzzer->socket, SHUT_RDWR);
+    close(fuzzer->socket);
+  }
+  free(fuzzer);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  fuzzinit(fuzzer);
+
+  pthread_create(&fuzzer->thread, NULL, Server, fuzzer);
+  client(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* To Avoid UAF*/
+
+  clean(fuzzer);
+  return 0;
+}
+
+/* Function prototype as requested */
+int modbus_write_and_read_registers(modbus_t *, int, int, const uint16_t *, int, int, uint16_t *);
+
+int client(Fuzzer *fuzzer) {
+
+  modbus_t *ctx = NULL;
+  int rc;
+
+  struct FuzzParams {
+    int write_addr;
+    int write_nb;
+    int read_addr;
+    int read_nb;
+  };
+
+  const struct FuzzParams *params = (const struct FuzzParams *)fuzzer->buffer;
+  
+  /* Constrain write_nb and read_nb to valid ranges to avoid trivial errors */
+  int write_nb = (params->write_nb % 121) + 1;
+  int read_nb = (params->read_nb % 125) + 1;
+
+  if (fuzzer->size < sizeof(struct FuzzParams) + (size_t)write_nb * sizeof(uint16_t)) {
+    return -1;
+  }
+
+  const uint16_t *src = (const uint16_t *)(fuzzer->buffer + sizeof(struct FuzzParams));
+  
+  uint16_t *dest = (uint16_t *)malloc((size_t)read_nb * sizeof(uint16_t));
+  if (dest == NULL) {
+    return -1;
+  }
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+  if (ctx == NULL) {
+    fprintf(stderr, "Unable to allocate libmodbus context\n");
+    free(dest);
+    return -1;
+  }
+
+  if (modbus_connect(ctx) == -1) {
+    fprintf(stderr, "Connection failed: %s\n", modbus_strerror(errno));
+    modbus_free(ctx);
+    free(dest);
+    return -1;
+  }
+
+  rc = modbus_write_and_read_registers(ctx, params->write_addr, write_nb, src, params->read_addr, read_nb, dest);
+
+  /* Free the memory */
+  free(dest);
+
+  /* Close the connection */
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return rc;
+}
+	

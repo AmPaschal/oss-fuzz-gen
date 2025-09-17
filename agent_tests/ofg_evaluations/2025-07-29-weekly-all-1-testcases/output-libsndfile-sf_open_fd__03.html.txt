@@ -1,0 +1,117 @@
+
+	
+<description>
+The `sf_open_fd` function opens a sound file using a file descriptor. It takes a file descriptor `fd`, an integer `mode` specifying the read/write mode, a pointer to an `SF_INFO` structure `sfinfo` containing information about the file, and an integer `close_desc` which indicates whether to close the file descriptor when the handle is closed. The function performs some initial checks, allocates a private structure, and then calls `psf_open_file` to handle the rest of the file opening process. The callers of this function usually obtain the file descriptor from `open`, `pipe`, or `fileno` and set the mode to `SFM_READ` or `SFM_WRITE`.
+</description>
+<requirements>
+
+<requirement>
+The `fd` argument must be a valid file descriptor. This is because the function uses this file descriptor to perform file operations and an invalid descriptor will lead to errors.
+</requirement>
+<requirement>
+The `mode` argument should be one of `SFM_READ` (0x10), `SFM_WRITE` (0x20), or `SFM_RDWR` (0x30). The function uses this argument to determine the file access mode.
+</requirement>
+<requirement>
+The `sfinfo` argument must be a non-NULL pointer to a valid `SF_INFO` structure. The function accesses members of this structure, so a NULL pointer would cause a crash.
+</requirement>
+<requirement>
+The `format` member of the `SF_INFO` struct must not be `SF_FORMAT_SD2`. The function explicitly checks for this format and returns NULL if it is set.
+</requirement>
+<requirement>
+The `samplerate`, `channels`, and `format` members of the `SF_INFO` struct must be initialized with valid values. The `sf_format_check` function can be used to check the validity of these values.
+</requirement>
+<requirement>
+The `close_desc` argument must be either `SF_TRUE` (1) or `SF_FALSE` (0). This argument controls whether the file descriptor is closed when `sf_close` is called on the returned handle.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+SNDFILE * sf_open_fd(int fd, int mode, SF_INFO *sfinfo, int close_desc)
+</function_signature>
+<project_name>
+libsndfile
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <vector>
+
+extern "C" {
+#include "sndfile.h"
+}
+
+// Forward declaration for the function under test.
+extern "C" SNDFILE * sf_open_fd(int, int, SF_INFO *, int);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider provider(data, size);
+
+    // We need at least some data to drive the fuzzer.
+    if (provider.remaining_bytes() < 20) {
+        return 0;
+    }
+
+    const char* filename = "/tmp/fuzz_sf_open_fd.wav";
+
+    // Create a temporary file and write a portion of the fuzzer data to it.
+    int fd = open(filename, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        return 0;
+    }
+
+    size_t data_size = provider.ConsumeIntegralInRange<size_t>(0, provider.remaining_bytes());
+    std::vector<uint8_t> file_data = provider.ConsumeBytes<uint8_t>(data_size);
+    write(fd, file_data.data(), file_data.size());
+    lseek(fd, 0, SEEK_SET); // Rewind for reading.
+
+    // Prepare parameters for sf_open_fd.
+    SF_INFO sfinfo;
+    memset(&sfinfo, 0, sizeof(sfinfo));
+
+    const int mode = provider.PickValueInArray({SFM_READ, SFM_WRITE, SFM_RDWR});
+
+    // If writing, we must provide valid format info.
+    if (mode != SFM_READ) {
+        sfinfo.samplerate = provider.ConsumeIntegralInRange<int>(8000, 48000);
+        sfinfo.channels = provider.ConsumeIntegralInRange<int>(1, 4);
+        // Pick a format that is generally supported for writing and is not SF_FORMAT_SD2.
+        sfinfo.format = provider.PickValueInArray({
+            SF_FORMAT_WAV | SF_FORMAT_PCM_16,
+            SF_FORMAT_AIFF | SF_FORMAT_PCM_24,
+            SF_FORMAT_AU | SF_FORMAT_PCM_S8,
+            SF_FORMAT_FLAC | SF_FORMAT_PCM_16,
+            SF_FORMAT_WAV | SF_FORMAT_FLOAT
+        });
+
+        // If the generated format is invalid, we cannot proceed with writing.
+        if (!sf_format_check(&sfinfo)) {
+            close(fd);
+            unlink(filename);
+            return 0;
+        }
+    }
+
+    // Use SF_FALSE and manage the file descriptor manually for simpler, robust cleanup.
+    const int close_desc = SF_FALSE;
+
+    // Call the target function.
+    SNDFILE *sndfile = sf_open_fd(fd, mode, &sfinfo, close_desc);
+
+    // Cleanup.
+    if (sndfile) {
+        sf_close(sndfile);
+    }
+
+    close(fd);
+    unlink(filename);
+
+    return 0;
+}
+	

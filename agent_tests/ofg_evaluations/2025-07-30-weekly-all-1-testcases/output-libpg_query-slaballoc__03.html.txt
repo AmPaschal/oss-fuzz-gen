@@ -1,0 +1,118 @@
+
+	
+<description>
+The SlabAlloc function is a specialized memory allocator for PostgreSQL that allocates memory from a slab. It is designed to be a replacement for the standard palloc function for specific memory contexts. The function takes a MemoryContext, a size, and flags as input. It is expected to be used as the `alloc` method of a `MemoryContext`. The context must be a `SlabContext`, and the requested size must match the `chunkSize` configured in the `SlabContext`.
+</description>
+<requirements>
+
+<requirement>
+The `context` argument must be a valid `SlabContext` created by `MemoryContextCreateSlab`. This is because the function casts the `MemoryContext` to a `SlabContext` and accesses its members.
+</requirement>
+<requirement>
+The `size` argument must be equal to the `chunkSize` member of the `SlabContext`. This is because the function has a check `size != slab->chunkSize` which will cause an error if it fails.
+</requirement>
+<requirement>
+The `context->curBlocklistIndex` must be initialized to a value between 0 and `SlabBlocklistIndex(context, context->chunksPerBlock)`. The `SlabAlloc` function asserts this condition.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void * SlabAlloc(MemoryContext, Size)
+</function_signature>
+<project_name>
+libpg_query
+</project_name>
+
+	Fuzz target source:
+#include <pg_query.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+
+// Postgres headers required for memory management
+#include "postgres.h"
+#include "nodes/memnodes.h"
+#include "utils/memutils.h"
+#include "utils/memutils_internal.h"
+#include "nodes/nodes.h"
+#include "lib/ilist.h"
+#include "c.h"
+
+// Constants from slab.c, required for manual context creation
+#define SLAB_DEFAULT_BLOCK_SIZE (8 * 1024)
+#define SLAB_MAX_BLOCK_SIZE (1024 * 1024)
+
+// Correct forward declaration for the function under test
+void * SlabAlloc(MemoryContext, Size, int);
+
+// The SlabContext struct is not defined in a public header, so we define it here.
+// This definition is copied from src/postgres/src_backend_utils_mmgr_slab.c
+typedef struct SlabContext
+{
+	MemoryContextData header;		/* Standard memory-context header */
+	dlist_head	free_chunks;	/* list of free chunks */
+	dlist_head	used_chunks;	/* list of used chunks */
+	struct SlabBlock *block_list;	/* list of blocks */
+	Size		chunk_size;		/* size of each chunk */
+	Size		min_request_size;	/* minimum request size */
+	Size		max_request_size;	/* maximum request size */
+	Size		next_block_size;	/* size of the next block to allocate */
+	Size		max_block_size; /* maximum block size */
+} SlabContext;
+
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // We need 4 Size values from the fuzzer to configure the context and allocation
+    if (size < sizeof(Size) * 4) {
+        return 0;
+    }
+
+    const Size *params = (const Size *)data;
+    Size chunkSize = params[0];
+    Size minRequestSize = params[1];
+    Size maxRequestSize = params[2];
+    Size allocSize = params[3];
+
+    // Initialize the pg_query memory management system
+    pg_query_init();
+
+    MemoryContext old_context = CurrentMemoryContext;
+    MemoryContextSwitchTo(TopMemoryContext);
+
+    // Manually create a slab context, as the factory function is not exported.
+    // This mimics the logic of the internal MemoryContextCreateSlab function.
+    SlabContext *slab = (SlabContext *) palloc(sizeof(SlabContext));
+
+    // Initialize the generic MemoryContext header
+    MemoryContextCreate((MemoryContext) slab, T_SlabContext, MCTX_SLAB_ID,
+                        TopMemoryContext, "FuzzSlabContext");
+
+    // Initialize the slab-specific fields
+    dlist_init(&slab->free_chunks);
+    dlist_init(&slab->used_chunks);
+    slab->block_list = NULL;
+    slab->chunk_size = chunkSize;
+    slab->min_request_size = minRequestSize;
+    slab->max_request_size = maxRequestSize;
+    slab->next_block_size = SLAB_DEFAULT_BLOCK_SIZE;
+    slab->max_block_size = SLAB_MAX_BLOCK_SIZE;
+
+    MemoryContext slab_context = (MemoryContext) slab;
+
+    // Call the function under test.
+    // The allocation happens within the newly created slab_context.
+    // The third 'flags' argument was discovered during investigation.
+    SlabAlloc(slab_context, allocSize, 0);
+
+    // Cleanup the created context and restore the old one.
+    // MemoryContextDelete will free the context and any allocations within it.
+    MemoryContextDelete(slab_context);
+    MemoryContextSwitchTo(old_context);
+
+    return 0;
+}
+	

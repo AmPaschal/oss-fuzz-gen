@@ -1,0 +1,123 @@
+
+	
+<description>
+The `gnutls_certificate_verify_peers3` function is used to verify the certificate chain of a peer in a TLS session. It checks if the peer's certificate is signed by a trusted Certificate Authority (CA) and if the hostname (or IP address) provided matches the name(s) present in the certificate. The function takes three arguments: a `gnutls_session_t` object, a `const char *` for the hostname, and a pointer to an `unsigned int` to store the verification status. It is a wrapper for the more general `gnutls_certificate_verify_peers` function, specifically setting the data type to `GNUTLS_DT_DNS_HOSTNAME`. For the function to execute correctly, the `session` object must be an initialized client session that has already performed a TLS handshake with a peer. This is because the peer's certificate chain must be available within the session context for verification. The session must also be configured with a set of trusted CA certificates against which the peer's certificate chain will be validated. The `hostname` argument is a string that will be used to verify the identity of the peer, and the `status` pointer must point to a valid memory location to receive the result.
+</description>
+<requirements>
+<requirement>
+A call to `gnutls_init` is required to initialize the `gnutls_session_t` object. This is necessary to get a valid session handle to work with.
+</requirement>
+<requirement>
+The `gnutls_certificate_allocate_credentials` and `gnutls_certificate_set_x509_trust_mem` functions must be called to create and load trusted CAs into a credentials object. Certificate verification requires a set of trusted root certificates to build and validate the certificate chain.
+</requirement>
+<requirement>
+`gnutls_credentials_set` must be called to associate the created credentials with the session. This provides the session with the necessary information (like trusted CAs) to perform the verification.
+</requirement>
+<requirement>
+A successful TLS handshake must be performed using `gnutls_handshake` before calling the target function. The function needs to access the peer's certificate, which is only available in the session after a handshake.
+</requirement>
+<requirement>
+The `hostname` argument must be a null-terminated string. This string is used internally to match against the hostname in the peer's certificate, and a non-terminated string could lead to out-of-bounds reads.
+</requirement>
+<requirement>
+The `status` argument must be a valid pointer to an `unsigned int`. The function writes the verification result to this memory location, so it must be a writable address to avoid a crash.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int gnutls_certificate_verify_peers3(gnutls_session_t, const char *, unsigned int *)
+</function_signature>
+<project_name>
+gnutls
+</project_name>
+
+	Fuzz target source:
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
+
+#include "fuzzer.h"
+#include "mem.h"
+
+#if GNUTLS_VERSION_NUMBER < 0x030506
+#define VERS_STR "VERS-TLS1.2"
+#else
+#define VERS_STR ""
+#endif
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	int res;
+	gnutls_session_t session;
+	gnutls_certificate_credentials_t xcred;
+	struct mem_st memdata;
+	char *hostname = NULL;
+	const uint8_t *handshake_data;
+	size_t handshake_size;
+
+	if (size < 1) {
+		return 0;
+	}
+
+	/* Use the first byte for hostname length */
+	const size_t hostname_len = data[0];
+	if (size < 1 + hostname_len) {
+		handshake_data = data;
+		handshake_size = size;
+	} else {
+		hostname = malloc(hostname_len + 1);
+		if (!hostname) {
+			return 0;
+		}
+		memcpy(hostname, data + 1, hostname_len);
+		hostname[hostname_len] = '\0';
+
+		handshake_data = data + 1 + hostname_len;
+		handshake_size = size - (1 + hostname_len);
+	}
+
+	res = gnutls_init(&session, GNUTLS_CLIENT);
+	assert(res >= 0);
+
+	res = gnutls_certificate_allocate_credentials(&xcred);
+	assert(res >= 0);
+	res = gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, xcred);
+	assert(res >= 0);
+
+	res = gnutls_priority_set_direct(
+		session, "NORMAL:+SIGN-EDDSA-ED448:" VERS_STR, NULL);
+	assert(res >= 0);
+
+	memdata.data = handshake_data;
+	memdata.size = handshake_size;
+
+	gnutls_transport_set_push_function(session, mem_push);
+	gnutls_transport_set_pull_function(session, mem_pull);
+	gnutls_transport_set_pull_timeout_function(session, mem_pull_timeout);
+	gnutls_transport_set_ptr(session, &memdata);
+
+	do {
+		res = gnutls_handshake(session);
+	} while (res < 0 && gnutls_error_is_fatal(res) == 0);
+
+	unsigned int status = 0;
+	gnutls_certificate_verify_peers3(session, hostname, &status);
+
+	/* test with NULL hostname */
+	gnutls_certificate_verify_peers3(session, NULL, &status);
+
+	gnutls_deinit(session);
+	gnutls_certificate_free_credentials(xcred);
+	if (hostname) {
+		free(hostname);
+	}
+	return 0;
+}
+	

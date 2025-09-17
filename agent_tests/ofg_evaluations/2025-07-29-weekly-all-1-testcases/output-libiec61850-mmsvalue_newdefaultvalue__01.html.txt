@@ -1,0 +1,177 @@
+
+	
+<description>
+This function, `MmsValue_newDefaultValue`, is responsible for creating a new `MmsValue` object with a default value, based on the provided `MmsVariableSpecification`. The function acts as a factory, allocating and initializing the `MmsValue` according to the type specified in the `typeSpec` argument. It uses a `switch` statement to handle different MMS data types, such as integers, floats, strings, arrays, and structures. For complex types like arrays and structures, it recursively calls itself to create the nested values, making the input `typeSpec`'s integrity crucial for correct operation.
+
+The callers, `MmsValue_createArray` and `MmsValue_newStructure`, use this function to populate the elements of the complex data types they create. This recursive pattern highlights the need for a well-defined and valid `MmsVariableSpecification` tree to prevent crashes from null pointer dereferences or infinite recursion. The function's handling of various data sizes, including the use of `abs()` for some string and bitstring types, suggests that the size-related fields in `typeSpec` can accept a range of values, including negative ones, which are treated as positive sizes for memory allocation. Therefore, the fuzzer should generate both positive and negative values for these fields to ensure all paths are tested.
+</description>
+<requirements>
+<requirement>
+The `typeSpec` parameter must not be a NULL pointer. This is because the function immediately dereferences it to access the `type` field, and a NULL value would lead to a crash.
+</requirement>
+<requirement>
+The `type` field of the `typeSpec` parameter should be a fuzzed value from the `MmsType` enum. The function uses this field in a switch statement, and providing a valid enum value is essential for the function to behave as expected and not fall through to the default case, which would return NULL.
+</requirement>
+<requirement>
+If `typeSpec->type` is `MMS_ARRAY`, the `elementTypeSpec` of the `array` field must point to a valid `MmsVariableSpecification` object. This is to prevent a NULL pointer from being passed to the recursive call within `MmsValue_createArray`, which would cause a crash.
+</requirement>
+<requirement>
+If `typeSpec->type` is `MMS_STRUCTURE`, the `elements` field of the `structure` must be a valid pointer to an array of `MmsVariableSpecification` pointers. This is crucial because `MmsValue_newStructure` iterates over this array to make recursive calls, and an invalid pointer would lead to a crash.
+</requirement>
+<requirement>
+The integer members `bitString`, `octetString`, and `visibleString` of the `typeSpec` union should be fuzzed with both positive and negative values. The code uses the `abs()` function on these members, indicating that negative values are handled and should be tested to ensure full code coverage.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+MmsValue * MmsValue_newDefaultValue(const MmsVariableSpecification *)
+</function_signature>
+<project_name>
+libiec61850
+</project_name>
+
+	Fuzz target source:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include "/src/libiec61850/src/mms/inc/mms_value.h"
+#include "mms_type_spec.h"
+
+#define MAX_RECURSION_DEPTH 4
+#define MAX_ARRAY_ELEMENTS 8
+#define MAX_STRUCT_ELEMENTS 8
+
+// Forward declarations for recursive functions
+static MmsVariableSpecification* create_spec_from_data(const uint8_t** data, size_t* size, int depth);
+static void free_spec(MmsVariableSpecification* spec);
+
+// Helper function to safely consume data from the input buffer
+static int consume_data(void* dest, size_t len, const uint8_t** data, size_t* size) {
+    if (*size < len) {
+        return 0; // Not enough data
+    }
+    memcpy(dest, *data, len);
+    *data += len;
+    *size -= len;
+    return 1;
+}
+
+// Recursively frees the MmsVariableSpecification structure
+static void free_spec(MmsVariableSpecification* spec) {
+    if (spec == NULL) {
+        return;
+    }
+
+    if (spec->type == MMS_ARRAY) {
+        free_spec(spec->typeSpec.array.elementTypeSpec);
+    } else if (spec->type == MMS_STRUCTURE) {
+        if (spec->typeSpec.structure.elements != NULL) {
+            for (int i = 0; i < spec->typeSpec.structure.elementCount; i++) {
+                free_spec(spec->typeSpec.structure.elements[i]);
+            }
+            free(spec->typeSpec.structure.elements);
+        }
+    }
+
+    free(spec);
+}
+
+// Recursively creates an MmsVariableSpecification from the fuzzer data
+static MmsVariableSpecification* create_spec_from_data(const uint8_t** data, size_t* size, int depth) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        return NULL;
+    }
+
+    MmsVariableSpecification* spec = (MmsVariableSpecification*)calloc(1, sizeof(MmsVariableSpecification));
+    if (spec == NULL) {
+        return NULL;
+    }
+
+    uint8_t type_val;
+    if (!consume_data(&type_val, sizeof(type_val), data, size)) {
+        free(spec);
+        return NULL;
+    }
+    spec->type = (MmsType)(type_val % 13); // Modulo to get a valid MmsType
+
+    switch (spec->type) {
+        case MMS_INTEGER:
+        case MMS_UNSIGNED:
+        case MMS_BIT_STRING:
+        case MMS_OCTET_STRING:
+        case MMS_VISIBLE_STRING:
+        case MMS_STRING:
+            if (!consume_data(&spec->typeSpec.integer, sizeof(int), data, size)) {
+                goto error;
+            }
+            break;
+        case MMS_FLOAT:
+            if (!consume_data(&spec->typeSpec.floatingpoint, sizeof(spec->typeSpec.floatingpoint), data, size)) {
+                goto error;
+            }
+            break;
+        case MMS_ARRAY: {
+            uint8_t count;
+            if (!consume_data(&count, sizeof(count), data, size)) {
+                goto error;
+            }
+            spec->typeSpec.array.elementCount = count % MAX_ARRAY_ELEMENTS;
+            spec->typeSpec.array.elementTypeSpec = create_spec_from_data(data, size, depth + 1);
+            if (spec->typeSpec.array.elementTypeSpec == NULL) {
+                goto error;
+            }
+            break;
+        }
+        case MMS_STRUCTURE: {
+            uint8_t count;
+            if (!consume_data(&count, sizeof(count), data, size)) {
+                goto error;
+            }
+            spec->typeSpec.structure.elementCount = count % MAX_STRUCT_ELEMENTS;
+            if (spec->typeSpec.structure.elementCount > 0) {
+                spec->typeSpec.structure.elements = (MmsVariableSpecification**)calloc(spec->typeSpec.structure.elementCount, sizeof(MmsVariableSpecification*));
+                if (spec->typeSpec.structure.elements == NULL) {
+                    goto error;
+                }
+                for (int i = 0; i < spec->typeSpec.structure.elementCount; i++) {
+                    spec->typeSpec.structure.elements[i] = create_spec_from_data(data, size, depth + 1);
+                    if (spec->typeSpec.structure.elements[i] == NULL) {
+                        goto error;
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            // For MMS_BOOLEAN, MMS_UTC_TIME, etc., no specific data is needed from the fuzzer.
+            break;
+    }
+
+    return spec;
+
+error:
+    free_spec(spec);
+    return NULL;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size == 0) {
+        return 0;
+    }
+
+    MmsVariableSpecification* typeSpec = create_spec_from_data(&data, &size, 0);
+
+    if (typeSpec != NULL) {
+        MmsValue* value = MmsValue_newDefaultValue(typeSpec);
+        if (value != NULL) {
+            MmsValue_delete(value);
+        }
+        free_spec(typeSpec);
+    }
+
+    return 0;
+}
+	

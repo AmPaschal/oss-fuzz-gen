@@ -1,0 +1,195 @@
+
+	
+<description>
+The `modbus_write_bits` function writes the status of a given number of bits (coils) to a Modbus server.
+
+The function takes four arguments:
+- `ctx`: a pointer to a `modbus_t` structure. This structure is initialized by calling `modbus_new_tcp`, `modbus_new_tcp_pi`, or `modbus_new_rtu`. It holds the context of the Modbus connection.
+- `addr`: the starting address of the bits to be written.
+- `nb`: the number of bits to be written. This value must be between 1 and 1968 (inclusive), as defined by `MODBUS_MAX_WRITE_BITS`.
+- `src`: a pointer to an array of `uint8_t` that contains the data to be written. The size of this array must be at least `nb`.
+
+The function first checks if `ctx` is NULL and if `nb` is within the valid range. If not, it returns -1 and sets `errno`. Otherwise, it constructs a Modbus request, sends it to the server, and waits for a confirmation. The data in `src` is packed into the request.
+</description>
+<requirements>
+<requirement>
+The first argument, `ctx`, should be a valid pointer to a `modbus_t` structure. This is because a NULL pointer will cause the function to return -1 and set `errno` to `EINVAL`.
+</requirement>
+<requirement>
+The `modbus_t` structure should be initialized by calling `modbus_new_tcp`, `modbus_new_tcp_pi`, or `modbus_new_rtu`. This is to ensure that the context is properly set up for communication.
+</requirement>
+<requirement>
+The third argument, `nb`, which represents the number of bits to write, must be between 1 and 1968. This is because values outside of this range will cause the function to return -1 and set `errno` to `EMBMDATA`.
+</requirement>
+<requirement>
+The fourth argument, `src`, must be a pointer to a valid memory region with a size of at least `nb` bytes. This is to prevent memory access violations when the function reads from this buffer.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_write_bits(modbus_t *, int, int, const uint8_t *)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/fuzz/unit-test.h"
+#include <modbus.h>
+
+#define PORT 8080
+#define kMinInputLength 9
+#define kMaxInputLength MODBUS_RTU_MAX_ADU_LENGTH
+#define MODBUS_MAX_WRITE_BITS 0x07B0
+
+struct Fuzzer {
+  uint16_t port;
+  uint64_t size;
+  const uint8_t *buffer;
+
+  pthread_t thread;
+  int socket;
+
+  /* Fuzzer-derived parameters for the function under test */
+  int addr;
+  int nb;
+  const uint8_t *src;
+  size_t src_size;
+};
+typedef struct Fuzzer Fuzzer;
+
+int client(Fuzzer *fuzzer);
+
+void fuzzinit(Fuzzer *fuzzer) {
+  struct sockaddr_in server_addr;
+  fuzzer->socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(fuzzer->port);
+  server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  setsockopt(fuzzer->socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+  bind(fuzzer->socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  listen(fuzzer->socket, 1);
+}
+
+void *Server(void *args) {
+
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  {
+    int client_socket;
+    char clientData[10240];
+    struct sockaddr_in clientAddr;
+    uint32_t clientSZ = sizeof(clientAddr);
+
+    client_socket = accept(fuzzer->socket, (struct sockaddr *)&clientAddr, &clientSZ);
+
+    /* First, receive the request from the client */
+    recv(client_socket, clientData, sizeof(clientData), 0);
+    /* Then, send the fuzzed response */
+    send(client_socket, fuzzer->buffer, fuzzer->size, 0);
+
+    shutdown(client_socket, SHUT_RDWR);
+    close(client_socket);
+  }
+  pthread_exit(NULL);
+}
+
+void clean(Fuzzer *fuzzer) {
+  { // Server
+    shutdown(fuzzer->socket, SHUT_RDWR);
+    close(fuzzer->socket);
+  }
+  free(fuzzer);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+  if (size < kMinInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  /* Extract parameters for modbus_write_bits from the input data */
+  /* We need at least 4 bytes for addr and nb */
+  if (size < 4) {
+      free(fuzzer);
+      return 0;
+  }
+
+  fuzzer->addr = *(const uint16_t*)data;
+  fuzzer->nb = *(const uint16_t*)(data + 2);
+
+  /* Constrain nb to a valid range */
+  fuzzer->nb = (fuzzer->nb % MODBUS_MAX_WRITE_BITS) + 1;
+
+  /* Constrain addr to prevent overflow */
+  if (fuzzer->addr + fuzzer->nb > 65535) {
+      fuzzer->addr = 65535 - fuzzer->nb;
+  }
+
+  fuzzer->src = data + 4;
+  fuzzer->src_size = size - 4;
+
+  size_t required_src_size = (fuzzer->nb / 8) + ((fuzzer->nb % 8) ? 1 : 0);
+  if (fuzzer->src_size < required_src_size) {
+      free(fuzzer);
+      return 0;
+  }
+
+  fuzzinit(fuzzer);
+
+  pthread_create(&fuzzer->thread, NULL, Server, fuzzer);
+  client(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* To Avoid UAF*/
+
+  clean(fuzzer);
+  return 0;
+}
+
+int client(Fuzzer *fuzzer) {
+
+  modbus_t *ctx = NULL;
+  int rc;
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+
+  if (ctx == NULL) {
+    fprintf(stderr, "Unable to allocate libmodbus context\n");
+    return -1;
+  }
+
+  if (modbus_connect(ctx) == -1) {
+    fprintf(stderr, "Connection failed: %s\n", modbus_strerror(errno));
+    modbus_free(ctx);
+    return -1;
+  }
+
+  /* Call the function under test */
+  rc = modbus_write_bits(ctx, fuzzer->addr, fuzzer->nb, fuzzer->src);
+
+  /* Close the connection */
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return rc;
+}
+	

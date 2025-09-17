@@ -1,0 +1,243 @@
+
+	
+<description>
+The `mbedtls_ssl_write()` function is used to send application data over an established SSL/TLS or DTLS connection. Before calling this function, the SSL context (`mbedtls_ssl_context`) must be fully initialized and a successful handshake must have been completed. The initialization process involves setting up the configuration, random number generator, certificates, and I/O callbacks. The function handles the fragmentation of data for stream-based transports (TLS) if the input length exceeds the maximum allowed payload size. For datagram-based transports (DTLS), it will return an error if the data is too large. It can also handle sending zero-length application data fragments, which can be used as a traffic analysis countermeasure. The function will block until the entire message is sent or an error occurs.
+</description>
+<requirements>
+
+<requirement>
+The `mbedtls_ssl_context` pointer, `ssl`, must not be NULL, and its `conf` member must also be initialized. This is a basic sanity check performed by the function to prevent null pointer dereferences.
+</requirement>
+<requirement>
+The `mbedtls_ssl_context` structure must be initialized by calling a sequence of setup functions before calling `mbedtls_ssl_write`. The required setup includes `mbedtls_ssl_init`, `mbedtls_ssl_config_defaults`, `mbedtls_ssl_setup`, and `mbedtls_ssl_set_bio` to ensure the SSL context is in a valid state.
+</requirement>
+<requirement>
+An SSL/TLS handshake must be completed successfully before writing application data. The `mbedtls_ssl_write` function will attempt to perform the handshake if it is not already complete, but it is best practice to ensure the handshake is done by calling `mbedtls_ssl_handshake` beforehand.
+</requirement>
+<requirement>
+For DTLS (datagram) transport, the `len` argument must be less than or equal to the maximum fragment length negotiated. If `len` is larger, the function will return an error (`MBEDTLS_ERR_SSL_BAD_INPUT_DATA`) instead of fragmenting the data.
+</requirement>
+<requirement>
+The `buf` argument can be a user-controlled buffer. It can be NULL only if `len` is zero. This allows for sending zero-length application data fragments.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mbedtls_ssl_write(mbedtls_ssl_context *, const unsigned char *, size_t)
+</function_signature>
+<project_name>
+mbedtls
+</project_name>
+
+	Fuzz target source:
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "test/certs.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+/* The file `common.c` is not linked by default with this fuzzer.
+ * Including it directly is a workaround to allow usage of the helper
+ * functions it defines, which are necessary for setting up an SSL context.
+ * `common.c` also includes `common.h`, so we don't need to include it here.
+ */
+#include "common.c"
+
+
+#if defined(MBEDTLS_SSL_CLI_C) && \
+    defined(MBEDTLS_ENTROPY_C) && \
+    defined(MBEDTLS_CTR_DRBG_C)
+static int initialized = 0;
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+static mbedtls_x509_crt cacert;
+#endif
+const char *alpn_list[3];
+
+
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+const unsigned char psk[] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+};
+const char psk_id[] = "Client_identity";
+#endif
+
+const char *pers = "fuzz_client";
+#endif /* MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C */
+
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+#if defined(MBEDTLS_SSL_CLI_C) && \
+    defined(MBEDTLS_ENTROPY_C) && \
+    defined(MBEDTLS_CTR_DRBG_C)
+    int ret;
+    size_t len;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+    unsigned char buf[4096];
+    fuzzBufferOffset_t biomemfuzz;
+    uint16_t options;
+
+    if (initialized == 0) {
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+        mbedtls_x509_crt_init(&cacert);
+        if (mbedtls_x509_crt_parse(&cacert, (const unsigned char *) mbedtls_test_cas_pem,
+                                   mbedtls_test_cas_pem_len) != 0) {
+            return 1;
+        }
+#endif
+
+        alpn_list[0] = "HTTP";
+        alpn_list[1] = "fuzzalpn";
+        alpn_list[2] = NULL;
+
+        dummy_init();
+
+        initialized = 1;
+    }
+
+    //we take 2 bytes as options input
+    if (Size < 2) {
+        return 0;
+    }
+    options = (Data[Size - 2] << 8) | Data[Size - 1];
+    //Avoid warnings if compile options imply no options
+    (void) options;
+
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_entropy_init(&entropy);
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        goto exit;
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+    if (mbedtls_ctr_drbg_seed(&ctr_drbg, dummy_entropy, &entropy,
+                              (const unsigned char *) pers, strlen(pers)) != 0) {
+        goto exit;
+    }
+
+    if (mbedtls_ssl_config_defaults(&conf,
+                                    MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+        goto exit;
+    }
+
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+    if (options & 2) {
+        mbedtls_ssl_conf_psk(&conf, psk, sizeof(psk),
+                             (const unsigned char *) psk_id, sizeof(psk_id) - 1);
+    }
+#endif
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+    if (options & 4) {
+        mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    } else
+#endif
+    {
+        mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
+#if defined(MBEDTLS_SSL_EXTENDED_MASTER_SECRET)
+    mbedtls_ssl_conf_extended_master_secret(&conf,
+                                            (options &
+                                             0x10) ? MBEDTLS_SSL_EXTENDED_MS_DISABLED : MBEDTLS_SSL_EXTENDED_MS_ENABLED);
+#endif
+#if defined(MBEDTLS_SSL_ENCRYPT_THEN_MAC)
+    mbedtls_ssl_conf_encrypt_then_mac(&conf,
+                                      (options &
+                                       0x20) ? MBEDTLS_SSL_ETM_DISABLED : MBEDTLS_SSL_ETM_ENABLED);
+#endif
+#if defined(MBEDTLS_SSL_RENEGOTIATION)
+    mbedtls_ssl_conf_renegotiation(&conf,
+                                   (options &
+                                    0x80) ? MBEDTLS_SSL_RENEGOTIATION_ENABLED : MBEDTLS_SSL_RENEGOTIATION_DISABLED);
+#endif
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    mbedtls_ssl_conf_session_tickets(&conf,
+                                     (options &
+                                      0x100) ? MBEDTLS_SSL_SESSION_TICKETS_DISABLED : MBEDTLS_SSL_SESSION_TICKETS_ENABLED);
+#endif
+#if defined(MBEDTLS_SSL_ALPN)
+    if (options & 0x200) {
+        mbedtls_ssl_conf_alpn_protocols(&conf, alpn_list);
+    }
+#endif
+
+    srand(1);
+    mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+
+    if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+        goto exit;
+    }
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+    if ((options & 1) == 0) {
+        if (mbedtls_ssl_set_hostname(&ssl, "localhost") != 0) {
+            goto exit;
+        }
+    }
+#endif
+
+    biomemfuzz.Data = Data;
+    biomemfuzz.Size = Size-2;
+    biomemfuzz.Offset = 0;
+    mbedtls_ssl_set_bio(&ssl, &biomemfuzz, dummy_send, fuzz_recv, NULL);
+
+    ret = mbedtls_ssl_handshake(&ssl);
+
+    if (ret == 0) {
+        // Handshake successful.
+        // The fuzzer's input after the handshake part can be used for writing.
+        const uint8_t *writeData = biomemfuzz.Data + biomemfuzz.Offset;
+        size_t writeSize = biomemfuzz.Size - biomemfuzz.Offset;
+
+        if (writeSize > 0) {
+            // Fuzz the function under test
+            mbedtls_ssl_write(&ssl, writeData, writeSize);
+        }
+
+        // It is also valuable to fuzz the read part after a write
+        do {
+            len = sizeof(buf) - 1;
+            ret = mbedtls_ssl_read(&ssl, buf, len);
+            if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+                continue;
+            } else if (ret <= 0) {
+                // EOF or error
+                break;
+            }
+        } while (1);
+    }
+
+exit:
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ssl_free(&ssl);
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    mbedtls_psa_crypto_free();
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+#else
+    (void) Data;
+    (void) Size;
+#endif /* MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C */
+
+    return 0;
+}
+	

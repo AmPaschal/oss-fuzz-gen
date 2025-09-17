@@ -1,0 +1,102 @@
+
+	
+<description>
+The `sb_encode` function is responsible for encoding a frame of wideband speech. It takes an encoder state, an input audio buffer, and a bitstream buffer as input. The function performs sub-band decomposition, LPC analysis, quantization, and bitstream packing. It is not called directly, but rather through the `speex_encode_native` function, which is pointed to by a function pointer in the `SpeexMode` struct.
+</description>
+<requirements>
+<requirement>
+The first argument, `state`, must be a pointer to a valid `SBEncState` struct, which is initialized by calling `sb_encoder_init`. This is because the function casts the `void *` to a `SBEncState *` and accesses its members extensively.
+</requirement>
+<requirement>
+The second argument, `vin`, must be a pointer to a buffer of `spx_word16_t` of at least `st->full_frame_size` bytes. This is because the function performs a QMF decomposition on the input buffer into a low and high band, and accesses `in+st->frame_size`, which is half of the full frame size.
+</requirement>
+<requirement>
+The third argument, `bits`, must be a pointer to a `SpeexBits` struct that has been initialized with `speex_bits_init`. This is because the function packs the encoded data into the bitstream using `speex_bits_pack`.
+</requirement>
+<requirement>
+The `st_low` member of the `SBEncState` struct must be initialized by a call to the narrowband encoder's init function. This is because `sb_encode` calls `speex_encode_native` on `st->st_low` to encode the low-band signal.
+</requirement>
+<requirement>
+Before calling `sb_encode`, `speex_encoder_ctl` should be called with `SPEEX_SET_INNOVATION_SAVE` to provide a buffer for the innovation signal. This is required to save the innovation signal from the low-band encoder.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int sb_encode(void *, void *, SpeexBits *)
+</function_signature>
+<project_name>
+speex
+</project_name>
+
+	Fuzz target source:
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <speex/speex.h>
+#include <speex/speex_bits.h>
+
+#include <cstdint>
+#include <vector>
+
+// sb_celp.h is a C header without extern "C" guards, so we need to wrap it.
+extern "C" {
+#include "/src/speex/libspeex/sb_celp.h"
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider provider(data, size);
+
+    void *state = sb_encoder_init(&speex_wb_mode);
+    if (!state) {
+        return 0;
+    }
+
+    // Fuzz various encoder settings to cover more code paths
+    int vbr = provider.ConsumeBool();
+    speex_encoder_ctl(state, SPEEX_SET_VBR, &vbr);
+
+    int vad = provider.ConsumeBool();
+    speex_encoder_ctl(state, SPEEX_SET_VAD, &vad);
+
+    int dtx = provider.ConsumeBool();
+    speex_encoder_ctl(state, SPEEX_SET_DTX, &dtx);
+
+    int complexity = provider.ConsumeIntegralInRange<int>(0, 10);
+    speex_encoder_ctl(state, SPEEX_SET_COMPLEXITY, &complexity);
+
+    if (vbr) {
+        float vbr_quality = provider.ConsumeFloatingPointInRange<float>(0.0f, 10.0f);
+        speex_encoder_ctl(state, SPEEX_SET_VBR_QUALITY, &vbr_quality);
+    } else {
+        int bitrate = provider.ConsumeIntegralInRange(4000, 44000);
+        speex_encoder_ctl(state, SPEEX_SET_BITRATE, &bitrate);
+    }
+
+    int frame_size;
+    speex_encoder_ctl(state, SPEEX_GET_FRAME_SIZE, &frame_size);
+    const int full_frame_size = frame_size * 2;
+    const size_t frame_size_bytes = full_frame_size * sizeof(spx_int16_t);
+
+    SpeexBits bits;
+    speex_bits_init(&bits);
+
+    // Process as many full frames as the input data allows
+    while (provider.remaining_bytes() >= frame_size_bytes) {
+        std::vector<uint8_t> input_frame = provider.ConsumeBytes<uint8_t>(frame_size_bytes);
+        
+        // sb_encode writes to the bits struct, so reset it for each frame
+        speex_bits_reset(&bits);
+        
+        sb_encode(state, (void*)input_frame.data(), &bits);
+    }
+
+    speex_bits_destroy(&bits);
+    sb_encoder_destroy(state);
+
+    return 0;
+}
+	

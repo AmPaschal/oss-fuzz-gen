@@ -1,0 +1,124 @@
+
+	
+<description>
+The `symbolic_to_physical` function converts a symbolic representation of a compressed block (`symbolic_compressed_block`) into a physical 16-byte ASTC block (`pcb`). It uses a `block_size_descriptor` (`bsd`) to get context about the block's properties, such as its dimensions and supported modes. The function handles various block types, including constant-color blocks and complex partitioned blocks, encoding weights, color endpoints, and other metadata into the final physical block. It is the final step in the ASTC compression pipeline, called by `compress_block` after it has determined the best symbolic representation for a given image block.
+</description>
+<requirements>
+
+<requirement>
+The `block_size_descriptor` (`bsd`) argument must be initialized by calling `init_block_size_descriptor`. This is because this function populates internal tables essential for the logic inside `symbolic_to_physical`.
+</requirement>
+<requirement>
+The `scb.block_type` must not be `SYM_BTYPE_ERROR` (0). This is enforced by an assertion at the beginning of the function.
+</requirement>
+<requirement>
+The `scb.block_mode` must be a valid block mode index within the provided `bsd`. This is because `bsd.get_block_mode(scb.block_mode)` is called, and an invalid index will lead to an out-of-bounds access.
+</requirement>
+<requirement>
+The `scb.partition_count` must be a valid value (e.g., 1 to 4). The logic of the function for writing partition data depends on this value.
+</requirement>
+<requirement>
+The `symbolic_compressed_block` (`scb`) should be generated in a way that is consistent with the `block_size_descriptor` (`bsd`). One way to achieve this is to call `physical_to_symbolic` on fuzzed data to produce a valid `scb`.
+</requirement>
+<requirement>
+The `pcb` buffer must be at least 16 bytes long. The function writes 16 bytes to this buffer.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void symbolic_to_physical(const struct block_size_descriptor &, const struct symbolic_compressed_block &, uint8_t *)
+</function_signature>
+<project_name>
+astc-encoder
+</project_name>
+
+	Fuzz target source:
+// SPDX-License-Identifier: Apache-2.0
+// ----------------------------------------------------------------------------
+//  Copyright 2022-2023 Arm Limited.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// ----------------------------------------------------------------------------
+
+#include "/src/astc-encoder/Source/astcenc_internal.h"
+
+#include <array>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+
+struct BlockSizes {
+  int x;
+  int y;
+  int z;
+};
+
+std::array<BlockSizes, 3> testSz{{
+    {4, 4, 1},   // Highest bitrate
+    {12, 12, 1}, // Largest 2D block
+    {6, 6, 6}    // Largest 3D block
+}};
+
+std::array<block_size_descriptor, 3> testBSD;
+
+/**
+ * @brief Utility function to create all of the block size descriptors needed.
+ */
+bool bsd_initializer() {
+  for (size_t i = 0; i < testSz.size(); i++) {
+    init_block_size_descriptor(testSz[i].x, testSz[i].y, testSz[i].z, false, 4, 1.0f, testBSD[i]);
+  }
+  return true;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  // Preinitialize the block size descriptors we need
+  static bool init = bsd_initializer();
+
+  // Must have enough data for a block size index and a 16 byte payload
+  if (size < sizeof(int) + 16) {
+    return 0;
+  }
+
+  FuzzedDataProvider stream(data, size);
+
+  // Select a block size to test
+  int i = stream.ConsumeIntegralInRange<int>(0, testSz.size() - 1);
+  const block_size_descriptor &bsd = testBSD[i];
+
+  // Populate the initial physical block from fuzzer data
+  uint8_t pcb_in[16];
+  std::vector<uint8_t> buffer = stream.ConsumeBytes<uint8_t>(16);
+  if (buffer.size() != 16) {
+    return 0;
+  }
+  std::memcpy(pcb_in, buffer.data(), 16);
+
+  // First, convert physical to symbolic to get a valid symbolic block
+  symbolic_compressed_block scb;
+  physical_to_symbolic(bsd, pcb_in, scb);
+
+  // If the symbolic block is an error, we can't proceed
+  if (scb.block_type == SYM_BTYPE_ERROR) {
+    return 0;
+  }
+
+  // Now, call the function under test to convert symbolic back to physical
+  uint8_t pcb_out[16];
+  symbolic_to_physical(bsd, scb, pcb_out);
+
+  return 0;
+}
+	

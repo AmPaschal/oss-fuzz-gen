@@ -1,0 +1,144 @@
+
+	
+<description>
+The `IngestExternalFiles` function is used to ingest external SST files into the database. It takes a vector of `IngestExternalFileArg` objects, each of which specifies a column family, a list of external files to ingest, and options for the ingestion. The function is atomic, meaning that all files are either ingested successfully or none are. The function performs several checks on the input arguments, including checking for null column family handles, duplicate column families, and empty external file lists. It also checks for compatibility between the ingestion options and the database options.
+</description>
+<requirements>
+
+<requirement>
+The `args` vector should not be empty. This is to prevent an `InvalidArgument` error, as the function expects at least one file to be ingested.
+</requirement>
+<requirement>
+Each `IngestExternalFileArg` in the `args` vector must have a non-null `column_family`. This is because the function needs a valid column family to ingest the files into.
+</requirement>
+<requirement>
+Each `IngestExternalFileArg` in the `args` vector must have a unique `column_family`. This is to avoid conflicts and ensure that the ingestion is unambiguous.
+</requirement>
+<requirement>
+The `external_files` vector in each `IngestExternalFileArg` should not be empty. This is because the function expects at least one file to ingest for each column family.
+</requirement>
+<requirement>
+The `fill_cache` option should be the same for all `IngestExternalFileArg` objects in the `args` vector. This is to ensure consistent caching behavior across all ingested files.
+</requirement>
+<requirement>
+If the `ingest_behind` option is set to true, the `allow_ingest_behind` database option must also be true. This is a security measure to prevent accidental data corruption.
+</requirement>
+<requirement>
+If the `ingest_behind` option is set to true, the column family must not have user-defined timestamps enabled. This is because the `ingest_behind` feature is not compatible with user-defined timestamps.
+</requirement>
+<requirement>
+If the `atomic_replace_range` option is used, the `ingest_behind` option must be false. This is because these two options are mutually exclusive and cannot be used at the same time.
+</requirement>
+<requirement>
+The external SST files to be ingested must be created using the `SstFileWriter` class. This is because the `IngestExternalFiles` function expects the files to be in a specific format that is only produced by `SstFileWriter`.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+Status rocksdb::DBImpl::IngestExternalFiles(const vector<rocksdb::IngestExternalFileArg, std::__1::allocator<rocksdb::IngestExternalFileArg> > &)
+</function_signature>
+<project_name>
+rocksdb
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "rocksdb/db.h"
+#include "rocksdb/options.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/sst_file_writer.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+    FuzzedDataProvider provider(data, size);
+
+    const std::string kDbPath = "/tmp/db_ingest_external_files_fuzzer";
+    // Clean up from any previous runs by calling rocksdb::DestroyDB directly
+    rocksdb::DestroyDB(kDbPath, {}).PermitUncheckedError();
+
+    // Fuzz various options for ingestion
+    bool ingest_behind = provider.ConsumeBool();
+    bool move_files = provider.ConsumeBool();
+
+    // Set up database options, respecting the constraints for ingestion
+    rocksdb::Options options;
+    options.create_if_missing = true;
+    if (ingest_behind) {
+        options.allow_ingest_behind = true;
+    } else {
+        options.allow_ingest_behind = provider.ConsumeBool();
+    }
+
+    // Open the database
+    rocksdb::DB* db = nullptr;
+    rocksdb::Status s = rocksdb::DB::Open(options, kDbPath, &db);
+    if (!s.ok()) {
+        rocksdb::DestroyDB(kDbPath, options).PermitUncheckedError();
+        return 0;
+    }
+
+    // Create an SST file to ingest
+    const std::string sst_file_path = kDbPath + "/external_file.sst";
+    rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(), options);
+    s = sst_file_writer.Open(sst_file_path);
+    if (!s.ok()) {
+        delete db;
+        rocksdb::DestroyDB(kDbPath, options).PermitUncheckedError();
+        return 0;
+    }
+
+    // Use a map to ensure keys are sorted and unique, as required by SstFileWriter
+    std::map<std::string, std::string> kvs;
+    int num_keys = provider.ConsumeIntegralInRange<int>(1, 25);
+    for (int i = 0; i < num_keys; ++i) {
+        kvs[provider.ConsumeRandomLengthString(100)] =
+            provider.ConsumeRandomLengthString(100);
+    }
+
+    bool sst_writer_ok = true;
+    for (const auto& pair : kvs) {
+        s = sst_file_writer.Put(pair.first, pair.second);
+        if (!s.ok()) {
+            sst_writer_ok = false;
+            break;
+        }
+    }
+    
+    if (sst_writer_ok) {
+        s = sst_file_writer.Finish();
+    }
+
+    // Only proceed if the SST file was created successfully
+    if (s.ok()) {
+        // Prepare arguments for IngestExternalFiles
+        rocksdb::IngestExternalFileArg arg;
+
+        arg.column_family = db->DefaultColumnFamily();
+        arg.external_files.push_back(sst_file_path);
+
+        arg.options.move_files = move_files;
+        arg.options.ingest_behind = ingest_behind;
+        arg.options.allow_global_seqno = provider.ConsumeBool();
+        arg.options.allow_blocking_flush = provider.ConsumeBool();
+        arg.options.fill_cache = provider.ConsumeBool();
+
+        // Call the function under test
+        db->IngestExternalFiles({arg}).PermitUncheckedError();
+    }
+
+    // Cleanup
+    delete db;
+    rocksdb::DestroyDB(kDbPath, options).PermitUncheckedError();
+
+    return 0;
+}
+	

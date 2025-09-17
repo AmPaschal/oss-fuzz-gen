@@ -1,0 +1,285 @@
+
+	
+<description>
+The kex_gen_server function is a callback used in the server-side key exchange process of an SSH connection. It sets a dispatch handler to process the SSH2_MSG_KEX_ECDH_INIT message from the client. This handler, input_kex_gen_init, is responsible for performing the key exchange, which involves loading the server's host key, receiving the client's public key, generating a shared secret, and signing the exchange hash.
+</description>
+<requirements>
+<requirement>
+The ssh->kex field must be initialized. The function kex_gen_server is assigned to a function pointer within the ssh->kex structure, and the subsequent dispatch function `input_kex_gen_init` reads from this structure.
+</requirement>
+<requirement>
+A host key must be loaded into the ssh object before calling kex_gen_server. The `input_kex_gen_init` function, called from the dispatch set by kex_gen_server, calls `kex_load_hostkey` to retrieve the host key.
+</requirement>
+<requirement>
+The ssh object must contain a network buffer with a valid SSH2_MSG_KEX_ECDH_INIT message. The `input_kex_gen_init` function is the handler for this message and will read the client's public key from the buffer.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_gen_server(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <string>
+#include <vector>
+
+extern "C" {
+#include "includes.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "packet.h"
+#include "myproposal.h"
+#include "xmalloc.h"
+#include "authfile.h"
+#include "log.h"
+#include "kex.h"
+#include "fixed-keys.h"
+#include "dispatch.h"
+
+// Self-contained implementation based on kex_fuzz.cc
+static int prepare_key(struct shared_state *st, int keytype, int bits);
+
+struct shared_state {
+  size_t nkeys;
+  struct sshkey **privkeys, **pubkeys;
+};
+
+struct test_state {
+  struct sshbuf *smsgs, *cmsgs; /* output, for standalone mode */
+  struct sshbuf *sin, *cin;     /* input; setup per-test in do_kex_with_key */
+  struct sshbuf *s_template, *c_template; /* main copy of input */
+};
+
+static void store_key(struct shared_state *st, struct sshkey *pubkey, struct sshkey *privkey) {
+  if (st == NULL || pubkey->type < 0 || pubkey->type > INT_MAX || privkey->type != pubkey->type || ((size_t)pubkey->type < st->nkeys && st->pubkeys[pubkey->type] != NULL))
+    abort();
+  if ((size_t)pubkey->type >= st->nkeys) {
+    st->pubkeys = (struct sshkey **)xrecallocarray(st->pubkeys, st->nkeys, pubkey->type + 1, sizeof(*st->pubkeys));
+    st->privkeys = (struct sshkey **)xrecallocarray(st->privkeys, st->nkeys, privkey->type + 1, sizeof(*st->privkeys));
+    st->nkeys = privkey->type + 1;
+  }
+  st->pubkeys[pubkey->type] = pubkey;
+  st->privkeys[privkey->type] = privkey;
+}
+
+static int prepare_key(struct shared_state *st, int kt, int bits) {
+  const char *pubstr = NULL;
+  const char *privstr = NULL;
+  char *tmp, *cp;
+  struct sshkey *privkey = NULL, *pubkey = NULL;
+  struct sshbuf *b = NULL;
+  int r;
+
+  switch (kt) {
+  case KEY_RSA:
+    pubstr = PUB_RSA;
+    privstr = PRIV_RSA;
+    break;
+  case KEY_DSA:
+    pubstr = PUB_DSA;
+    privstr = PRIV_DSA;
+    break;
+  case KEY_ECDSA:
+    pubstr = PUB_ECDSA;
+    privstr = PRIV_ECDSA;
+    break;
+  case KEY_ED25519:
+    pubstr = PUB_ED25519;
+    privstr = PRIV_ED25519;
+    break;
+  default:
+    abort();
+  }
+  if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+    abort();
+  if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0) {
+    abort();
+  }
+  sshbuf_free(b);
+  tmp = cp = xstrdup(pubstr);
+  if ((pubkey = sshkey_new(KEY_UNSPEC)) == NULL)
+    abort();
+  if ((r = sshkey_read(pubkey, &cp)) != 0) {
+    abort();
+  }
+  free(tmp);
+
+  store_key(st, pubkey, privkey);
+  return 0;
+}
+
+static int prepare_keys(struct shared_state *st) {
+  if (prepare_key(st, KEY_RSA, 2048) != 0 || prepare_key(st, KEY_DSA, 1024) != 0 || prepare_key(st, KEY_ECDSA, 256) != 0 || prepare_key(st, KEY_ED25519, 256) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static struct sshkey *get_pubkey(struct shared_state *st, int keytype) {
+  if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys || st->pubkeys == NULL || st->pubkeys[keytype] == NULL)
+    abort();
+  return st->pubkeys[keytype];
+}
+
+static struct sshkey *get_privkey(struct shared_state *st, int keytype) {
+  if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys || st->privkeys == NULL || st->privkeys[keytype] == NULL)
+    abort();
+  return st->privkeys[keytype];
+}
+
+static int do_send_and_receive(struct ssh *from, struct ssh *to, struct sshbuf *store, int clobber, size_t *n) {
+  u_char type;
+  size_t len;
+  const u_char *buf;
+  int r;
+
+  for (*n = 0;; (*n)++) {
+    if ((r = ssh_packet_next(from, &type)) != 0) {
+      return r;
+    }
+    if (type != 0)
+      return 0;
+    buf = ssh_output_ptr(from, &len);
+    if (len == 0)
+      return 0;
+    if ((r = ssh_output_consume(from, len)) != 0) {
+      return r;
+    }
+    if (store != NULL && (r = sshbuf_put(store, buf, len)) != 0) {
+      return r;
+    }
+    if (!clobber && (r = ssh_input_append(to, buf, len)) != 0) {
+      return r;
+    }
+  }
+}
+
+static int run_kex(struct test_state *ts, struct ssh *client, struct ssh *server) {
+  int r = 0;
+  size_t cn, sn;
+
+  if (ts->sin != NULL) {
+    if ((r = ssh_input_append(server, sshbuf_ptr(ts->sin), sshbuf_len(ts->sin))) != 0) {
+      return r;
+    }
+    sshbuf_reset(ts->sin);
+  }
+  if (ts->cin != NULL) {
+    if ((r = ssh_input_append(client, sshbuf_ptr(ts->cin), sshbuf_len(ts->cin))) != 0) {
+      return r;
+    }
+    sshbuf_reset(ts->cin);
+  }
+  while (!server->kex->done || !client->kex->done) {
+    cn = sn = 0;
+    if ((r = do_send_and_receive(server, client, ts->smsgs, ts->cin != NULL, &sn)) != 0) {
+      break;
+    }
+    if ((r = do_send_and_receive(client, server, ts->cmsgs, ts->sin != NULL, &cn)) != 0) {
+      break;
+    }
+    if (cn == 0 && sn == 0) {
+      r = SSH_ERR_PROTOCOL_ERROR;
+      break;
+    }
+  }
+  return r;
+}
+
+static int do_kex_with_key(struct shared_state *st, struct test_state *ts, const char *kex, int keytype) {
+  struct ssh *client = NULL, *server = NULL;
+  struct sshkey *privkey = NULL, *pubkey = NULL;
+  struct kex_params kex_params;
+  const char *proposal[PROPOSAL_MAX] = {KEX_CLIENT};
+  char *myproposal[PROPOSAL_MAX] = {0}, *keyname = NULL;
+  int i, r = 0;
+
+  ts->cin = ts->sin = NULL;
+  if (ts->c_template != NULL && (ts->cin = sshbuf_fromb(ts->c_template)) == NULL)
+    abort();
+  if (ts->s_template != NULL && (ts->sin = sshbuf_fromb(ts->s_template)) == NULL)
+    abort();
+
+  pubkey = get_pubkey(st, keytype);
+  privkey = get_privkey(st, keytype);
+  keyname = xstrdup(sshkey_ssh_name(privkey));
+
+  for (i = 0; i < PROPOSAL_MAX; i++) {
+    const char *ccp = proposal[i];
+    if (i == PROPOSAL_SERVER_HOST_KEY_ALGS)
+      ccp = keyname;
+    else if (i == PROPOSAL_KEX_ALGS && kex != NULL)
+      ccp = kex;
+    if ((myproposal[i] = strdup(ccp)) == NULL) {
+      r = SSH_ERR_ALLOC_FAIL;
+      goto fail;
+    }
+  }
+  memcpy(kex_params.proposal, myproposal, sizeof(myproposal));
+  if ((r = ssh_init(&client, 0, &kex_params)) != 0) {
+    goto fail;
+  }
+  if ((r = ssh_init(&server, 1, &kex_params)) != 0) {
+    goto fail;
+  }
+  if ((r = ssh_add_hostkey(server, privkey)) != 0 || (r = ssh_add_hostkey(client, pubkey)) != 0) {
+    goto fail;
+  }
+  r = run_kex(ts, client, server);
+
+fail:
+  for (i = 0; i < PROPOSAL_MAX; i++)
+    free(myproposal[i]);
+  sshbuf_free(ts->sin);
+  sshbuf_free(ts->cin);
+  ssh_free(client);
+  ssh_free(server);
+  free(keyname);
+  return r;
+}
+
+} // extern "C"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  static struct shared_state *st = NULL;
+  if (st == NULL) {
+    st = (struct shared_state *)xcalloc(1, sizeof(*st));
+    log_init("kex_fuzzer", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_AUTH, 1);
+    if (prepare_keys(st) != 0) {
+      free(st);
+      st = NULL; // Prevent reuse on failure
+      return 0;
+    }
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  struct test_state *ts = (struct test_state *)xcalloc(1, sizeof(*ts));
+
+  if (provider.ConsumeBool()) {
+    ts->s_template = sshbuf_new();
+    const std::vector<uint8_t> v = provider.ConsumeRemainingBytes<uint8_t>();
+    sshbuf_put(ts->s_template, v.data(), v.size());
+  } else {
+    ts->c_template = sshbuf_new();
+    const std::vector<uint8_t> v = provider.ConsumeRemainingBytes<uint8_t>();
+    sshbuf_put(ts->c_template, v.data(), v.size());
+  }
+
+  // This will implicitly call kex_gen_server
+  do_kex_with_key(st, ts, "ecdh-sha2-nistp256", KEY_ECDSA);
+
+  sshbuf_free(ts->s_template);
+  sshbuf_free(ts->c_template);
+  free(ts);
+
+  return 0;
+}
+	

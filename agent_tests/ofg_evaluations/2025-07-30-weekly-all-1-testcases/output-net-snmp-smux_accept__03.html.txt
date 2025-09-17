@@ -1,0 +1,134 @@
+
+	
+<description>
+The `smux_accept` function accepts a new SMUX peer connection on a listening socket. It takes a socket descriptor `sd` as input, which should be a listening socket ready to accept new connections. The function calls `accept()` to get a new socket for the peer, then receives and processes an SMUX `OpenPDU` to authenticate the peer. If the peer is successfully authenticated, its file descriptor is returned. Otherwise, the function returns -1.
+</description>
+<requirements>
+<requirement>
+The function `real_init_smux()` must be called before `smux_accept`. This is because `real_init_smux()` creates and initializes the listening socket `smux_listen_sd` which is passed as an argument to `smux_accept`.
+</requirement>
+<requirement>
+The integer argument `sd` must be a valid file descriptor for a listening socket. `smux_accept` calls `accept()` on this descriptor, so it must be a socket that has been created with `socket()`, bound with `bind()`, and put in the listening state with `listen()`.
+</requirement>
+<requirement>
+A peer connection must be established on the listening socket `sd`. `smux_accept` blocks on `accept()`, so a `connect()` call must be made to the listening port to proceed with execution.
+</requirement>
+<requirement>
+The connected peer must send a valid SMUX `OpenPDU` after connecting. The function `smux_accept` attempts to receive and parse this PDU to authenticate the peer. Failure to do so will result in the connection being closed and an error returned.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int smux_accept(int sd)
+</function_signature>
+<project_name>
+net-snmp
+</project_name>
+
+	Fuzz target source:
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/agent/net-snmp-agent-includes.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+
+int smux_accept(int);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Basic initialization to prevent crashes in library code.
+    init_agent("smux_fuzzer");
+    init_snmp("smux_fuzzer");
+
+    int listen_sd = -1;
+    int accepted_sd = -1;
+    struct sockaddr_in server_addr;
+    pid_t pid;
+
+    // 1. Create a listening socket for the "agent"
+    listen_sd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sd < 0) {
+        return 0; // Cannot create socket, skip input
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_addr.sin_port = 0; // Let the OS choose an ephemeral port
+
+    if (bind(listen_sd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        close(listen_sd);
+        return 0; // Cannot bind, skip input
+    }
+
+    // Get the chosen port so the client (child) can connect
+    socklen_t len = sizeof(server_addr);
+    if (getsockname(listen_sd, (struct sockaddr *)&server_addr, &len) < 0) {
+        close(listen_sd);
+        return 0;
+    }
+
+    if (listen(listen_sd, 1) < 0) {
+        close(listen_sd);
+        return 0; // Cannot listen, skip input
+    }
+
+    // 2. Fork to create a client process
+    pid = fork();
+
+    if (pid < 0) { // Fork failed
+        close(listen_sd);
+        return 0;
+    }
+
+    if (pid == 0) { // Child process (the SMUX peer)
+        close(listen_sd); // Not needed in child
+
+        int client_sd = socket(AF_INET, SOCK_STREAM, 0);
+        if (client_sd < 0) {
+            _exit(1);
+        }
+
+        if (connect(client_sd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            close(client_sd);
+            _exit(1);
+        }
+
+        // Send the fuzzer data to the parent
+        ssize_t total_written = 0;
+        while (total_written < size) {
+            ssize_t written = write(client_sd, data + total_written, size - total_written);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            total_written += written;
+        }
+
+        close(client_sd);
+        _exit(0);
+    } else { // Parent process (the agent)
+        // 3. Call the function under test. It will accept the child's connection.
+        accepted_sd = smux_accept(listen_sd);
+
+        // 4. Clean up resources
+        if (accepted_sd >= 0) {
+            close(accepted_sd);
+        }
+        close(listen_sd);
+        wait(NULL); // Wait for child to exit to prevent zombie processes
+    }
+
+    return 0;
+}
+	

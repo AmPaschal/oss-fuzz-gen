@@ -1,0 +1,120 @@
+
+	
+<description>
+The `gnutls_record_recv_seq` function is responsible for receiving application data from a TLS session. It is a wrapper around the internal function `_gnutls_recv_int`, which handles the core logic of reading from the session's internal buffers and the transport layer. To function correctly, it requires a fully initialized and established TLS session, including a successful handshake. The function will read the decrypted application data into the user-provided buffer `data` and, if the `seq` pointer is not null, will write the 64-bit sequence number of the received record to it.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `session`, must be a valid `gnutls_session_t` object that has been initialized using `gnutls_init`. This is because the function operates on an initialized TLS session.
+</requirement>
+<requirement>
+The `gnutls_session_t` object should be initialized as a server using the `GNUTLS_SERVER` flag in `gnutls_init`. This is because the function is typically used in a server context to receive data from a client.
+</requirement>
+<requirement>
+A transport pull function must be set for the session using `gnutls_transport_set_pull_function`. This is because the underlying receive functions rely on this callback to get data from the network.
+</requirement>
+<requirement>
+A successful TLS handshake must be performed using `gnutls_handshake` before calling this function. This is because application data can only be received after the handshake is complete.
+</requirement>
+<requirement>
+If the third argument, `data_size`, is not zero, the second argument, `data`, must point to a valid memory buffer of at least `data_size` bytes. This is to prevent a buffer overflow when data is copied into it.
+</requirement>
+<requirement>
+If the fourth argument, `seq`, is not NULL, it must point to a buffer of at least 8 bytes. This is because the function will write the 8-byte record sequence number into this buffer.
+</requirement>
+<requirement>
+Server credentials must be set using a function like `gnutls_certificate_set_x509_key_file`. This is necessary for the server to authenticate itself to the client during the handshake.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+ssize_t gnutls_record_recv_seq(gnutls_session_t, void *, size_t, unsigned char *)
+</function_signature>
+<project_name>
+gnutls
+</project_name>
+
+	Fuzz target source:
+/*
+# Copyright 2016 Google Inc.
+# Copyright 2017 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+################################################################################
+*/
+
+#include <assert.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+#include <gnutls/gnutls.h>
+#include "mem.h"
+#include "fuzzer.h"
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	int res;
+	gnutls_session_t session;
+	gnutls_certificate_credentials_t xcred;
+	struct mem_st memdata;
+
+	res = gnutls_init(&session, GNUTLS_CLIENT);
+	assert(res >= 0);
+
+	res = gnutls_certificate_allocate_credentials(&xcred);
+	assert(res >= 0);
+	res = gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, xcred);
+	assert(res >= 0);
+
+	res = gnutls_priority_set_direct(
+		session, "NORMAL:+SIGN-EDDSA-ED448:" VERS_STR, NULL);
+	assert(res >= 0);
+
+	memdata.data = data;
+	memdata.size = size;
+
+	gnutls_transport_set_push_function(session, mem_push);
+	gnutls_transport_set_pull_function(session, mem_pull);
+	gnutls_transport_set_pull_timeout_function(session, mem_pull_timeout);
+	gnutls_transport_set_ptr(session, &memdata);
+
+	do {
+		res = gnutls_handshake(session);
+	} while (res < 0 && gnutls_error_is_fatal(res) == 0);
+
+	if (res >= 0) {
+		while (true) {
+			char buf[16384];
+			unsigned char seq[8];
+			res = gnutls_record_recv_seq(session, buf, sizeof(buf), seq);
+			if (res <= 0) {
+				break;
+			}
+		}
+	}
+
+	gnutls_deinit(session);
+	gnutls_certificate_free_credentials(xcred);
+	return 0;
+}
+	

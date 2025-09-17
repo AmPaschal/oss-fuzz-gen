@@ -1,0 +1,123 @@
+
+	
+<description>
+The `lou_hyphenate` function takes a string of wide characters and generates a hyphenation mask. It can operate in two modes. If `mode` is 0, the input is treated as text. If `mode` is not 0, the input is treated as braille and is first back-translated to text before hyphenation. The function uses a translation table specified by `tableList` to determine character properties and hyphenation rules.
+</description>
+<requirements>
+
+<requirement>
+The `tableList` argument must point to a valid, compiled translation table that contains hyphenation rules. This is because the function internally calls `lou_getTable` and expects it to return a table with a non-zero `hyphenStatesArray`.
+</requirement>
+<requirement>
+The `inlen` argument, representing the length of the input buffer `inbuf`, must be less than 100. This is to prevent a buffer overflow on the stack-allocated `textBuffer` which has a fixed size of `HYPHSTRING` (100).
+</requirement>
+<requirement>
+The `hyphens` buffer must be allocated with a size of at least `inlen + 1`. This is to ensure it can hold the resulting hyphenation mask and a null terminator.
+</requirement>
+<requirement>
+The `inbuf` argument should be a valid pointer to an array of `widechar` with `inlen` elements. It can be initialized from a fuzzer-provided string using the `_lou_extParseChars` function.
+</requirement>
+<requirement>
+The `mode` argument should be either 0 or 1. Other values are not explicitly handled and may lead to unexpected behavior, although the code only checks if it is zero or non-zero.
+</requirement>
+<requirement>
+The `lou_getTable` function should be called to obtain a `TranslationTableHeader`, and its `hyphenStatesArray` member should be checked for a non-zero value before calling `lou_hyphenate`. This ensures that the provided table actually supports hyphenation.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int lou_hyphenate(const char *, const widechar *, int, char *, int)
+</function_signature>
+<project_name>
+liblouis
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+extern "C" {
+#include "/src/liblouis/liblouis/liblouis.h"
+}
+
+// A silent log callback to prevent liblouis from printing to stderr.
+static void silent_log_callback(logLevels level, const char *msg) {
+  (void)level;
+  (void)msg;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  static bool initialized = false;
+  if (!initialized) {
+    lou_registerLogCallback(silent_log_callback);
+    initialized = true;
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  // We need some data for the table and some for the input string.
+  if (provider.remaining_bytes() < 2) {
+    return 0;
+  }
+
+  // 1. Create a temporary table file from fuzzer data.
+  std::vector<uint8_t> table_data =
+      provider.ConsumeBytes<uint8_t>(provider.ConsumeIntegralInRange<size_t>(
+          1, provider.remaining_bytes() - 1));
+
+  char table_filename[] = "/tmp/fuzz-hyphenate-XXXXXX";
+  int fd = mkstemp(table_filename);
+  if (fd == -1) {
+    return 0;
+  }
+
+  ssize_t written = write(fd, table_data.data(), table_data.size());
+  close(fd);
+  if (written != (ssize_t)table_data.size()) {
+    unlink(table_filename);
+    return 0;
+  }
+
+  // 2. Check if the table is valid. If not, we can't proceed.
+  if (lou_checkTable(table_filename) == 0) {
+    unlink(table_filename);
+    return 0;
+  }
+
+  // 3. Prepare the parameters for lou_hyphenate.
+  const char *tableList = table_filename;
+  int mode = provider.ConsumeBool();
+  
+  std::vector<uint8_t> raw_inbuf_vec = provider.ConsumeRemainingBytes<uint8_t>();
+  const widechar* inbuf = reinterpret_cast<const widechar*>(raw_inbuf_vec.data());
+  int inlen = raw_inbuf_vec.size() / sizeof(widechar);
+
+  if (inlen == 0) {
+    lou_free();
+    unlink(table_filename);
+    return 0;
+  }
+
+  // Allocate a buffer for the hyphenation output.
+  char *hyphens = new char[inlen + 1];
+
+  // 4. Call the function under test.
+  lou_hyphenate(tableList, inbuf, inlen, hyphens, mode);
+
+  // 5. Clean up resources.
+  delete[] hyphens;
+  lou_free(); // Frees resources loaded by lou_checkTable/lou_hyphenate.
+  unlink(table_filename);
+
+  return 0;
+}
+	

@@ -1,0 +1,175 @@
+
+	
+<description>
+The `CppCheck::check` function serves as an entry point for analyzing a single file with a specific configuration. It takes a `FileSettings` object, which encapsulates all the necessary information for the analysis, such as the file path, preprocessor definitions, include paths, and language standard.
+
+The function operates by first creating a temporary copy of the main `Settings` object and augmenting it with the file-specific settings from the provided `FileSettings` argument. It then creates a new temporary `CppCheck` instance initialized with these combined settings. This temporary instance is then used to perform the actual analysis of the file by calling either its `check()` or `checkFile()` method, depending on whether the clang parser is enabled in the settings. Finally, it merges some of the analysis results, like function usage data, back into the original `CppCheck` object.
+
+This design allows for checking multiple files with different configurations within a single `CppCheck` session, as each call to `check` uses a tailored, temporary configuration without altering the global settings of the main `CppCheck` instance.
+</description>
+<requirements>
+<requirement>
+A `CppCheck` object must be created before the target function is called. The `mSettings` of this object, particularly the `clang` boolean, dictates the code path taken within the target function.
+</requirement>
+<requirement>
+The `FileSettings` argument must be initialized via its constructor, providing a file path, language, and size. This ensures the essential `FileWithDetails` member is correctly set up for the analysis.
+</requirement>
+<requirement>
+The `file.mPath` member of the `FileSettings` argument must be a non-empty string pointing to a valid file. An empty path will cause the `FileWithDetails` constructor to throw a `std::runtime_error`.
+</requirement>
+<requirement>
+The file corresponding to `file.mPath` should contain source code controlled by the fuzzer. This is the primary input that the `CppCheck` engine will analyze.
+</requirement>
+<requirement>
+The `standard` member of the `FileSettings` object should be a valid C or C++ standard (e.g., "c99", "c++11", "c++20"). This is necessary for the parser to apply the correct language rules during syntax analysis.
+</requirement>
+<requirement>
+The `platformType` member of the `FileSettings` object should be set to a valid value from the `Platform::Type` enum. This ensures that the analysis correctly handles platform-dependent code.
+</requirement>
+<requirement>
+The `defines` member of the `FileSettings` object should be a string of semicolon-separated preprocessor definitions. Fuzzing this input allows for the exploration of different code paths dependent on compile-time macros.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+unsigned int CppCheck::check(const struct FileSettings &)
+</function_signature>
+<project_name>
+cppcheck
+</project_name>
+
+	Fuzz target source:
+/*
+ * Cppcheck - A tool for static C/C++ code analysis
+ * Copyright (C) 2007-2025 Cppcheck team.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "cppcheck.h"
+#include "errorlogger.h"
+#include "errortypes.h"
+#include "filesettings.h"
+#include "settings.h"
+#include "suppressions.h"
+#include "/src/cppcheck/lib/checkunusedfunctions.h"
+
+#include <string>
+
+#ifndef NO_FUZZ
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+
+#include "type2.h"
+#else
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#endif
+
+class DummyErrorLogger : public ErrorLogger {
+public:
+    void reportOut(const std::string& /*outmsg*/, Color /*c*/) override {}
+    void reportErr(const ErrorMessage& /*msg*/) override {}
+    void reportProgress(const std::string& /*filename*/,
+                        const char /*stage*/[],
+                        const std::size_t /*value*/) override {}
+    void reportMetric(const std::string & /*metric*/) override {}
+};
+
+static Settings create_settings()
+{
+    // TODO: load std.cfg
+    Settings s;
+    s.templateFormat = "{bold}{file}:{line}:{column}: {red}{inconclusive:{magenta}}{severity}:{inconclusive: inconclusive:}{default} {message} [{id}]{reset}\\n{code}";
+    s.templateLocation = "{bold}{file}:{line}:{column}: {dim}note:{reset} {info}\\n{code}";
+    s.addEnabled("all");
+    s.certainty.setEnabled(Certainty::inconclusive, true);
+    return s;
+}
+static const Settings s_settings = create_settings();
+static DummyErrorLogger s_errorLogger;
+
+#ifndef NO_FUZZ
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    FileSettings fs("fuzz.cpp",
+                    fdp.PickValueInArray<Standards::Language>({Standards::Language::None, Standards::Language::C, Standards::Language::CPP}),
+                    fdp.ConsumeIntegralInRange<size_t>(0, 100000));
+
+    fs.defines = fdp.ConsumeRandomLengthString(100);
+    fs.standard = fdp.ConsumeRandomLengthString(20);
+    fs.platformType = fdp.PickValueInArray<Platform::Type>({Platform::Type::Unspecified, Platform::Type::Native, Platform::Type::Win32A, Platform::Type::Win32W, Platform::Type::Win64, Platform::Type::Unix32, Platform::Type::Unix64, Platform::Type::File});
+    fs.msc = fdp.ConsumeBool();
+    fs.useMfc = fdp.ConsumeBool();
+
+    while (fdp.ConsumeBool() && fdp.remaining_bytes() > 50) {
+        fs.undefs.insert(fdp.ConsumeRandomLengthString(50));
+    }
+    while (fdp.ConsumeBool() && fdp.remaining_bytes() > 100) {
+        fs.includePaths.push_back(fdp.ConsumeRandomLengthString(100));
+    }
+
+    fs.cfg = fdp.ConsumeRemainingBytesAsString();
+
+    Suppressions supprs;
+    CppCheck cppcheck(s_settings, supprs, s_errorLogger, false, nullptr);
+
+    cppcheck.check(fs);
+
+    return 0;
+}
+#else
+// This part is for standalone execution and is not used by the fuzzer.
+// We can keep it as is from the original file.
+static const FileWithDetails s_file("test.cpp", Standards::Language::CPP, 0);
+
+static void doCheck(const std::string& code)
+{
+    Suppressions supprs;
+    CppCheck cppcheck(s_settings, supprs, s_errorLogger, false, nullptr);
+    cppcheck.check(s_file, code);
+}
+
+int main(int argc, char * argv[])
+{
+    if (argc < 2 || argc > 3)
+        return EXIT_FAILURE;
+
+    std::ifstream f(argv[1]);
+    if (!f.is_open())
+        return EXIT_FAILURE;
+
+    std::ostringstream oss;
+    oss << f.rdbuf();
+
+    if (!f.good())
+        return EXIT_FAILURE;
+
+    const int cnt = (argc == 3) ? std::stoi(argv[2]) : 1;
+
+    const std::string code = oss.str();
+    for (int i = 0; i < cnt; ++i)
+        doCheck(code);
+
+    return EXIT_SUCCESS;
+}
+#endif
+	

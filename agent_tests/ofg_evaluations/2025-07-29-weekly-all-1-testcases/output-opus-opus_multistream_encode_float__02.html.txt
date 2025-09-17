@@ -1,0 +1,114 @@
+
+	
+<description>
+The `opus_multistream_encode_float` function encodes a multistream Opus frame from floating-point input. It is a wrapper around the internal `opus_multistream_encode_native` function. The encoder state is initialized by `opus_multistream_encoder_create` or `opus_multistream_surround_encoder_create`. The function takes an initialized `OpusMSEncoder`, a PCM audio data buffer, the frame size, an output buffer for the encoded data, and the maximum size of the output buffer. It returns the number of bytes written to the output buffer, or an error code.
+</description>
+<requirements>
+
+<requirement>
+The `OpusMSEncoder` struct pointed to by the first argument must be initialized by `opus_multistream_encoder_create` or `opus_multistream_surround_encoder_create`. This is to ensure the encoder is in a valid state before encoding.
+</requirement>
+<requirement>
+The `frame_size` argument should be a value that is a multiple of the input sample rate. Common values are derived from frame times of 2.5, 5, 10, 20, 40, or 60 ms.
+</requirement>
+<requirement>
+The `pcm` buffer should contain `frame_size * channels` samples, where `channels` is the number of channels specified during encoder creation. This is to prevent out-of-bounds reads.
+</requirement>
+<requirement>
+The `max_data_bytes` argument should be large enough to hold the encoded output. A recommended size is 1500 bytes as used in the fuzzer. A value that's too small will result in an `OPUS_BUFFER_TOO_SMALL` error.
+</requirement>
+<requirement>
+The `OpusMSEncoder` can be configured using `opus_multistream_encoder_ctl` after creation. The fuzzer demonstrates setting various options like complexity, VBR, and bandwidth, which can affect the encoding process and output.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int opus_multistream_encode_float(OpusMSEncoder *, const opus_val16 *, int, unsigned char *, opus_int32)
+</function_signature>
+<project_name>
+opus
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <vector>
+#include <cmath>
+
+#include "opus.h"
+#include "opus_multistream.h"
+#include "../celt/arch.h"
+#include "/src/opus/include/opus_custom.h"
+
+#define MAX_CHANNELS 8
+#define MAX_PACKET_BYTES 1500
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+
+  const opus_int32 kSampleRates[] = {8000, 12000, 16000, 24000, 48000};
+  opus_int32 Fs = fdp.PickValueInArray(kSampleRates);
+
+  int channels = fdp.ConsumeIntegralInRange<int>(1, MAX_CHANNELS);
+  int streams = fdp.ConsumeIntegralInRange<int>(1, channels);
+  int coupled_streams = fdp.ConsumeIntegralInRange<int>(0, streams);
+
+  if (streams + coupled_streams > channels) {
+    coupled_streams = channels - streams;
+  }
+
+  std::vector<unsigned char> mapping(channels);
+  for (int i = 0; i < channels; ++i) {
+      if (i < streams + coupled_streams) {
+          mapping[i] = i;
+      } else {
+          mapping[i] = 255;
+      }
+  }
+
+  const int kApplications[] = {OPUS_APPLICATION_VOIP, OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_RESTRICTED_LOWDELAY};
+  int application = fdp.PickValueInArray(kApplications);
+
+  int error;
+  OpusMSEncoder *enc = opus_multistream_encoder_create(Fs, channels, streams, coupled_streams, mapping.data(), application, &error);
+
+  if (error != OPUS_OK || enc == nullptr) {
+    return 0;
+  }
+
+  opus_multistream_encoder_ctl(enc, OPUS_SET_BITRATE(fdp.ConsumeIntegralInRange<int>(500, 1000000)));
+  opus_multistream_encoder_ctl(enc, OPUS_SET_COMPLEXITY(fdp.ConsumeIntegralInRange<int>(0, 10)));
+  if (fdp.ConsumeBool()) {
+    opus_multistream_encoder_ctl(enc, OPUS_SET_VBR(fdp.ConsumeBool()));
+  }
+  if (fdp.ConsumeBool()) {
+    const int kBandwidths[] = {OPUS_BANDWIDTH_NARROWBAND, OPUS_BANDWIDTH_MEDIUMBAND, OPUS_BANDWIDTH_WIDEBAND, OPUS_BANDWIDTH_SUPERWIDEBAND, OPUS_BANDWIDTH_FULLBAND};
+    opus_multistream_encoder_ctl(enc, OPUS_SET_BANDWIDTH(fdp.PickValueInArray(kBandwidths)));
+  }
+
+  const int kFrameDurationsMs[] = {10, 20, 40, 60};
+  int frame_duration_ms = fdp.PickValueInArray(kFrameDurationsMs);
+  int frame_size = Fs * frame_duration_ms / 1000;
+
+  size_t pcm_size = frame_size * channels;
+  if (fdp.remaining_bytes() < pcm_size * sizeof(float)) {
+    opus_multistream_encoder_destroy(enc);
+    return 0;
+  }
+
+  std::vector<float> pcm(pcm_size);
+  fdp.ConsumeData(pcm.data(), pcm.size() * sizeof(float));
+
+  unsigned char out_buffer[MAX_PACKET_BYTES];
+
+  opus_multistream_encode_float(enc, pcm.data(), frame_size, out_buffer, MAX_PACKET_BYTES);
+
+  opus_multistream_encoder_destroy(enc);
+
+  return 0;
+}
+	

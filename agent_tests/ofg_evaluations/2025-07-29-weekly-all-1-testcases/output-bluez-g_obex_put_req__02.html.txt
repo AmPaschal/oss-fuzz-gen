@@ -1,0 +1,152 @@
+
+	
+<description>
+The `g_obex_put_req` function initiates an OBEX PUT request to send data. It is a variadic function that takes a `GObex` session object, data producer and completion callbacks, user data, and a variable number of OBEX headers. The function internally creates a `GObexPacket` with the provided headers and then calls `g_obex_put_req_pkt` to queue and send the request. The data to be sent is provided by the `data_func` callback, and the `complete_func` is called upon completion of the transfer. The variadic header list must be terminated with `G_OBEX_HDR_INVALID`.
+</description>
+<requirements>
+<requirement>
+The first argument, `obex`, must be a valid `GObex` object initialized by `g_obex_new()`. This object represents the OBEX session and is essential for the function to operate.
+</requirement>
+<requirement>
+The `data_func` callback (GObexDataProducer) must be a valid function pointer. It must return the number of bytes written to the buffer, 0 on completion, or a negative value on error.
+</requirement>
+<requirement>
+The `complete_func` callback (GObexFunc) must be a valid function pointer. It is responsible for cleaning up resources allocated for the transfer, such as file handles or memory.
+</requirement>
+<requirement>
+The list of variadic arguments must be terminated with `G_OBEX_HDR_INVALID`. Failure to do so will result in undefined behavior due to reading beyond the argument list.
+</requirement>
+<requirement>
+The `user_data` pointer should point to a valid memory location containing any data needed by the callbacks. This data must remain valid for the duration of the transfer.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+guint g_obex_put_req(GObex *, GObexDataProducer, GObexFunc, gpointer, GError **, guint, void)
+</function_signature>
+<project_name>
+bluez
+</project_name>
+
+	Fuzz target source:
+#include <config.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <glib.h>
+#include <glib-object.h>
+
+#include "gobex/gobex.h"
+#include "gobex/gobex-defs.h"
+#include "gobex/gobex-header.h"
+
+// These macros are internal to gobex-header.c but needed for the fuzzer
+#define G_OBEX_HDR_ENC_UNICODE	(0 << 6)
+#define G_OBEX_HDR_ENC_BYTES	(1 << 6)
+#define G_OBEX_HDR_ENC_UINT8	(2 << 6)
+#define G_OBEX_HDR_ENC_UINT32	(3 << 6)
+
+// Fuzzer-controlled data for callbacks
+struct FuzzData {
+	const uint8_t *data;
+	size_t size;
+};
+
+// Mock GObexDataProducer callback
+static gssize data_producer(void *buf, gsize len, gpointer user_data)
+{
+	struct FuzzData *fuzz_data = user_data;
+	if (!fuzz_data || fuzz_data->size == 0) {
+		return 0; // No more data
+	}
+
+	gsize to_copy = MIN(len, fuzz_data->size);
+	memcpy(buf, fuzz_data->data, to_copy);
+
+	fuzz_data->data += to_copy;
+	fuzz_data->size -= to_copy;
+
+	return to_copy;
+}
+
+// Mock GObexFunc callback
+static void completion_handler(GObex *obex, GError *err, gpointer user_data)
+{
+	// No-op for fuzzing
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	if (size < 1) {
+		return 0;
+	}
+
+	GObex *obex = g_obex_new(NULL, 0, -1, -1);
+	if (!obex) {
+		return 0;
+	}
+
+	struct FuzzData fuzz_data = { .data = data, .size = size };
+	GError *err = NULL;
+
+	guint header_id = data[0];
+	const uint8_t *value_ptr = data + 1;
+	size_t value_size = size - 1;
+
+	// Construct and call with one header based on fuzzer input
+	switch (header_id & 0xC0) {
+	case G_OBEX_HDR_ENC_UNICODE:
+		if (value_size > 0) {
+			char *str = g_strndup((const char *)value_ptr, value_size);
+			g_obex_put_req(obex, data_producer, completion_handler, &fuzz_data, &err,
+				       header_id, str, G_OBEX_HDR_INVALID);
+			g_free(str);
+		}
+		break;
+
+	case G_OBEX_HDR_ENC_BYTES:
+		if (value_size > 0) {
+			GBytes *bytes = g_bytes_new(value_ptr, value_size);
+			g_obex_put_req(obex, data_producer, completion_handler, &fuzz_data, &err,
+				       header_id, bytes, G_OBEX_HDR_INVALID);
+			g_bytes_unref(bytes);
+		}
+		break;
+
+	case G_OBEX_HDR_ENC_UINT8:
+		if (value_size >= sizeof(guint8)) {
+			guint8 val = *value_ptr;
+			g_obex_put_req(obex, data_producer, completion_handler, &fuzz_data, &err,
+				       header_id, val, G_OBEX_HDR_INVALID);
+		}
+		break;
+
+	case G_OBEX_HDR_ENC_UINT32:
+		if (value_size >= sizeof(guint32)) {
+			guint32 val;
+			memcpy(&val, value_ptr, sizeof(guint32));
+			g_obex_put_req(obex, data_producer, completion_handler, &fuzz_data, &err,
+				       header_id, val, G_OBEX_HDR_INVALID);
+		}
+		break;
+	}
+
+	if (err) {
+		g_error_free(err);
+		err = NULL;
+	}
+
+	// Also call with no headers
+	g_obex_put_req(obex, data_producer, completion_handler, &fuzz_data, &err, G_OBEX_HDR_INVALID);
+
+	if (err) {
+		g_error_free(err);
+	}
+
+	g_object_unref(obex);
+
+	return 0;
+}
+	

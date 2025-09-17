@@ -1,0 +1,164 @@
+
+	
+<description>
+The `symbolic_to_physical` function converts a symbolic representation of a compressed block (`symbolic_compressed_block`) into a physical hardware-ready format (`physical_compressed_block`, or `pcb`). This process involves several steps, starting with handling special cases like constant-color blocks. For non-constant blocks, it compresses and encodes weights using an Integer Sequence Encoding (ISE) scheme, then writes various metadata fields such as block mode, partition count, and color endpoint formats into the 16-byte `pcb` array at specific bit positions. The function's correct execution depends heavily on the validity of the data within the `symbolic_compressed_block` struct, as many of its fields are used as indices into tables or for controlling logic, making a well-formed input critical for stability.
+</description>
+<requirements>
+<requirement>
+The `scb.block_type` must not be `SYM_BTYPE_ERROR`. The function asserts this condition, and a failure to meet it will result in a crash.
+</requirement>
+<requirement>
+The `scb.block_mode` must be a valid index for the `bsd.block_modes` array. An invalid index will cause an out-of-bounds read when `bsd.get_block_mode()` is called.
+</requirement>
+<requirement>
+The `scb.quant_mode` must be between `QUANT_6` and `QUANT_32`, inclusive. This is to prevent an out-of-bounds access on `color_uquant_to_scrambled_pquant_tables`.
+</requirement>
+<requirement>
+The `scb.partition_count` must be at least 1 for non-constant block types. This is because it is used in calculations like `partition_count - 1` and as a loop bound.
+</requirement>
+<requirement>
+The `bsd` argument, a `block_size_descriptor`, should be initialized by calling `init_block_size_descriptor`. A properly initialized `bsd` is crucial as it provides the block mode and decimation information required for encoding.
+</requirement>
+<requirement>
+The `pcb` parameter must be a writable buffer of at least 16 bytes. The function writes 16 bytes of physical block data into this buffer.
+</requirement>
+<requirement>
+The upper 2 bits of each element in `scb.color_formats` must be less than or equal to 3. This is to prevent an assertion failure `assert(vals <= 8)` where `vals` is calculated based on these bits.
+</requirement>
+<requirement>
+The values in the `scb.color_values` array must be valid indices for the `pack_table` which is derived from `color_uquant_to_scrambled_pquant_tables`. An invalid value will result in an out-of-bounds read.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void symbolic_to_physical(const struct block_size_descriptor &, const struct symbolic_compressed_block &, uint8_t *)
+</function_signature>
+<project_name>
+astc-encoder
+</project_name>
+
+	Fuzz target source:
+// SPDX-License-Identifier: Apache-2.0
+// ----------------------------------------------------------------------------
+// Copyright 2020-2021 Arm Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License. You may obtain a copy
+// of the License at:
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief Fuzz target for symbolic_to_physical().
+ *
+ * This function is the final entrypoint for compressing a symbolic block into
+ * a 16 byte physical ASTC data block for storing on disk. The symbolic block
+ * can contain arbitrary data, but the block size used must be a valid
+ * ASTC block footprint.
+ */
+
+#include "/src/astc-encoder/Source/astcenc_internal.h"
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <array>
+#include <vector>
+
+struct BlockSizes
+{
+	int x;
+	int y;
+	int z;
+};
+
+std::array<BlockSizes, 3> testSz {{
+	{ 4,  4, 1}, // Highest bitrate
+	{12, 12, 1}, // Largest 2D block
+	{6,  6,  6}  // Largest 3D block
+}};
+
+std::array<block_size_descriptor, 3> testBSD;
+
+/**
+ * @brief Utility function to create all of the block size descriptors needed.
+ *
+ * This is triggered once via a static initializer.
+ *
+ * Triggering once is important so that we only create a single BSD per block
+ * size we need, rather than one per fuzzer iteration (it's expensive). This
+ * improves fuzzer throughput by ~ 1000x!
+ *
+ * Triggering via a static initializer, rather than a lazy init in the fuzzer
+ * function, is important because is means that the BSD is allocated before
+ * fuzzing starts. This means that leaksanitizer will ignore the fact that we
+ * "leak" the dynamic allocations inside the BSD (we never call term()).
+ */
+bool bsd_initializer()
+{
+	for (size_t i = 0; i < testSz.size(); i++)
+	{
+		init_block_size_descriptor(
+		    testSz[i].x,
+		    testSz[i].y,
+		    testSz[i].z,
+		    false,
+		    4,
+		    1.0f,
+		    testBSD[i]);
+	}
+
+	return true;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	// Preinitialize the block size descriptors we need
+	static bool init = bsd_initializer();
+
+	FuzzedDataProvider stream(data, size);
+
+	// We need enough data to populate the symbolic block
+	if (size < sizeof(symbolic_compressed_block))
+	{
+		return 0;
+	}
+
+	// Select a block size to test
+	int i = stream.ConsumeIntegralInRange<int>(0, (int)testSz.size() - 1);
+	const block_size_descriptor& bsd = testBSD[i];
+
+	// Populate the symbolic block
+	symbolic_compressed_block scb;
+	size_t consumed = stream.ConsumeData(&scb, sizeof(scb));
+	if (consumed != sizeof(scb))
+	{
+		return 0;
+	}
+
+	// Clamp fuzzed values to ensure they are valid, so we get past
+	// initial checks and into the core logic.
+	if (scb.block_type == SYM_BTYPE_ERROR)
+	{
+		scb.block_type = SYM_BTYPE_NONCONST;
+	}
+
+	scb.partition_count = (scb.partition_count % 4) + 1;
+	scb.block_mode %= bsd.block_mode_count_all;
+
+	// Prepare the output buffer
+	uint8_t pcb[16];
+
+	// Call the function under test
+	symbolic_to_physical(bsd, scb, pcb);
+
+	return 0;
+}
+	

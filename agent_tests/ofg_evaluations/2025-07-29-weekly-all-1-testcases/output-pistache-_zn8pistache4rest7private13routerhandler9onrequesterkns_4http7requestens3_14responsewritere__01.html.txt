@@ -1,0 +1,149 @@
+
+	
+<description>
+The function `Pistache::Rest::Private::RouterHandler::onRequest` is the main entry point for handling an HTTP request by the Pistache REST router. It receives an `Http::Request` and an `Http::ResponseWriter`. Its primary role is to delegate the request to the `route` method of its internal `router` object. The `router` then attempts to find a matching route based on the request's method and resource path. If a route is found, the corresponding handler is invoked. If not, a "Not Found" response might be sent if a handler for that case is registered.
+
+For the function to be tested effectively, the `RouterHandler` must be properly initialized with a `Router` that has routes configured. The `Http::Request` object must also be populated with a method and a resource path that can be used for routing decisions. The `Http::ResponseWriter` can be created with a null peer, which is safe for testing purposes as the implementation checks for a null peer before using it.
+</description>
+<requirements>
+<requirement>
+The `router` member of the `Pistache::Rest::Private::RouterHandler` must be initialized with a valid `Pistache::Rest::Router` object.
+This is because the `onRequest` function directly dereferences the `router` pointer to call its `route` method, and a null pointer would lead to a crash.
+</requirement>
+<requirement>
+The `Pistache::Rest::Router` object should be configured with at least one route before being used to initialize the `RouterHandler`.
+This is because without any configured routes, the `router->route()` call will never find a match, leading to poor code coverage.
+</requirement>
+<requirement>
+The `Http::Request` argument should have its `method` and `resource` fields populated.
+This is because the router uses the request's HTTP method and resource path to look up the appropriate route handler.
+</requirement>
+<requirement>
+The `Http::ResponseWriter` can be constructed with a `nullptr` for the `Tcp::Peer*` argument.
+This is because the `ResponseWriter`'s methods check if the internal `peer_` is null before using it, making it safe to use a `nullptr` in a testing environment.
+</requirement>
+<requirement>
+The `resource` string of the `Http::Request` should be fuzzed.
+This is because the resource path is the primary input to the route matching algorithm, and fuzzing it is crucial for testing the parsing and matching of different path structures.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Rest::Private::RouterHandler::onRequest(const Request &, ResponseWriter)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include "/src/pistache/include/pistache/http.h"
+#include <pistache/router.h>
+#include <memory>
+#include <string>
+#include <vector>
+
+// Helper to ignore exceptions, a good practice adopted from the project's
+// existing fuzzers.
+template <class F>
+void ignoreExceptions(const F &func) {
+  try {
+    func();
+  } catch (...) {
+  }
+}
+
+// A context class to handle the one-time initialization of the router
+// and router handler. This is more efficient than re-creating these complex
+// objects for every fuzzer input.
+class FuzzContext {
+public:
+    FuzzContext() {
+        auto router = std::make_shared<Pistache::Rest::Router>();
+
+        // Define a simple handler function for our routes. Its signature is
+        // compatible with Pistache::Rest::Route::Handler.
+        auto handler_func = [](const Pistache::Rest::Request&, Pistache::Http::ResponseWriter resp) {
+            ignoreExceptions([&] { resp.send(Pistache::Http::Code::Ok); });
+            return Pistache::Rest::Route::Result::Ok;
+        };
+
+        // Add routes for various HTTP methods to ensure the router can be
+        // exercised. A parameterized route is used to test path matching.
+        // The handler_func is passed directly as it's convertible to Route::Handler.
+        router->get("/:path", handler_func);
+        router->post("/:path", handler_func);
+        router->put("/:path", handler_func);
+        router->del("/:path", handler_func);
+
+        // Initialize the handler with our configured router.
+        handler = std::make_unique<Pistache::Rest::Private::RouterHandler>(router);
+    }
+
+    Pistache::Rest::Private::RouterHandler* getHandler() {
+        return handler.get();
+    }
+
+private:
+    std::unique_ptr<Pistache::Rest::Private::RouterHandler> handler;
+};
+
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Static context to ensure one-time initialization.
+    static FuzzContext context;
+
+    FuzzedDataProvider provider(data, size);
+
+    // 1. Create the Pistache::Http::Request object.
+    // We create a raw HTTP request string from fuzzed data and then use the
+    // Pistache parser. This is a realistic way to create a valid Request object.
+    const auto method = provider.PickValueInArray<std::string>({
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"
+    });
+    const auto resource = provider.ConsumeRemainingBytesAsString();
+    
+    // Prevent trivial header injection through the resource path.
+    if (resource.find('\n') != std::string::npos || resource.find('\r') != std::string::npos) {
+        return 0;
+    }
+
+    std::string raw_request = method + " " + resource + " HTTP/1.1\r\n"
+                              "Host: fuzzer\r\n"
+                              "Content-Length: 0\r\n\r\n";
+
+    Pistache::Http::RequestParser parser(Pistache::Const::DefaultMaxRequestSize);
+    parser.feed(raw_request.data(), raw_request.size());
+
+    Pistache::Http::Private::State state = Pistache::Http::Private::State::Again;
+    ignoreExceptions([&] {
+        state = parser.parse();
+    });
+
+    // If the request could not be parsed, we cannot proceed.
+    if (state != Pistache::Http::Private::State::Done) {
+        return 0;
+    }
+    const Pistache::Http::Request& request = parser.request;
+
+    // 2. Create the Pistache::Http::ResponseWriter object.
+    // As per the requirements, it can be constructed with null/empty pointers
+    // for use in a testing environment.
+    Pistache::Http::ResponseWriter response(
+        Pistache::Http::Version::Http11,
+        nullptr, // Tcp::Transport*
+        nullptr, // Handler*
+        std::weak_ptr<Pistache::Tcp::Peer>()
+    );
+
+    // 3. Call the function under test.
+    auto* router_handler = context.getHandler();
+    ignoreExceptions([&] {
+        router_handler->onRequest(request, std::move(response));
+    });
+
+    return 0;
+}
+	

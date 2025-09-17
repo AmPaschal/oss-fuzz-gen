@@ -1,0 +1,110 @@
+
+	
+<description>
+The `raw_expression_tree_walker_impl` function is a recursive walker for raw PostgreSQL parse trees. It traverses a tree of `Node` structures, starting from the `node` parameter. For each node encountered, it invokes the `walker` callback function, passing the node itself and a generic `context` pointer. This allows callers to perform custom, stateful analysis on the parse tree. The traversal of a branch of the tree is stopped if the `walker` callback returns `true`. The function is designed to handle all known raw expression node types, and it includes a call to `check_stack_depth` to prevent stack overflows caused by excessively deep expression trees. An error is raised if an unknown node type is encountered. The callers in the codebase use it to extract information like constants and statements from the parse tree.
+</description>
+<requirements>
+<requirement>
+The `node` argument must be a valid pointer to a `Node` structure representing a parsed SQL query. To ensure validity, it is recommended to create the `Node` tree by parsing a SQL query string with a function like `pg_query_parse()`.
+</requirement>
+<requirement>
+The input `node` can have a large depth. The fuzzer should generate deeply nested expression trees to test the `check_stack_depth()` mechanism for preventing stack overflows.
+</requirement>
+<requirement>
+The `walker` argument must be a valid function pointer of type `tree_walker_callback`. The callback function must be able to handle any valid `Node` type passed to it.
+</requirement>
+<requirement>
+The `context` argument is a `void` pointer passed to the `walker` callback, which is responsible for managing the memory of the associated context data structure.
+</requirement>
+<requirement>
+The `walker` callback should be implemented to randomly return `true` or `false`. This ensures that both early termination and full traversal of the expression tree are tested.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool raw_expression_tree_walker_impl(Node *, tree_walker_callback, void *)
+</function_signature>
+<project_name>
+libpg_query
+</project_name>
+
+	Fuzz target source:
+#include <pg_query.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+// The main postgres header. This must be included before other postgres headers.
+#include "postgres.h"
+
+// Header for the function-under-test and its dependencies.
+#include "nodes/nodeFuncs.h"
+
+// Internal headers needed for raw parsing.
+#include "src/pg_query_internal.h"
+
+// Callback function to be used with the walker.
+// Randomly returns true to stop traversal, or false to continue.
+static bool
+walker_callback(Node *node, void *context)
+{
+	(void)node;		// Unused
+	(void)context;	// Unused
+
+	// Return a deterministic pseudo-random boolean based on the node pointer.
+	// This avoids stateful `rand()` and ensures both early termination and
+	// full traversal paths are tested.
+	return ((uintptr_t)node) % 3 == 0;
+}
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	// Create a null-terminated string from the fuzzer input.
+	char *new_str = (char *)malloc(size + 1);
+	if (new_str == NULL) {
+		return 0;
+	}
+	memcpy(new_str, data, size);
+	new_str[size] = '\0';
+
+	// The library uses its own memory management. We need to enter its memory context.
+	MemoryContext ctx = pg_query_enter_memory_context();
+
+	// Use the internal raw_parse function to get a parse tree (List of RawStmt).
+	PgQueryInternalParsetreeAndError result = pg_query_raw_parse(new_str, PG_QUERY_PARSE_DEFAULT);
+
+	// If parsing was successful and we have a tree, walk it.
+	if (result.tree != NULL) {
+		const ListCell *lc;
+
+		// The result is a list of statements.
+		foreach(lc, result.tree)
+		{
+			RawStmt *raw_stmt = lfirst_node(RawStmt, lc);
+
+			// Walk the statement's node tree.
+			if (raw_stmt && raw_stmt->stmt != NULL) {
+				raw_expression_tree_walker_impl(raw_stmt->stmt, walker_callback, NULL);
+			}
+		}
+	}
+
+	// Clean up resources.
+	if (result.error) {
+		pg_query_free_error(result.error);
+	}
+	free(result.stderr_buffer);
+
+	// Exit the memory context, which frees the parse tree and other allocations.
+	pg_query_exit_memory_context(ctx);
+
+	free(new_str);
+
+	return 0;
+}
+	

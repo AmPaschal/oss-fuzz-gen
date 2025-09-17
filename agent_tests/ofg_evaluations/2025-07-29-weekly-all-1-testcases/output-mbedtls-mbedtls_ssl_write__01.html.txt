@@ -1,0 +1,161 @@
+
+	
+<description>
+The `mbedtls_ssl_write` function is used to write application data to an established SSL/TLS connection. It takes an SSL context, a buffer containing the data, and the length of the data as input. Before this function can be called, a complete SSL/TLS handshake must have been performed to bring the connection state to `MBEDTLS_SSL_HANDSHAKE_OVER`. The function handles the process of encrypting the data and sending it over the underlying transport. For TLS, it can fragment large buffers into multiple records. For DTLS, it expects the buffer size to be within the negotiated maximum fragment length.
+</description>
+<requirements>
+<requirement>
+The `mbedtls_ssl_context` object must be initialized by calling `mbedtls_ssl_init()` and `mbedtls_ssl_setup()`. This is because the `mbedtls_ssl_context` is a complex structure with many internal fields that must be set to a consistent state, which is handled by these initialization functions.
+</requirement>
+<requirement>
+The `mbedtls_ssl_config` object, passed to `mbedtls_ssl_setup`, must be initialized, for example using `mbedtls_ssl_config_init` and `mbedtls_ssl_config_defaults`. This is because the SSL context relies on a valid configuration to be set up correctly, including endpoint role (client/server), ciphersuites, and other security parameters.
+</requirement>
+<requirement>
+The I/O callbacks must be set for the SSL context using `mbedtls_ssl_set_bio()`. The `mbedtls_ssl_write` function uses these callbacks to send the encrypted data over the network and will fail without them.
+</requirement>
+<requirement>
+A successful SSL/TLS handshake must be completed by calling `mbedtls_ssl_handshake()` before calling `mbedtls_ssl_write()`. This is because `mbedtls_ssl_write` checks if the SSL state is `MBEDTLS_SSL_HANDSHAKE_OVER` and requires the handshake to be established for writing application data.
+</requirement>
+<requirement>
+The second argument, `buf`, should be a valid pointer to a buffer of at least `len` bytes. The function reads `len` bytes from this buffer to send as application data, and an invalid pointer or insufficient buffer size will lead to a crash.
+</requirement>
+<requirement>
+The third argument, `len`, should be fuzzed to test the handling of different data lengths. This is to ensure the function's ability to handle fragmentation in TLS and size limits in DTLS is robust against various input sizes.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mbedtls_ssl_write(mbedtls_ssl_context *, const unsigned char *, size_t)
+</function_signature>
+<project_name>
+mbedtls
+</project_name>
+
+	Fuzz target source:
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "test/certs.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.c"
+
+#if defined(MBEDTLS_SSL_CLI_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+const char *pers = "fuzz_client";
+static int initialized = 0;
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+static mbedtls_x509_crt cacert;
+#endif
+
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+const unsigned char psk[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+const char psk_id[] = "Client_identity";
+#endif
+#endif // MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+#if defined(MBEDTLS_SSL_CLI_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+  int ret;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_context entropy;
+  fuzzBufferOffset_t biomemfuzz;
+
+  mbedtls_ssl_init(&ssl);
+  mbedtls_ssl_config_init(&conf);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  mbedtls_entropy_init(&entropy);
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+  mbedtls_x509_crt_init(&cacert);
+#endif
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) {
+    goto exit;
+  }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+  if (mbedtls_ctr_drbg_seed(&ctr_drbg, dummy_entropy, &entropy, (const unsigned char *)pers, strlen(pers)) != 0) {
+    goto exit;
+  }
+
+  if (initialized == 0) {
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+    if (mbedtls_x509_crt_parse(&cacert, (const unsigned char *)mbedtls_test_cas_pem, mbedtls_test_cas_pem_len) != 0) {
+      return 1;
+    }
+#endif
+    dummy_init();
+
+    initialized = 1;
+  }
+
+  if (mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+    goto exit;
+  }
+
+  mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+  mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+  mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+#endif
+
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+  if (mbedtls_ssl_conf_psk(&conf, psk, sizeof(psk), (const unsigned char *)psk_id, sizeof(psk_id) - 1) != 0) {
+    goto exit;
+  }
+#endif
+
+  if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+    goto exit;
+  }
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C)
+  if (mbedtls_ssl_set_hostname(&ssl, "localhost") != 0) {
+    goto exit;
+  }
+#endif
+
+  biomemfuzz.Data = Data;
+  biomemfuzz.Size = Size;
+  biomemfuzz.Offset = 0;
+  mbedtls_ssl_set_bio(&ssl, &biomemfuzz, dummy_send, fuzz_recv, NULL);
+
+  ret = mbedtls_ssl_handshake(&ssl);
+
+  if (ret == 0) {
+    // Handshake successful, now call mbedtls_ssl_write
+    const unsigned char *write_buf = biomemfuzz.Data + biomemfuzz.Offset;
+    size_t write_len = biomemfuzz.Size - biomemfuzz.Offset;
+
+    if (write_len > 0) {
+      mbedtls_ssl_write(&ssl, write_buf, write_len);
+    }
+  }
+
+exit:
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+  mbedtls_x509_crt_free(&cacert);
+#endif
+  mbedtls_ssl_free(&ssl);
+  mbedtls_ssl_config_free(&conf);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_entropy_free(&entropy);
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  mbedtls_psa_crypto_free();
+#endif
+
+#else
+  (void)Data;
+  (void)Size;
+#endif /* MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C */
+
+  return 0;
+}
+	

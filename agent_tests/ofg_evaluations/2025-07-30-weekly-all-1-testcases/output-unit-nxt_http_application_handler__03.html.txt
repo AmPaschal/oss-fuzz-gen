@@ -1,0 +1,194 @@
+
+	
+<description>
+The function `nxt_http_application_handler` is a request handler for HTTP applications. It is responsible for extracting protocol-specific information from the request, determining the server name, and then passing the request to the router for further processing. This function is part of a chain of request handlers and is invoked via a function pointer.
+</description>
+<requirements>
+<requirement>
+The `r` argument, a pointer to `nxt_http_request_t`, must be initialized by calling `nxt_http_request_create`. This is because the function expects a fully initialized request object, and `nxt_http_request_create` properly allocates and sets up the necessary fields.
+</requirement>
+<requirement>
+The `r->host` field should be a valid `nxt_str_t`. The function checks the length of this string to determine the server name, so it must be valid to avoid crashes.
+</requirement>
+<requirement>
+The `r->proto.any` field of the request object must not be NULL. This is because `nxt_http_request_proto_info` is called, which dereferences this pointer. 
+</requirement>
+<requirement>
+The `action->u.conf` field must be a valid pointer to a `nxt_http_app_conf_t` structure. The function `nxt_router_process_http_request` is called with the action, and it accesses this member.
+</requirement>
+<requirement>
+The `task` argument must be a valid pointer to a `nxt_task_t` structure with `task->thread->engine` initialized. This is because the engine is used in downstream functions called by the target.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+nxt_http_action_t * nxt_http_application_handler(nxt_task_t *, nxt_http_request_t *, nxt_http_action_t *)
+</function_signature>
+<project_name>
+unit
+</project_name>
+
+	Fuzz target source:
+/*
+ * Copyright (C) NGINX, Inc.
+ */
+
+#include <nxt_main.h>
+#include "/src/unit/src/nxt_http.h"
+#include "/src/unit/src/nxt_http_parse.h"
+
+/* DO NOT TRY THIS AT HOME! */
+/* The fuzz target needs access to static functions and variables from these files. */
+#include "/src/unit/src/nxt_h1proto.c"
+#include "/src/unit/src/nxt_http_request.c"
+#include "/src/unit/src/nxt_router.c"
+
+
+#define KMININPUTLENGTH 16
+#define KMAXINPUTLENGTH 1024
+
+
+extern int LLVMFuzzerInitialize(int *argc, char ***argv);
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
+
+extern char  **environ;
+
+
+int
+LLVMFuzzerInitialize(int *argc, char ***argv)
+{
+    if (nxt_lib_start("fuzzing", NULL, &environ) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    if (nxt_h1p_init(&nxt_main_task) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    return 0;
+}
+
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    nxt_mp_t                  *mp;
+    nxt_int_t                 rc;
+    nxt_buf_mem_t             buf;
+    nxt_http_request_t        *r;
+    nxt_http_request_parse_t  rp;
+    nxt_http_action_t         *action;
+    nxt_http_app_conf_t       *app_conf;
+
+    if (size < KMININPUTLENGTH || size > KMAXINPUTLENGTH) {
+        return 0;
+    }
+
+    mp = nxt_mp_create(4096, 128, 512, 32);
+    if (mp == NULL) {
+        return 0;
+    }
+
+    r = nxt_mp_zget(mp, sizeof(nxt_http_request_t));
+    if (r == NULL) {
+        goto failed;
+    }
+
+    r->mem_pool = mp;
+    r->task = nxt_main_task;
+    r->log_route = 1;
+
+    r->proto.h1 = nxt_mp_zget(mp, sizeof(nxt_h1proto_t));
+    if (r->proto.h1 == NULL) { goto failed; }
+
+    r->proto.h1->conn = nxt_mp_zget(mp, sizeof(nxt_conn_t));
+    if (r->proto.h1->conn == NULL) { goto failed; }
+
+    r->proto.h1->conn->log = nxt_main_log;
+
+    r->proto.h1->conn->remote = nxt_mp_zget(mp, sizeof(nxt_sockaddr_t));
+    if (r->proto.h1->conn->remote == NULL) { goto failed; }
+
+    r->proto.h1->conn->local = nxt_mp_zget(mp, sizeof(nxt_sockaddr_t));
+    if (r->proto.h1->conn->local == NULL) { goto failed; }
+
+    r->remote = r->proto.h1->conn->remote;
+    r->local = r->proto.h1->conn->local;
+
+    r->protocol = NXT_HTTP_PROTO_H1;
+
+    r->conf = nxt_mp_zget(mp, sizeof(nxt_socket_conf_joint_t));
+    if (r->conf == NULL) { goto failed; }
+
+    r->conf->socket_conf = nxt_mp_zget(mp, sizeof(nxt_socket_conf_t));
+    if (r->conf->socket_conf == NULL) { goto failed; }
+
+    r->conf->socket_conf->router_conf = nxt_mp_zget(mp, sizeof(nxt_router_conf_t));
+    if (r->conf->socket_conf->router_conf == NULL) { goto failed; }
+
+    nxt_memzero(&rp, sizeof(nxt_http_request_parse_t));
+
+    rc = nxt_http_parse_request_init(&rp, mp);
+    if (rc != NXT_OK) {
+        goto failed;
+    }
+
+    buf.start = (u_char *)data;
+    buf.end = (u_char *)data + size;
+    buf.pos = buf.start;
+    buf.free = buf.end;
+
+    rc = nxt_http_parse_request(&rp, &buf);
+    if (rc != NXT_DONE) {
+        goto failed;
+    }
+
+    r->method = &rp.method;
+    r->path = &rp.path;
+    r->args = &rp.args;
+    r->fields = rp.fields;
+
+    r->request_line.start = (u_char *)data;
+    if (rp.request_line_end > (u_char*) data) {
+        r->request_line.length = rp.request_line_end - (u_char *)data;
+    }
+
+    r->target.start = rp.target_start;
+    if (rp.target_end > rp.target_start) {
+        r->target.length = rp.target_end - rp.target_start;
+    }
+
+    r->version.start = rp.version.str;
+    r->version.length = 8;
+
+    action = nxt_mp_zget(mp, sizeof(nxt_http_action_t));
+    if (action == NULL) {
+        goto failed;
+    }
+
+    app_conf = nxt_mp_zget(mp, sizeof(nxt_http_app_conf_t));
+    if (app_conf == NULL) {
+        goto failed;
+    }
+
+    app_conf->app = nxt_mp_zget(mp, sizeof(nxt_app_t));
+    if (app_conf->app == NULL) {
+        goto failed;
+    }
+
+    action->u.conf = app_conf;
+
+    nxt_http_application_handler(&r->task, r, action);
+
+failed:
+
+    if (mp != NULL) {
+        nxt_mp_destroy(mp);
+    }
+
+    return 0;
+}
+	

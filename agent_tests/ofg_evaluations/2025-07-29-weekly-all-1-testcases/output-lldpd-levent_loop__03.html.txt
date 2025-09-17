@@ -1,0 +1,112 @@
+
+	
+<description>
+The `levent_loop` function is the main event loop of the lldpd daemon. It initializes the event-based components, starts the LLDP processing loop, and handles events such as signals and interface changes. The `cfg` argument is a global configuration structure that is initialized in the `lldpd_main` function. It contains various settings and state information required by the daemon, including the event base, protocol settings, and interface information.
+</description>
+<requirements>
+
+<requirement>
+The `cfg` argument, a pointer to a `struct lldpd`, must be a valid, non-null pointer. This is because it is dereferenced throughout the function and its callees.
+</requirement>
+<requirement>
+The `cfg->g_base` member must be initialized by calling `event_base_new()`. This is because it is used as the event base for all libevent operations within the function.
+</requirement>
+<requirement>
+The `cfg->g_iface_timer_event` member can be initialized to `NULL`. The function handles a `NULL` value for this member.
+</requirement>
+<requirement>
+If SNMP is enabled, the `cfg->g_snmp` member should be initialized to a non-zero value. This will enable the SNMP-related functionality within `levent_loop`.
+</requirement>
+<requirement>
+The `levent_init()` function must be called before `levent_loop()`. This is because `levent_init()` initializes the event base and signal handlers required by `levent_loop`.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void levent_loop(struct lldpd *)
+</function_signature>
+<project_name>
+lldpd
+</project_name>
+
+	Fuzz target source:
+#define _GNU_SOURCE
+#include "/src/lldpd/src/daemon/lldpd.h"
+#include <event2/event.h>
+
+// Dummy log function to suppress output during fuzzing.
+static void
+donothing(int pri, const char *msg)
+{
+	(void)pri;
+	(void)msg;
+}
+
+// Callback function to be executed by the timer event.
+// It stops the libevent loop.
+static void
+exit_loop_cb(evutil_socket_t fd, short events, void *arg)
+{
+	(void)fd;
+	(void)events;
+	struct event_base *base = (struct event_base *)arg;
+	// Exit the loop gracefully. The loop will terminate after this event.
+	event_base_loopexit(base, NULL);
+}
+
+// Using the --wrap linker feature, calls to lldpd_loop() are redirected here.
+// This allows us to control the event loop for fuzzing purposes.
+// Instead of scheduling periodic tasks, we schedule a one-shot timer
+// to terminate the loop.
+void
+__wrap_lldpd_loop(struct lldpd *cfg)
+{
+	struct timeval tv = { 0, 1000 }; // 1ms timeout
+
+	// levent_loop() calls levent_init() which creates the event base.
+	// We can now use cfg->g_base to schedule our exit event.
+	if (cfg->g_base) {
+		struct event *ev_exit =
+		    evtimer_new(cfg->g_base, exit_loop_cb, cfg->g_base);
+		if (ev_exit) {
+			evtimer_add(ev_exit, &tv);
+		}
+	}
+}
+
+void levent_loop(struct lldpd *);
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	(void)data;
+	(void)size;
+
+	struct lldpd *cfg = (struct lldpd *)calloc(1, sizeof(struct lldpd));
+	if (!cfg) {
+		return 0;
+	}
+
+	// Initialize a minimal lldpd configuration for the event loop to run.
+	log_register(donothing);
+	cfg->g_ctl = -1; // We don't use a control socket.
+	cfg->g_config.c_tx_hold = LLDPD_TX_HOLD;
+	cfg->g_config.c_tx_interval = LLDPD_TX_INTERVAL * 1000;
+	cfg->g_iface_timer_event = NULL;
+
+	// Call the target function. It will call our __wrap_lldpd_loop,
+	// which ensures the event loop terminates.
+	levent_loop(cfg);
+
+	// Cleanup. levent_loop allocates an event_base but does not free it.
+	if (cfg->g_base) {
+		event_base_free(cfg->g_base);
+	}
+	free(cfg);
+
+	return 0;
+}
+	

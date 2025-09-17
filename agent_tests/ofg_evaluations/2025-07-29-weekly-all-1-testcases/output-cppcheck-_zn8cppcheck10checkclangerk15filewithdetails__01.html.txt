@@ -1,0 +1,148 @@
+
+	
+<description>
+The CppCheck::checkClang function is responsible for analyzing a single C/C++ file using Clang. It takes a FileWithDetails object as input, which contains the path to the file, the language, and the file size. The function constructs a clang command with appropriate flags based on the settings provided in the CppCheck object, executes the command to get an AST dump of the file, and then parses the AST to perform various checks. The results of the analysis are reported through the ErrorLogger object.
+</description>
+<requirements>
+
+<requirement>
+The FileWithDetails object passed to checkClang must contain a valid path to a C or C++ source file. This is because the function attempts to open and read the file at this path.
+</requirement>
+<requirement>
+The FileWithDetails object must have its language member set to either Standards::Language::C or Standards::Language::CPP. This is used to provide the correct language flag to the clang compiler.
+</requirement>
+<requirement>
+The CppCheck object must be initialized with a valid Settings object. The settings object contains important information such as include paths, defines, and the path to the clang executable, which are all necessary for the correct execution of the clang command.
+</requirement>
+<requirement>
+The CppCheck object must be initialized with a valid ExecuteCmdFn callback function. This function is used to execute the clang command and capture its output.
+</requirement>
+<requirement>
+The clang executable must be available in the environment where the fuzzer is running. The path to the executable should be set in the Settings object.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+unsigned int CppCheck::checkClang(const FileWithDetails &)
+</function_signature>
+<project_name>
+cppcheck
+</project_name>
+
+	Fuzz target source:
+#include "cppcheck.h"
+#include "errorlogger.h"
+#include "errortypes.h"
+#include "filesettings.h"
+#include "settings.h"
+#include "suppressions.h"
+#include "/src/cppcheck/lib/programmemory.h"
+
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
+
+class DummyErrorLogger : public ErrorLogger {
+public:
+  void reportOut(const std::string & /*outmsg*/, Color /*c*/) override {}
+  void reportErr(const ErrorMessage & /*msg*/) override {}
+  void reportProgress(const std::string & /*filename*/, const char /*stage*/[],
+                      const std::size_t /*value*/) override {}
+  void reportMetric(const std::string & /*metric*/) override {}
+};
+
+static Settings create_settings(bool is_cpp) {
+  Settings s;
+  s.clang = true;
+  s.clangExecutable = is_cpp ? "clang++" : "clang";
+  s.addEnabled("all");
+  s.certainty.setEnabled(Certainty::inconclusive, true);
+  return s;
+}
+
+static int executeCommand(const std::string &exe,
+                          const std::vector<std::string> &args,
+                          const std::string &redirect, std::string &output) {
+  std::string cmd_str = exe;
+  for (const auto &arg : args) {
+    cmd_str += " '";
+    for (char c : arg) {
+      if (c == '\'') {
+        cmd_str += "'\\''"; // escape single quotes
+      } else {
+        cmd_str += c;
+      }
+    }
+    cmd_str += "'";
+  }
+  cmd_str += " " + redirect;
+
+  FILE *pipe = popen(cmd_str.c_str(), "r");
+  if (!pipe) {
+    return -1;
+  }
+
+  char buffer[256];
+  output.clear();
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    output.append(buffer);
+  }
+
+  int status = pclose(pipe);
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  return -1;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1) {
+    return 0;
+  }
+  FuzzedDataProvider provider(data, size);
+
+  const bool is_cpp = provider.ConsumeBool();
+  const std::string content = provider.ConsumeRemainingBytesAsString();
+
+  const char *extension = is_cpp ? ".cpp" : ".c";
+  char filename_template[32];
+  snprintf(filename_template, sizeof(filename_template), "/tmp/fuzz-XXXXXX%s",
+           extension);
+
+  int fd = mkstemps(filename_template, strlen(extension));
+  if (fd < 0) {
+    return 0;
+  }
+
+  if (write(fd, content.c_str(), content.size()) != (ssize_t)content.size()) {
+    close(fd);
+    unlink(filename_template);
+    return 0;
+  }
+  close(fd);
+
+  static DummyErrorLogger errorLogger;
+  Settings settings = create_settings(is_cpp);
+  Suppressions supprs;
+  CppCheck cppcheck(settings, supprs, errorLogger, false, executeCommand);
+
+  const Standards::Language lang =
+      is_cpp ? Standards::Language::CPP : Standards::Language::C;
+  FileWithDetails file(filename_template, lang, content.size());
+
+  cppcheck.check(file);
+
+  unlink(filename_template);
+
+  return 0;
+}
+	

@@ -1,0 +1,158 @@
+
+	
+<description>
+The _cmsDefaultICCintents function is a wrapper around the internal DefaultICCintents function. It is responsible for creating a color transformation pipeline (cmsPipeline) based on a series of ICC profiles and rendering intents. It iterates through the provided profiles, determines the appropriate color space conversions, and chains them together. The function's correct execution heavily relies on the caller providing valid profile handles and correctly sized arrays for intents, black point compensation flags, and adaptation states, as specified by the nProfiles argument.
+</description>
+<requirements>
+<requirement>
+The `nProfiles` argument must be greater than 0. The function returns NULL if nProfiles is 0, and a value greater than 0 is required to enter the main processing loop.
+</requirement>
+<requirement>
+The `nProfiles` argument must be equal to the number of elements in the `TheIntents`, `hProfiles`, `BPC`, and `AdaptationStates` arrays. This is to prevent out-of-bounds memory access when the function iterates through these arrays.
+</requirement>
+<requirement>
+Each element in the `hProfiles` array must be a valid `cmsHPROFILE` handle. The function dereferences each handle to retrieve profile information, and an invalid handle will cause a crash.
+</requirement>
+<requirement>
+The `TheIntents` array elements should correspond to valid rendering intents (e.g., INTENT_PERCEPTUAL, INTENT_RELATIVE_COLORIMETRIC). While not strictly enforced in this function, downstream functions rely on valid intent values to select the correct transformation.
+</requirement>
+<requirement>
+The `ContextID` can be NULL, in which case a global context is used. If not NULL, it must be a valid pointer to a cmsContext created by `cmsCreateContext`.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+cmsPipeline* _cmsDefaultICCintents(cmsContext, cmsUInt32Number, cmsUInt32Number *, cmsHPROFILE *, cmsBool *, cmsFloat64Number *, cmsUInt32Number)
+</function_signature>
+<project_name>
+lcms
+</project_name>
+
+	Fuzz target source:
+/* Copyright 2024 Google LLC
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+      http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include "lcms2.h"
+#include "/src/lcms/include/lcms2_plugin.h"
+
+// Forward declare the function to be tested as it's not in a public header
+cmsPipeline* _cmsDefaultICCintents(cmsContext, cmsUInt32Number, cmsUInt32Number *, cmsHPROFILE *, cmsBool *, cmsFloat64Number *, cmsUInt32Number);
+
+#define MAX_PROFILES 8
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+    if (size < 2) {
+        return 0;
+    }
+
+    // Use the first byte to determine the number of profiles, ensuring it's at least 1.
+    cmsUInt32Number nProfiles = (data[0] % MAX_PROFILES) + 1;
+    data++;
+    size--;
+
+    // Determine the required size for all parameter arrays and flags
+    size_t required_size = sizeof(cmsUInt32Number) + // dwFlags
+                           (nProfiles * sizeof(cmsUInt32Number)) + // TheIntents
+                           (nProfiles * sizeof(cmsBool)) + // BPC
+                           (nProfiles * sizeof(cmsFloat64Number)); // AdaptationStates
+    
+    if (size < required_size) {
+        return 0;
+    }
+
+    // Consume data for flags and parameter arrays
+    cmsUInt32Number dwFlags;
+    memcpy(&dwFlags, data, sizeof(cmsUInt32Number));
+    data += sizeof(cmsUInt32Number);
+    size -= sizeof(cmsUInt32Number);
+
+    cmsUInt32Number TheIntents[MAX_PROFILES];
+    memcpy(TheIntents, data, nProfiles * sizeof(cmsUInt32Number));
+    data += nProfiles * sizeof(cmsUInt32Number);
+    size -= nProfiles * sizeof(cmsUInt32Number);
+
+    cmsBool BPC[MAX_PROFILES];
+    memcpy(BPC, data, nProfiles * sizeof(cmsBool));
+    data += nProfiles * sizeof(cmsBool);
+    size -= nProfiles * sizeof(cmsBool);
+
+    cmsFloat64Number AdaptationStates[MAX_PROFILES];
+    memcpy(AdaptationStates, data, nProfiles * sizeof(cmsFloat64Number));
+    data += nProfiles * sizeof(cmsFloat64Number);
+    size -= nProfiles * sizeof(cmsFloat64Number);
+
+    // Create profile handles
+    cmsHPROFILE hProfiles[MAX_PROFILES] = { NULL };
+    for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+        // Use a byte from fuzzer input to decide which profile to create
+        uint8_t profile_type = 0;
+        if (size > 0) {
+            profile_type = data[0] % 4;
+            data++;
+            size--;
+        }
+
+        switch (profile_type) {
+            case 0:
+                // Attempt to create a profile from the fuzzer's data
+                if (size > 128) {
+                    hProfiles[i] = cmsOpenProfileFromMem(data, 128);
+                    data += 128;
+                    size -= 128;
+                } else {
+                    hProfiles[i] = cmsCreate_sRGBProfile();
+                }
+                break;
+            case 1:
+                hProfiles[i] = cmsCreateLab4Profile(NULL);
+                break;
+            case 2:
+                hProfiles[i] = cmsCreateXYZProfile();
+                break;
+            case 3:
+            default:
+                hProfiles[i] = cmsCreate_sRGBProfile();
+                break;
+        }
+
+        if (hProfiles[i] == NULL) {
+            // If any profile creation fails, we cannot proceed. Clean up and exit.
+            for (cmsUInt32Number j = 0; j < i; j++) {
+                if (hProfiles[j]) cmsCloseProfile(hProfiles[j]);
+            }
+            return 0;
+        }
+    }
+
+    // Call the function under test
+    cmsPipeline* pipeline = _cmsDefaultICCintents(NULL, nProfiles, TheIntents, hProfiles, BPC, AdaptationStates, dwFlags);
+
+    // Cleanup
+    if (pipeline != NULL) {
+        cmsPipelineFree(pipeline);
+    }
+
+    for (cmsUInt32Number i = 0; i < nProfiles; i++) {
+        if (hProfiles[i]) {
+            cmsCloseProfile(hProfiles[i]);
+        }
+    }
+
+    return 0;
+}
+	

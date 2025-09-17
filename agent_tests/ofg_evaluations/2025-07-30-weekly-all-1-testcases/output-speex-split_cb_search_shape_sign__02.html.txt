@@ -1,0 +1,146 @@
+
+	
+<description>
+The function `split_cb_search_shape_sign` is a core part of the Speex codec's codebook search mechanism. It is responsible for finding the best excitation vector from a codebook to represent the target signal. The function operates on a subframe-by-subframe basis. It takes the target signal, LPC coefficients, and other parameters to perform a shaped codebook search. The search complexity can be adjusted. The function updates the excitation signal and, optionally, the target signal. It also packs the codebook indices into a bitstream for transmission.
+</description>
+<requirements>
+
+<requirement>
+The `par` argument must be a valid pointer to a `split_cb_params` struct. The members of this struct determine the behavior of the codebook search, so they must be initialized with valid values.
+</requirement>
+<requirement>
+The `nsf` argument, representing the number of samples in a subframe, must be equal to the product of `subvect_size` and `nb_subvect` from the `par` struct. This is because the function iterates through subvectors, and an incorrect `nsf` value will lead to out-of-bounds memory access.
+</requirement>
+<requirement>
+The `shape_cb` member of the `par` struct must point to a valid, initialized codebook. This codebook is used to generate the excitation signal, so an invalid pointer will cause a crash.
+</requirement>
+<requirement>
+The `shape_bits` member of the `par` struct must be a positive integer. This value is used to calculate the size of the codebook, so an invalid value will cause memory allocation errors.
+</requirement>
+<requirement>
+The `p` argument, representing the number of LPC coefficients, must be a positive integer. This is to prevent issues in the `syn_percep_zero16` function, which uses this value for looping.
+</requirement>
+<requirement>
+The `bits` argument must be a valid pointer to an initialized `SpeexBits` struct. The function writes the codebook indices to this bitstream, so an uninitialized pointer will cause a crash.
+</requirement>
+<requirement>
+The `stack` argument must point to a valid, sufficiently large memory region. The function uses this memory as a stack for its internal allocations, so an invalid or too-small region will lead to a stack overflow.
+</requirement>
+<requirement>
+The `complexity` argument should be an integer between 0 and 10. The function clamps this value to a maximum of 10, so any value greater than 10 will be treated as 10. A value of 1 will trigger a call to a simplified version of the function.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void split_cb_search_shape_sign(spx_word16_t *, spx_coef_t *, spx_coef_t *, spx_coef_t *, const void *, int, int, spx_sig_t *, spx_word16_t *, SpeexBits *, char *, int, int)
+</function_signature>
+<project_name>
+speex
+</project_name>
+
+	Fuzz target source:
+#define FIXED_POINT 1
+
+#include <fuzzer/FuzzedDataProvider.h>
+
+// Must wrap C headers in extern "C" when compiling as C++
+extern "C" {
+#include "/src/speex/libspeex/cb_search.h"
+}
+#include "speex/speex_bits.h" // This public header has its own extern "C" guards
+
+#include <vector>
+#include <cstdint>
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+    FuzzedDataProvider provider(data, size);
+
+    // Fuzz parameters with reasonable ranges to avoid excessive memory allocation
+    // and long execution times.
+    const int p = provider.ConsumeIntegralInRange<int>(1, 16);
+    const int subvect_size = provider.ConsumeIntegralInRange<int>(4, 40);
+    const int nb_subvect = provider.ConsumeIntegralInRange<int>(1, 10);
+    const int nsf = subvect_size * nb_subvect;
+
+    // Check if nsf is too large, to prevent OOM.
+    if (nsf > 400) {
+        return 0;
+    }
+
+    const int complexity = provider.ConsumeIntegralInRange<int>(0, 15); // Function clamps to 10
+    const int update_target = provider.ConsumeBool();
+    const int shape_bits = provider.ConsumeIntegralInRange<int>(1, 7); // 2^7=128, keeps shape_cb_size reasonable
+    const int have_sign = provider.ConsumeBool();
+
+    const int shape_cb_size = 1 << shape_bits;
+    const int shape_cb_len = shape_cb_size * subvect_size;
+    if (shape_cb_len > 8192) { // Limit codebook size
+        return 0;
+    }
+
+    // Allocate and populate arrays from fuzzer data.
+    std::vector<spx_word16_t> target(nsf);
+    provider.ConsumeData(target.data(), target.size() * sizeof(spx_word16_t));
+
+    std::vector<spx_coef_t> ak(p);
+    provider.ConsumeData(ak.data(), ak.size() * sizeof(spx_coef_t));
+
+    std::vector<spx_coef_t> awk1(p + 1);
+    provider.ConsumeData(awk1.data(), awk1.size() * sizeof(spx_coef_t));
+
+    std::vector<spx_coef_t> awk2(p + 1);
+    provider.ConsumeData(awk2.data(), awk2.size() * sizeof(spx_coef_t));
+
+    std::vector<spx_sig_t> exc(nsf);
+    provider.ConsumeData(exc.data(), exc.size() * sizeof(spx_sig_t));
+
+    std::vector<spx_word16_t> r(nsf);
+    provider.ConsumeData(r.data(), r.size() * sizeof(spx_word16_t));
+
+    std::vector<signed char> shape_cb_vec(shape_cb_len);
+    provider.ConsumeData(shape_cb_vec.data(), shape_cb_vec.size());
+
+    // Setup params struct
+    split_cb_params params;
+    params.subvect_size = subvect_size;
+    params.nb_subvect = nb_subvect;
+    params.shape_cb = shape_cb_vec.data();
+    params.shape_bits = shape_bits;
+    params.have_sign = have_sign;
+
+    // Setup SpeexBits
+    SpeexBits bits;
+    speex_bits_init(&bits);
+
+    // The function uses a custom stack allocator. A large buffer should be sufficient.
+    char stack[65536];
+
+    // Call the function under test
+    split_cb_search_shape_sign(
+        target.data(),
+        ak.data(),
+        awk1.data(),
+        awk2.data(),
+        &params,
+        p,
+        nsf,
+        exc.data(),
+        r.data(),
+        &bits,
+        stack,
+        complexity,
+        update_target
+    );
+
+    // Cleanup
+    speex_bits_destroy(&bits);
+
+    return 0;
+}
+	

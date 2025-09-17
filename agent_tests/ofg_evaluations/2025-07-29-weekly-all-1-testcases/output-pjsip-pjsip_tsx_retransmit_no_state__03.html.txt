@@ -1,0 +1,166 @@
+
+	
+<description>
+The `pjsip_tsx_retransmit_no_state` function is responsible for retransmitting a SIP message for a given transaction without checking the transaction's state. It takes a pointer to a `pjsip_transaction` object (`tsx`) and a pointer to a `pjsip_tx_data` object (`tdata`). If `tdata` is NULL, the function will attempt to retransmit the last message sent within the transaction, which is stored in `tsx->last_tx`. The function acquires a group lock from the transaction to ensure thread safety during the retransmission process. The actual sending of the message is handled by the internal `tsx_send_msg` function. The reference count of the `tdata` object is managed within the function; it's incremented if `tsx->last_tx` is used and decremented upon successful transmission.
+</description>
+<requirements>
+<requirement>
+The `tsx` argument must be a valid, non-NULL pointer to a `pjsip_transaction` object. The function dereferences this pointer to access the group lock and potentially the last transmitted data.
+</requirement>
+<requirement>
+The `pjsip_transaction` object pointed to by `tsx` should be created using either the `pjsip_tsx_create_uac()` or `pjsip_tsx_create_uas()` function. This will ensure that the transaction's internal fields, such as `grp_lock` and `last_tx`, are properly initialized.
+</requirement>
+<requirement>
+If the `tdata` argument is `NULL`, the `tsx->last_tx` field must point to a valid `pjsip_tx_data` object. The function will use this field as the data for retransmission.
+</requirement>
+<requirement>
+If the `tdata` argument is not `NULL`, it must point to a valid `pjsip_tx_data` object. This object should be created using `pjsip_tx_data_create()` to ensure it is correctly initialized for transmission.
+</requirement>
+<requirement>
+The `tsx->grp_lock` field must be a valid, initialized group lock. This is a requirement for the `pj_grp_lock_acquire()` and `pj_grp_lock_release()` calls within the function. Proper initialization of the transaction via creation functions will satisfy this.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+pj_status_t pjsip_tsx_retransmit_no_state(pjsip_transaction *tsx, pjsip_tx_data *tdata)
+</function_signature>
+<project_name>
+pjsip
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <pjlib.h>
+#include <pjlib-util.h>
+#include <pjsip.h>
+#include <pjsip_ua.h>
+#include <pjsip/sip_endpoint.h>
+#include <pjsip/sip_transaction.h>
+#include <pjsip/sip_transport.h>
+#include <pjsip/sip_msg.h>
+#include <pjsip/sip_parser.h>
+
+#define kMinInputLength 1
+#define kMaxInputLength 4096
+
+static pj_caching_pool cp;
+static pjsip_endpoint *g_endpt;
+
+// Custom module to suppress error logging from transport failures
+static void null_log_writer(int level, const char *data, int len) {
+    (void)level;
+    (void)data;
+    (void)len;
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    (void)argc;
+    (void)argv;
+    pj_init();
+    pj_caching_pool_init(&cp, &pj_pool_factory_default_policy, 0);
+    // Suppress transport related error logs as we don't have a real network
+    pj_log_set_log_func(&null_log_writer);
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < kMinInputLength || size > kMaxInputLength) {
+        return 0;
+    }
+
+    pj_pool_t *pool = NULL;
+    pjsip_tx_data *tdata = NULL;
+    pjsip_transaction *tsx = NULL;
+    pj_status_t status;
+
+    pool = pj_pool_create(&cp.factory, "fuzz-pool", 1024, 1024, NULL);
+    if (!pool) {
+        return 0;
+    }
+
+    // Create a single endpoint for the fuzzing session
+    if (!g_endpt) {
+        status = pjsip_endpt_create(&cp.factory, "fuzzer", &g_endpt);
+        if (status != PJ_SUCCESS) {
+            pj_pool_release(pool);
+            return 0;
+        }
+        // Initialize transaction layer
+        status = pjsip_tsx_layer_init_module(g_endpt);
+        if (status != PJ_SUCCESS) {
+            pjsip_endpt_destroy(g_endpt);
+            g_endpt = NULL;
+            pj_pool_release(pool);
+            return 0;
+        }
+    }
+
+    // Create a transmit data buffer using the endpoint's public API
+    status = pjsip_endpt_create_tdata(g_endpt, &tdata);
+    if (status != PJ_SUCCESS) {
+        pj_pool_release(pool);
+        return 0;
+    }
+
+    // Create a simple SIP request, using fuzzer data as the body
+    char *msg_buf = (char *)pj_pool_alloc(pool, size + 256);
+    if (!msg_buf) {
+        pjsip_tx_data_dec_ref(tdata);
+        pj_pool_release(pool);
+        return 0;
+    }
+
+    int msg_len = pj_ansi_snprintf(msg_buf, size + 256,
+                                 "MESSAGE sip:endpt@127.0.0.1 SIP/2.0\r\n"
+                                 "Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK.fuzz\r\n"
+                                 "From: <sip:fuzzer@127.0.0.1>\r\n"
+                                 "To: <sip:endpt@127.0.0.1>\r\n"
+                                 "Call-ID: fuzz-callid\r\n"
+                                 "CSeq: 1 MESSAGE\r\n"
+                                 "Content-Type: text/plain\r\n"
+                                 "Content-Length: %zu\r\n"
+                                 "\r\n"
+                                 "%.*s",
+                                 size, (int)size, (const char *)data);
+
+    // Parse the message into the tdata
+    tdata->msg = pjsip_parse_msg(pool, msg_buf, msg_len, NULL);
+    if (!tdata->msg) {
+        pjsip_tx_data_dec_ref(tdata);
+        pj_pool_release(pool);
+        return 0;
+    }
+    
+    // Create a UAC transaction. This will add a reference to tdata.
+    status = pjsip_tsx_create_uac(NULL, tdata, &tsx);
+    if (status != PJ_SUCCESS) {
+        pjsip_tx_data_dec_ref(tdata);
+        pj_pool_release(pool);
+        return 0;
+    }
+
+    // Call the function under test with a valid tdata.
+    // This will also populate tsx->last_tx.
+    // The send will fail, but we are fuzzing the retransmit logic.
+    pjsip_tsx_retransmit_no_state(tsx, tdata);
+
+    // Call the function under test with NULL tdata.
+    // This will use tsx->last_tx.
+    pjsip_tsx_retransmit_no_state(tsx, NULL);
+
+    // Clean up
+    // The transaction holds a reference to tdata, and we hold one.
+    // Releasing the pool will clean up the transaction, which in turn
+    // should release its reference to tdata.
+    // We must release our own reference.
+    pjsip_tx_data_dec_ref(tdata);
+    pj_pool_release(pool);
+
+    return 0;
+}
+	

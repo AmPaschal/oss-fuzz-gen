@@ -1,0 +1,162 @@
+
+	
+<description>
+This function, `CppCheck::check`, serves as the primary entry point for analyzing a single file within the Cppcheck tool. It takes a `FileWithDetails` object, which encapsulates information about the file to be checked, including its path, language, and size.
+
+The function's control flow is determined by the `mSettings.clang` boolean flag. If this flag is true, the function delegates the analysis to `checkClang`, which utilizes Clang for the analysis. Otherwise, it calls `checkFile`, which uses Cppcheck's native analysis engine.
+
+The `FileWithDetails` object is typically created as part of a `FileSettings` object, which holds more comprehensive settings for a particular file. The `CppCheck` object itself must be properly initialized, as its internal state, particularly the `mSettings` member, dictates the analysis process. This includes setting up include paths, defines, and other compilation-related information. The `mExecuteCommand` function pointer within the `CppCheck` object is crucial when using the Clang-based analysis, as it is responsible for executing the Clang compiler.
+</description>
+<requirements>
+
+<requirement>
+The `path` member of the `FileWithDetails` object must be a non-empty string. The constructor of `FileWithDetails` throws a `std::runtime_error` if an empty path is provided, which would lead to a crash.
+</requirement>
+<requirement>
+The `lang` member of the `FileWithDetails` object should be initialized to either `Standards::Language::C` or `Standards::Language::CPP`. This is because the `checkClang` function asserts that the language is not `Standards::Language::None`.
+</requirement>
+<requirement>
+The `mSettings.clang` boolean flag in the `CppCheck` object must be initialized. This flag controls the execution path within the function, determining whether to use the Clang-based checker (`checkClang`) or the native Cppcheck checker (`checkFile`).
+</requirement>
+<requirement>
+If `mSettings.clang` is true, the `mExecuteCommand` member of the `CppCheck` object must be a valid function pointer. The `checkClang` function uses this to execute the Clang compiler, and a null or invalid pointer would result in a crash.
+</requirement>
+<requirement>
+The file specified by the `path` in the `FileWithDetails` object should contain valid C or C++ source code. The `checkFile` function reads and processes the content of this file, and invalid or malformed code can lead to parsing errors and unexpected behavior.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+unsigned int CppCheck::check(const FileWithDetails &)
+</function_signature>
+<project_name>
+cppcheck
+</project_name>
+
+	Fuzz target source:
+/*
+ * Cppcheck - A tool for static C/C++ code analysis
+ * Copyright (C) 2007-2025 Cppcheck team.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "cppcheck.h"
+#include "errorlogger.h"
+#include "errortypes.h"
+#include "filesettings.h"
+#include "settings.h"
+#include "suppressions.h"
+#include "/src/cppcheck/lib/checkmemoryleak.h"
+
+#include <string>
+#include <fstream>
+#include <unistd.h>
+
+#ifndef NO_FUZZ
+#include <cstddef>
+#include <cstdint>
+
+#include <fuzzer/FuzzedDataProvider.h>
+#else
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#endif
+
+class DummyErrorLogger : public ErrorLogger {
+public:
+    void reportOut(const std::string& /*outmsg*/, Color /*c*/) override {}
+    void reportErr(const ErrorMessage& /*msg*/) override {}
+    void reportProgress(const std::string& /*filename*/,
+                        const char /*stage*/[],
+                        const std::size_t /*value*/) override {}
+    void reportMetric(const std::string & /*metric*/) override {}
+};
+
+static Settings create_settings()
+{
+    // TODO: load std.cfg
+    Settings s;
+    s.templateFormat = "{bold}{file}:{line}:{column}: {red}{inconclusive:{magenta}}{severity}:{inconclusive: inconclusive:}{default} {message} [{id}]{reset}\\n{code}";
+    s.templateLocation = "{bold}{file}:{line}:{column}: {dim}note:{reset} {info}\\n{code}";
+    s.addEnabled("all");
+    s.certainty.setEnabled(Certainty::inconclusive, true);
+    return s;
+}
+
+#ifndef NO_FUZZ
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t dataSize);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t dataSize)
+{
+    FuzzedDataProvider provider(data, dataSize);
+    const std::string filename = provider.ConsumeRandomLengthString(16);
+    if (filename.empty()) {
+        return 0;
+    }
+
+    const std::string content = provider.ConsumeRemainingBytesAsString();
+    std::ofstream out(filename);
+    out << content;
+    out.close();
+
+    DummyErrorLogger s_errorLogger;
+    Suppressions supprs;
+    const Settings s_settings = create_settings();
+    CppCheck cppcheck(s_settings, supprs, s_errorLogger, false, nullptr);
+
+    Standards::Language lang = provider.PickValueInArray({Standards::Language::C, Standards::Language::CPP});
+    FileWithDetails file(filename, lang, content.size());
+    cppcheck.check(file);
+
+    unlink(filename.c_str());
+
+    return 0;
+}
+#else
+int main(int argc, char * argv[])
+{
+    if (argc < 2 || argc > 3)
+        return EXIT_FAILURE;
+
+    std::ifstream f(argv[1]);
+    if (!f.is_open())
+        return EXIT_FAILURE;
+
+    std::ostringstream oss;
+    oss << f.rdbuf();
+
+    if (!f.good())
+        return EXIT_FAILURE;
+
+    const int cnt = (argc == 3) ? std::stoi(argv[2]) : 1;
+
+    const std::string code = oss.str();
+    for (int i = 0; i < cnt; ++i) {
+        DummyErrorLogger s_errorLogger;
+        Suppressions supprs;
+        const Settings s_settings = create_settings();
+        CppCheck cppcheck(s_settings, supprs, s_errorLogger, false, nullptr);
+        FileWithDetails file("test.cpp", Standards::Language::CPP, code.size());
+        cppcheck.check(file, code);
+    }
+
+    return EXIT_SUCCESS;
+}
+#endif
+	

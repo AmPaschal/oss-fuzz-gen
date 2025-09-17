@@ -1,0 +1,154 @@
+
+	
+<description>
+This function, `symbolic_to_physical`, is a core component of the ASTC texture compression library. Its primary role is to convert a symbolic representation of a compressed block, which is a high-level and human-readable format, into a physical block, which is the final, hardware-ready compressed data.
+
+The function takes three arguments:
+1.  `bsd`: A `block_size_descriptor` object. This structure contains all the static information about the block size and its various encoding modes. It acts as a configuration object, guiding the compression process.
+2.  `scb`: A `symbolic_compressed_block` object. This structure holds the symbolic data to be converted. This includes the block type, partition information, color endpoint values, and weights. This is the main input to the function.
+3.  `pcb`: A pointer to a 16-byte buffer. This buffer will be filled with the physical block data. This is the output of the function.
+
+The function first handles two special cases of constant-color blocks (`SYM_BTYPE_CONST_U16` and `SYM_BTYPE_CONST_F16`). For these, it directly constructs the physical block data from the constant color values stored in the `scb`.
+
+For all other block types, the function performs a more complex conversion. It encodes the weights, partition information, color endpoint modes, and color endpoint values into the physical block. The encoding process involves several steps:
+-   It retrieves the block mode and decimation information from the `bsd`.
+-   It quantizes and scrambles the weights from the `scb`.
+-   It uses Integer Sequence Encoding (ISE) to compress the weights and color data.
+-   It carefully packs all the different pieces of information into the 128 bits of the physical block, using the `write_bits` utility function.
+
+The callers of this function, primarily `compress_symbolic_block`, are responsible for first finding the optimal symbolic representation of an image block and then calling `symbolic_to_physical` to perform the final conversion to a physical ASTC block. The `compress_symbolic_block` function tries different encoding modes and parameters to minimize the compression error, and the best result is then passed to `symbolic_to_physical`.
+</description>
+<requirements>
+<requirement>
+The `pcb` buffer must be at least 16 bytes in size. This is to prevent buffer overflows since the function writes 128 bits (16 bytes) of data.
+</requirement>
+<requirement>
+The `scb.block_type` must not be `SYM_BTYPE_ERROR`. This is enforced by an assertion at the beginning of the function and indicates that the symbolic block is invalid.
+</requirement>
+<requirement>
+The `scb.block_mode` must be a valid index for the block modes in the `bsd`. An invalid block mode can lead to out-of-bounds access when calling `bsd.get_block_mode`.
+</requirement>
+<requirement>
+The `scb.partition_count` must be between 1 and 4, inclusive. This is a fundamental constraint of the ASTC format.
+</requirement>
+<requirement>
+The `scb.weights` values should be within the range [0, 64]. These values are scaled and used as indices into quantization tables, so out-of-range values can lead to crashes.
+</requirement>
+<requirement>
+The `scb.color_formats` and `scb.color_values` must be consistent with the `scb.partition_count`. The number of color formats must match the partition count, and the number of color values depends on the formats.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void symbolic_to_physical(const struct block_size_descriptor &, const struct symbolic_compressed_block &, uint8_t *)
+</function_signature>
+<project_name>
+astc-encoder
+</project_name>
+
+	Fuzz target source:
+// SPDX-License-Identifier: Apache-2.0
+// ----------------------------------------------------------------------------
+//  Copyright 2023 Arm Limited.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// ----------------------------------------------------------------------------
+
+#include "/src/astc-encoder/Source/astcenc_internal.h"
+
+#include <array>
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+
+struct BlockSizes {
+  int x;
+  int y;
+  int z;
+};
+
+// A small selection of block sizes to test
+std::array<BlockSizes, 3> testSz{{
+    {4, 4, 1},   // Highest bitrate
+    {12, 12, 1}, // Largest 2D block
+    {6, 6, 6}    // Largest 3D block
+}};
+
+std::array<block_size_descriptor, 3> testBSD;
+
+/**
+ * @brief Utility function to create all of the block size descriptors needed.
+ */
+bool bsd_initializer() {
+  for (size_t i = 0; i < testSz.size(); i++) {
+    init_block_size_descriptor(testSz[i].x, testSz[i].y, testSz[i].z, false, 4, 1.0f, testBSD[i]);
+  }
+  return true;
+}
+
+void symbolic_to_physical(const struct block_size_descriptor &, const struct symbolic_compressed_block &, uint8_t *);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  // Preinitialize the block size descriptors we need
+  static bool init = bsd_initializer();
+
+  // Need enough data to select a BSD and populate the struct
+  if (size < 200) {
+    return 0;
+  }
+
+  FuzzedDataProvider stream(data, size);
+
+  // Select a block size to test
+  int bsd_idx = stream.ConsumeIntegralInRange<int>(0, (int)testSz.size() - 1);
+  const auto& bsd = testBSD[bsd_idx];
+
+  // Create and populate the symbolic block
+  symbolic_compressed_block scb;
+
+  // Populate based on the struct definition from the build environment
+  scb.block_type = stream.PickValueInArray<uint8_t>({(uint8_t)SYM_BTYPE_NONCONST, (uint8_t)SYM_BTYPE_CONST_U16, (uint8_t)SYM_BTYPE_CONST_F16});
+  scb.partition_count = stream.ConsumeIntegralInRange<uint8_t>(1, BLOCK_MAX_PARTITIONS);
+  scb.color_formats_matched = stream.ConsumeBool();
+  scb.plane2_component = stream.ConsumeIntegralInRange<int8_t>(-1, 3);
+  scb.block_mode = stream.ConsumeIntegralInRange<uint16_t>(0, bsd.block_mode_count_all - 1);
+  scb.partition_index = stream.ConsumeIntegral<uint16_t>();
+  
+  for (unsigned int i = 0; i < scb.partition_count; i++) {
+    scb.color_formats[i] = stream.ConsumeIntegral<uint8_t>();
+  }
+
+  scb.quant_mode = static_cast<quant_method>(stream.ConsumeIntegralInRange<int>(QUANT_2, QUANT_256));
+  stream.ConsumeData(scb.color_values, sizeof(scb.color_values));
+  
+  if (scb.block_type != SYM_BTYPE_NONCONST) {
+    stream.ConsumeData(scb.constant_color, sizeof(scb.constant_color));
+  }
+
+  uint8_t weights[BLOCK_MAX_WEIGHTS];
+  size_t consumed_weights = stream.ConsumeData(weights, sizeof(weights));
+  for (size_t i = 0; i < consumed_weights; i++) {
+    scb.weights[i] = weights[i] % 65; // Weights must be in range [0, 64]
+  }
+
+  // Create the output buffer
+  uint8_t pcb[16];
+
+  // Call the function under test
+  symbolic_to_physical(bsd, scb, pcb);
+
+  return 0;
+}
+	

@@ -1,0 +1,139 @@
+
+	
+<description>
+The `smux_accept` function accepts a new SMUX peer connection. It takes a listening socket descriptor as input, calls `accept` to get a new connection, and then waits for an OpenPDU from the new peer. It returns the new socket descriptor on success, and -1 on failure.
+</description>
+<requirements>
+
+<requirement>
+The function `init_smux` must be called before `smux_accept`. This is because `init_smux` creates the listening socket that is used by `smux_accept`.
+</requirement>
+<requirement>
+The global variable `npeers` must be less than 9. This is to prevent `smux_accept` from rejecting the new connection because the maximum number of peers has been reached.
+</requirement>
+<requirement>
+The input integer argument must be a valid file descriptor for a listening socket. This is because it is passed to the `accept` system call.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int smux_accept(int)
+</function_signature>
+<project_name>
+net-snmp
+</project_name>
+
+	Fuzz target source:
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/agent/net-snmp-agent-includes.h>
+
+// Use relative paths from the fuzzer's location (testing/fuzzing/) to the
+// project root to include internal headers.
+#include "../../agent/mibgroup/smux/smux.h"
+#include "../../agent/snmpd.h"
+
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+// smux_listen_sd is a global variable defined in agent/mibgroup/smux/smux.c.
+// We need to declare it as extern to access it from the fuzzer.
+extern int smux_listen_sd;
+
+// Structure to pass fuzzer data to the client thread.
+struct client_thread_data {
+    const uint8_t *data;
+    size_t size;
+};
+
+// The client thread function. It will act as a SMUX peer, connecting to the
+// agent, sending the fuzzer input, and then closing the connection.
+static void *client_thread_func(void *arg) {
+    struct client_thread_data *fuzz_data = (struct client_thread_data *)arg;
+    int client_sd;
+    struct sockaddr_in serv_addr;
+
+    if ((client_sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        return NULL;
+    }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(SMUXPORT);
+
+    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+        close(client_sd);
+        return NULL;
+    }
+
+    if (connect(client_sd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(client_sd);
+        return NULL;
+    }
+
+    if (fuzz_data->size > 0) {
+        send(client_sd, fuzz_data->data, fuzz_data->size, 0);
+    }
+
+    // Close the client socket to signal EOF to the server.
+    close(client_sd);
+    return NULL;
+}
+
+// This function performs the one-time initialization of the SMUX listener.
+static void initialize_smux_listener(void) {
+    netsnmp_ds_set_boolean(NETSNMP_DS_APPLICATION_ID, NETSNMP_DS_AGENT_ROLE, MASTER_AGENT);
+    init_smux();
+    real_init_smux();
+    if (smux_listen_sd < 0) {
+        fprintf(stderr, "Fuzzer Error: real_init_smux() failed to create a listening socket.\n");
+    }
+}
+
+static pthread_once_t smux_initializer_once = PTHREAD_ONCE_INIT;
+
+// Declare function prototypes for the functions under test.
+int smux_accept(int);
+int smux_process(int);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    pthread_t client_thread_id;
+    struct client_thread_data fuzz_data;
+
+    pthread_once(&smux_initializer_once, initialize_smux_listener);
+
+    if (smux_listen_sd < 0) {
+        return 0;
+    }
+
+    fuzz_data.data = data;
+    fuzz_data.size = size;
+
+    if (pthread_create(&client_thread_id, NULL, client_thread_func, &fuzz_data) != 0) {
+        return 0;
+    }
+
+    int new_connection_fd = smux_accept(smux_listen_sd);
+
+    if (new_connection_fd >= 0) {
+        // The client thread sends data and then closes the connection.
+        // Calling smux_process here will detect the closed connection (EOF),
+        // which triggers smux_peer_cleanup. This decrements the internal
+        // npeers counter and closes the socket, cleaning up the state.
+        smux_process(new_connection_fd);
+    }
+
+    pthread_join(client_thread_id, NULL);
+
+    return 0;
+}
+	

@@ -1,0 +1,117 @@
+
+	
+<description>
+The `auth_zones_startprobesequence` function starts a probe sequence for a given authoritative zone. It finds the zone transfer (auth_xfer) information associated with the zone name and class. If the zone transfer information is found, it initiates the probe by calling `xfr_process_notify`. The function is called from `do_auth_zone_sonotify` in `daemon/remote.c`, which processes a "sonotify" command. The zone name and class for the probe are parsed from the command argument. The `module_env` and `auth_zones` are obtained from the worker structure.
+</description>
+<requirements>
+<requirement>
+The `az` argument, which is a pointer to a `struct auth_zones`, must be a valid and initialized structure. This can be achieved by calling `auth_zones_create`. This is a requirement because the function dereferences this pointer to access the lock and the tree of transfer information.
+</requirement>
+<requirement>
+The `az` structure should contain the zone that is being probed. The functions `auth_zone_create` and `auth_xfer_create` can be used to create and add a zone and its transfer information to the `auth_zones` structure. This is important because `auth_xfer_find` will search for the zone in this structure, and if not found, the probe sequence will not be started.
+</requirement>
+<requirement>
+The `env` argument, a pointer to a `struct module_env`, must be a valid and initialized structure. This is because it is passed as an argument to `xfr_process_notify` which may use it.
+</requirement>
+<requirement>
+The `nm` argument should be a valid, wire-format domain name, and `nmlen` should be its length. The function `sldns_str2wire_dname_buf` can be used to convert a string representation of a domain name to the wire format. This is necessary because the `nm` and `nmlen` are used as a key to search for the zone in the `auth_zones` structure.
+</requirement>
+<requirement>
+The `dclass` argument should be a valid DNS class. In the caller, `LDNS_RR_CLASS_IN` is used. Using a valid class is important for the zone lookup to succeed.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int auth_zones_startprobesequence(struct auth_zones* az,
+struct module_env* env, uint8_t* nm, size_t nmlen, uint16_t dclass)
+</function_signature>
+<project_name>
+unbound
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include <stdlib.h>
+#include <string.h>
+
+#include "/src/unbound/services/authzone.h"
+#include "util/module.h"
+#include "util/regional.h"
+#include "util/config_file.h"
+#include "sldns/str2wire.h"
+#include "util/log.h"
+#include "sldns/rrdef.h"
+
+int auth_zones_startprobesequence(struct auth_zones *, struct module_env *, uint8_t *, size_t, uint16_t);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Minimal input to be a valid domain name component.
+    // sldns_str2wire_dname_buf handles most invalid inputs gracefully.
+    if (size == 0 || size > 1024) {
+        return 0;
+    }
+
+    // Suppress logs to avoid spamming output
+    log_init(NULL, 0, NULL);
+
+    // Create a null-terminated string from fuzzer data
+    char* dname_str = malloc(size + 1);
+    if (!dname_str) {
+        return 0;
+    }
+    memcpy(dname_str, data, size);
+    dname_str[size] = '\0';
+
+    // Convert string to wire format dname
+    uint8_t nm_buf[LDNS_MAX_DOMAINLEN];
+    size_t nmlen = sizeof(nm_buf);
+    if (sldns_str2wire_dname_buf(dname_str, nm_buf, &nmlen) != 0) {
+        free(dname_str);
+        return 0;
+    }
+    free(dname_str);
+
+    // Setup minimal module_env
+    struct module_env env;
+    memset(&env, 0, sizeof(env));
+    struct config_file cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    env.cfg = &cfg;
+    env.scratch = regional_create();
+    if (!env.scratch) {
+        return 0;
+    }
+
+    // Setup auth_zones
+    struct auth_zones* az = auth_zones_create();
+    if (!az) {
+        regional_destroy(env.scratch);
+        return 0;
+    }
+
+    // Create the zone that the function will look for
+    lock_rw_wrlock(&az->lock);
+    struct auth_zone* z = auth_zone_create(az, nm_buf, nmlen, LDNS_RR_CLASS_IN);
+    lock_rw_unlock(&az->lock);
+
+    if (z) {
+        // Create the transfer info for the zone
+        lock_rw_wrlock(&az->lock);
+        struct auth_xfer* xfr = auth_xfer_create(az, z);
+        lock_rw_unlock(&az->lock);
+
+        if (xfr) {
+            // Call the function under test
+            auth_zones_startprobesequence(az, &env, nm_buf, nmlen, LDNS_RR_CLASS_IN);
+        }
+    }
+
+    // Cleanup
+    auth_zones_delete(az);
+    regional_destroy(env.scratch);
+
+    return 0;
+}
+	

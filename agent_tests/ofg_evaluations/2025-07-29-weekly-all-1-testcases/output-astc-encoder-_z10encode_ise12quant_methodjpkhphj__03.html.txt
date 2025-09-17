@@ -1,0 +1,134 @@
+
+	
+<description>
+The `encode_ise` function encodes a sequence of integer values using either a trit-based or quint-based encoding scheme, determined by the `quant_level` parameter. The function reads from `input_data`, encodes it, and writes the result to `output_data`.
+</description>
+<requirements>
+
+<requirement>
+The `quant_level` parameter must be between 0 and 20. This is because `quant_level` is used to index into the `btq_counts` array, which has a size of 21.
+</requirement>
+<requirement>
+The `character_count` parameter must be greater than 0. This is enforced by a `promise` at the beginning of the function and prevents empty input.
+</requirement>
+<requirement>
+The `input_data` buffer must have a size of at least `character_count`. This is to prevent out-of-bounds reads during the encoding process.
+</requirement>
+<requirement>
+The values in `input_data` must be constrained based on the `quant_level`. If the selected `quant_level` results in using trits, each `(value >> bits) < 3`. If quints are used, each `(value >> bits) < 5`. This is because these values are used as indices into the `integer_of_trits` and `integer_of_quints` arrays.
+</requirement>
+<requirement>
+The `output_data` buffer must be large enough to hold the encoded data. The required size depends on `quant_level` and `character_count`, and insufficient size will lead to a buffer overflow.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void encode_ise(DW_TAG_enumeration_typequant_method, unsigned int, const uint8_t *, uint8_t *, unsigned int)
+</function_signature>
+<project_name>
+astc-encoder
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include "/src/astc-encoder/Source/astcenc_internal.h"
+#include <vector>
+#include <array>
+#include <cstdint>
+
+// Replicated from astcenc_integer_sequence.cpp to generate valid inputs.
+// This table defines the encoding parameters for each quantization level.
+struct btq_count {
+	uint8_t bits;
+	uint8_t trits;
+	uint8_t quints;
+};
+
+static const std::array<btq_count, 21> btq_counts {{
+	{ 1, 0, 0 }, // QUANT_2
+	{ 0, 1, 0 }, // QUANT_3
+	{ 2, 0, 0 }, // QUANT_4
+	{ 0, 0, 1 }, // QUANT_5
+	{ 1, 1, 0 }, // QUANT_6
+	{ 3, 0, 0 }, // QUANT_8
+	{ 1, 0, 1 }, // QUANT_10
+	{ 2, 1, 0 }, // QUANT_12
+	{ 4, 0, 0 }, // QUANT_16
+	{ 2, 0, 1 }, // QUANT_20
+	{ 3, 1, 0 }, // QUANT_24
+	{ 5, 0, 0 }, // QUANT_32
+	{ 3, 0, 1 }, // QUANT_40
+	{ 4, 1, 0 }, // QUANT_48
+	{ 6, 0, 0 }, // QUANT_64
+	{ 4, 0, 1 }, // QUANT_80
+	{ 5, 1, 0 }, // QUANT_96
+	{ 7, 0, 0 }, // QUANT_128
+	{ 5, 0, 1 }, // QUANT_160
+	{ 6, 1, 0 }, // QUANT_192
+	{ 8, 0, 0 }  // QUANT_256
+}};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+	FuzzedDataProvider stream(data, size);
+
+	// We need at least a few bytes for control values and one character.
+	if (size < 4) {
+		return 0;
+	}
+
+	// 1. Consume quant_level. The enum has 21 contiguous values [0-20].
+	auto quant_level_idx = stream.ConsumeIntegralInRange<uint8_t>(0, 20);
+	quant_method quant_level = static_cast<quant_method>(quant_level_idx);
+
+	// 2. Consume character_count. Must be > 0. Limit for performance.
+	unsigned int character_count = stream.ConsumeIntegralInRange<unsigned int>(1, 64);
+
+	// Ensure there is enough data to generate the input buffer.
+	if (stream.remaining_bytes() < character_count) {
+		return 0;
+	}
+
+	// 3. Generate constrained input_data based on quant_level.
+	const auto& bq = btq_counts[quant_level_idx];
+	unsigned int bits = bq.bits;
+	uint8_t max_high_val = 0;
+	if (bq.trits) {
+		max_high_val = 2; // Valid high part values are 0, 1, 2
+	} else if (bq.quints) {
+		max_high_val = 4; // Valid high part values are 0, 1, 2, 3, 4
+	}
+
+	std::vector<uint8_t> input_data;
+	input_data.reserve(character_count);
+	uint8_t low_mask = (1 << bits) - 1;
+
+	for (unsigned int i = 0; i < character_count; ++i) {
+		uint8_t byte = stream.ConsumeIntegral<uint8_t>();
+		uint8_t low_part = byte & low_mask;
+		uint8_t high_part = 0;
+
+		if (max_high_val > 0) {
+			// Constrain the high part of the value to be a valid index.
+			high_part = (byte >> bits) % (max_high_val + 1);
+		}
+		input_data.push_back((high_part << bits) | low_part);
+	}
+
+	// 4. Consume bit_offset and prepare a safe output_data buffer.
+	unsigned int bit_offset = stream.ConsumeIntegralInRange<unsigned int>(0, 128);
+
+	// Allocate a sufficiently large buffer to avoid calculating the exact size.
+	// Max bits per char is ~11 (8 for bits + 3 for quint). Max char_count is 64.
+	// Max bit_offset is 128. Total bits = 128 + 64 * 11 = 832 bits = 104 bytes.
+	// A 258-byte buffer is safe (includes padding for cross-byte writes).
+	std::vector<uint8_t> output_data(258, 0);
+
+	// 5. Call the function under test.
+	encode_ise(quant_level, character_count, input_data.data(), output_data.data(), bit_offset);
+
+	return 0;
+}
+	

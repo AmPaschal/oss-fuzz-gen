@@ -1,0 +1,121 @@
+
+	
+<description>
+The `kex_gen_client` function is responsible for generating the client's ephemeral key pair for various key exchange methods during the SSH handshake. It is not called directly, but rather assigned to a function pointer within the `kex` structure, which is a member of the main `ssh` structure. The actual call to `kex_gen_client` happens inside `kex_input_kexinit` after the key exchange algorithm has been negotiated between the client and the server. Based on the negotiated `kex_type`, it calls the appropriate function to generate the key pair (e.g., `kex_dh_keypair`, `kex_ecdh_keypair`, etc.). After the key pair is generated, it sends the client's public key to the server within a `SSH2_MSG_KEX_ECDH_INIT` packet and sets up a dispatch handler to receive the server's reply.
+</description>
+<requirements>
+<requirement>
+The `ssh` object passed as an argument must be initialized. The `ssh_new` function should be called to allocate and initialize the `ssh` structure.
+</requirement>
+<requirement>
+The `kex` member of the `ssh` structure must be initialized. The `kex_setup` function should be called to initialize the key exchange process, including allocating the `kex` structure and setting up the initial state.
+</requirement>
+<requirement>
+The `kex->kex_type` field must be set to one of the supported values in the `switch` statement. The value of `kex->kex_type` is determined by the `kex_choose_conf` function based on the provided algorithm proposal. Therefore, a valid proposal must be passed to `kex_setup` to ensure a supported `kex_type` is chosen.
+</requirement>
+<requirement>
+The `ssh->kex->client_pub` buffer must be uninitialized before calling `kex_gen_client`. This buffer is allocated and populated by the various `kex_*_keypair` functions called within `kex_gen_client`.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_gen_client(struct ssh *)
+</function_signature>
+<project_name>
+openssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <string.h>
+
+extern "C" {
+#include "config.h"
+// The header for the function-under-test must be inside extern "C"
+#include "/src/openssh/kex.h"
+#include "ssh_api.h"
+#include "myproposal.h"
+#include "log.h"
+#include "ssherr.h"
+#include "packet.h"
+#include "compat.h"
+#include "sshkey.h"
+#include "sshbuf.h"
+}
+
+// Dummy callback to satisfy the kex setup, preventing null pointer issues.
+// kex_gen_client does not use this, but it's good practice for initialization.
+static int verify_host_key_dummy(struct sshkey *hostkey, struct ssh *ssh) {
+  return 0;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  static bool initialized = false;
+  if (!initialized) {
+    // log_init is needed to avoid crashes in error paths.
+    log_init("fuzz", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_USER, 1);
+    initialized = true;
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  struct ssh *ssh = NULL;
+  struct kex_params kex_params;
+
+  // Use a default, valid proposal to ensure ssh_init succeeds.
+  char *myproposal[PROPOSAL_MAX] = {KEX_CLIENT};
+  memcpy(kex_params.proposal, myproposal, sizeof(myproposal));
+
+  // 1. Initialize the ssh object in client mode.
+  // This also allocates ssh->kex and sets up the kex function pointers.
+  if (ssh_init(&ssh, 0 /* is_server */, &kex_params) != 0) {
+    if (ssh)
+      ssh_free(ssh);
+    return 0;
+  }
+
+  if (ssh == NULL || ssh->kex == NULL) {
+    if (ssh)
+      ssh_free(ssh);
+    return 0;
+  }
+
+  // Set a dummy verifier to avoid null dereferences in case of unexpected code paths.
+  ssh->kex->verify_host_key = &verify_host_key_dummy;
+
+  // 2. Manually set the kex_type. This is normally chosen by kex_choose_conf.
+  const int kex_types[] = {
+#ifdef WITH_OPENSSL
+      KEX_DH_GRP1_SHA1,
+      KEX_DH_GRP14_SHA1,
+      KEX_DH_GRP14_SHA256,
+      KEX_DH_GRP16_SHA512,
+      KEX_DH_GRP18_SHA512,
+      KEX_ECDH_SHA2,
+#endif
+      KEX_C25519_SHA256,
+      KEX_KEM_SNTRUP761X25519_SHA512,
+      KEX_KEM_MLKEM768X25519_SHA256,
+  };
+  ssh->kex->kex_type = provider.PickValueInArray(kex_types);
+
+  // 3. Ensure client_pub is NULL, as required. It's allocated by the function.
+  sshbuf_free(ssh->kex->client_pub);
+  ssh->kex->client_pub = NULL;
+
+  // The sshpkt_* functions write to an in-memory buffer, so no real
+  // connection is needed. ssh_init prepares this.
+
+  // 4. Call the function under test.
+  kex_gen_client(ssh);
+
+  // 5. Clean up.
+  ssh_free(ssh);
+
+  return 0;
+}
+	

@@ -1,0 +1,143 @@
+
+	
+<description>
+The `FDKaacEnc_EncodeFrame` function is the core AAC encoding function. It takes a handle to the AAC encoder, a handle to the transport encoder, a buffer of PCM audio samples, and an array of extension payloads as input. It then performs psychoacoustic analysis, quantization, and bitstream formatting to produce an encoded AAC frame. The caller function, `aacEncEncode`, prepares the input buffer and extension payloads by processing various types of input data, including audio samples, metadata, and ancillary data, before calling this core encoding function.
+</description>
+<requirements>
+
+<requirement>
+The `aacEncOpen()` and `aacEncInit()` functions must be called before `FDKaacEnc_EncodeFrame()`. These functions are necessary to allocate and initialize the `HANDLE_AAC_ENC` (hAacEnc) and `HANDLE_TRANSPORTENC` (hTpEnc) handles, which are essential for the encoder's operation.
+</requirement>
+<requirement>
+The `hAacEnc` handle must be a valid, fully initialized handle returned from the setup functions. The function heavily dereferences this handle to access critical internal structures, and a NULL or improperly initialized handle will cause a crash.
+</requirement>
+<requirement>
+The `hTpEnc` handle must be a valid handle, also initialized by the setup functions. This handle is used for transport layer operations like writing the final bitstream.
+</requirement>
+<requirement>
+The `inputBuffer` argument should be a valid pointer to a buffer of `INT_PCM` audio samples. This buffer's contents should be fuzzed to explore different audio inputs.
+</requirement>
+<requirement>
+The `inputBufferBufSize` argument must accurately represent the number of samples in the `inputBuffer`. Providing a size larger than the actual buffer can lead to out-of-bounds reads within the `FDKaacEnc_psyMain` function.
+</requirement>
+<requirement>
+The `nOutBytes` argument must be a pointer to a valid integer. The function uses this to return the size of the encoded bitstream, and an invalid pointer would cause a crash on write.
+</requirement>
+<requirement>
+The `extPayload` argument is an array of `AACENC_EXT_PAYLOAD` structs with a size of `MAX_TOTAL_EXT_PAYLOADS` (12). For each element in the array, if its `dataSize` field is greater than zero, the `pData` field must point to a valid buffer of at least that size in bits.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+AAC_ENCODER_ERROR FDKaacEnc_EncodeFrame(HANDLE_AAC_ENC, HANDLE_TRANSPORTENC, INT_PCM *, const UINT, INT *, AACENC_EXT_PAYLOAD *)
+</function_signature>
+<project_name>
+libfdk-aac
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include "aacenc_lib.h"
+#include "/src/aac/libAACenc/src/aacenc.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1) {
+    return 0;
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  HANDLE_AACENCODER hAacEncoder = NULL;
+  if (aacEncOpen(&hAacEncoder, 0, 0) != AACENC_OK) {
+    return 0;
+  }
+
+  // Select a transport type
+  TRANSPORT_TYPE transport_type = provider.PickValueInArray<TRANSPORT_TYPE>(
+      {TT_MP4_ADTS, TT_MP4_LOAS, TT_MP4_RAW});
+  aacEncoder_SetParam(hAacEncoder, AACENC_TRANSMUX, transport_type);
+
+  // Select an Audio Object Type
+  AUDIO_OBJECT_TYPE aot = provider.PickValueInArray<AUDIO_OBJECT_TYPE>(
+      {AOT_AAC_LC, AOT_SBR, AOT_PS, AOT_ER_AAC_LD, AOT_ER_AAC_ELD});
+  aacEncoder_SetParam(hAacEncoder, AACENC_AOT, aot);
+
+  // Select a sample rate
+  int sample_rate = provider.PickValueInArray<int>(
+      {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000});
+  aacEncoder_SetParam(hAacEncoder, AACENC_SAMPLERATE, sample_rate);
+
+  // Select a channel mode
+  CHANNEL_MODE channel_mode =
+      provider.PickValueInArray<CHANNEL_MODE>({MODE_1, MODE_2});
+  aacEncoder_SetParam(hAacEncoder, AACENC_CHANNELMODE, channel_mode);
+
+  // Select a bitrate
+  int bitrate = provider.ConsumeIntegralInRange<int>(8000, 128000);
+  aacEncoder_SetParam(hAacEncoder, AACENC_BITRATE, bitrate);
+
+  if (aacEncEncode(hAacEncoder, NULL, NULL, NULL, NULL) != AACENC_OK) {
+    aacEncClose(&hAacEncoder);
+    return 0;
+  }
+
+  AACENC_InfoStruct info = {0};
+  if (aacEncInfo(hAacEncoder, &info) != AACENC_OK) {
+    aacEncClose(&hAacEncoder);
+    return 0;
+  }
+
+  // Prepare input and output buffers
+  std::vector<uint8_t> input_buf(info.frameLength * info.inputChannels * 2);
+  std::vector<uint8_t> output_buf(info.maxOutBufBytes);
+
+  // Fill input buffer with fuzzer data
+  size_t consumed_size =
+      provider.ConsumeData(input_buf.data(), input_buf.size());
+  if (consumed_size < input_buf.size()) {
+    // Not enough data, pad with zeros
+    memset(input_buf.data() + consumed_size, 0,
+           input_buf.size() - consumed_size);
+  }
+
+  // Setup buffer descriptors
+  AACENC_BufDesc in_buf_desc, out_buf_desc;
+  void *in_buf_ptr = input_buf.data();
+  int in_buf_size = input_buf.size();
+  int in_buf_el_size = 2;
+  int in_identifier = IN_AUDIO_DATA;
+  in_buf_desc.numBufs = 1;
+  in_buf_desc.bufs = &in_buf_ptr;
+  in_buf_desc.bufferIdentifiers = &in_identifier;
+  in_buf_desc.bufSizes = &in_buf_size;
+  in_buf_desc.bufElSizes = &in_buf_el_size;
+
+  void *out_buf_ptr = output_buf.data();
+  int out_buf_size = output_buf.size();
+  int out_buf_el_size = 1;
+  int out_identifier = OUT_BITSTREAM_DATA;
+  out_buf_desc.numBufs = 1;
+  out_buf_desc.bufs = &out_buf_ptr;
+  out_buf_desc.bufferIdentifiers = &out_identifier;
+  out_buf_desc.bufSizes = &out_buf_size;
+  out_buf_desc.bufElSizes = &out_buf_el_size;
+
+  // Setup arguments
+  AACENC_InArgs in_args;
+  memset(&in_args, 0, sizeof(in_args));
+  in_args.numInSamples = info.frameLength * info.inputChannels;
+
+  AACENC_OutArgs out_args;
+  memset(&out_args, 0, sizeof(out_args));
+
+  // Encode the frame. This will call FDKaacEnc_EncodeFrame internally.
+  aacEncEncode(hAacEncoder, &in_buf_desc, &out_buf_desc, &in_args, &out_args);
+
+  aacEncClose(&hAacEncoder);
+  return 0;
+}
+	

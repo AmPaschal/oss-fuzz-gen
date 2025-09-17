@@ -1,0 +1,118 @@
+
+	
+<description>
+The nb_encode function is the core of the Speex narrowband encoder. It takes the encoder state, a frame of audio data, and a bitstream structure as input, and performs the encoding of the audio frame, writing the compressed data into the bitstream. The function is not meant to be called directly, but is invoked through the speex_encode or speex_encode_int API functions when the encoder is initialized for narrowband operation (using speex_nb_mode). The encoder state must be properly initialized by a call to speex_encoder_init. Similarly, the SpeexBits structure must be initialized via speex_bits_init before being passed to the encoding function.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `state`, must be a valid pointer to an `EncState` structure initialized by `speex_encoder_init(&speex_nb_mode)`. This is because the function dereferences this pointer extensively without any null checks, and relies on the fields being correctly populated by the initialization function.
+</requirement>
+<requirement>
+The second argument, `vin`, must be a pointer to a buffer of at least `NB_FRAME_SIZE` (160) 16-bit samples. The function reads from this buffer, and an invalid pointer or insufficient buffer size will lead to a crash.
+</requirement>
+<requirement>
+The third argument, `bits`, must be a valid pointer to a `SpeexBits` structure, which must be initialized by calling `speex_bits_init`. This is because the function writes the encoded bitstream to this structure and will crash if the pointer is null or the structure is not properly initialized.
+</requirement>
+<requirement>
+The `submodeID` field of the `EncState` structure should be a valid index for the `submodes` array. An out-of-bounds `submodeID` will cause a crash when accessing `st->submodes[st->submodeID]`.
+</requirement>
+<requirement>
+Before calling `nb_encode`, it is recommended to call `speex_encoder_ctl` to set any desired encoding parameters, such as quality, bitrate, or complexity. This is because these settings affect the behavior and execution path of the `nb_encode` function.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int nb_encode(void *, void *, SpeexBits *)
+</function_signature>
+<project_name>
+speex
+</project_name>
+
+	Fuzz target source:
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include <cstdint>
+#include <cstdlib>
+
+#include "speex/speex.h"
+
+// This fuzzer targets nb_encode by using the public API in narrowband mode.
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    // Initialize encoder for narrowband to ensure nb_encode is the backend function used.
+    const SpeexMode *mode = speex_lib_get_mode(SPEEX_MODEID_NB);
+    if (!mode) {
+        return 0;
+    }
+    void *st = speex_encoder_init(mode);
+    if (!st) {
+        return 0;
+    }
+
+    // Configure encoder with fuzzed parameters to increase coverage.
+    spx_int32_t complexity = fdp.ConsumeIntegralInRange(0, 10);
+    speex_encoder_ctl(st, SPEEX_SET_COMPLEXITY, &complexity);
+
+    spx_int32_t bitrate = fdp.ConsumeIntegralInRange(2000, 40000);
+    speex_encoder_ctl(st, SPEEX_SET_BITRATE, &bitrate);
+
+    spx_int32_t vbr_enabled = fdp.ConsumeBool();
+    speex_encoder_ctl(st, SPEEX_SET_VBR, &vbr_enabled);
+    if (vbr_enabled) {
+        // VBR quality is a float, but speex_encoder_ctl takes a void*.
+        // The fixed-point build might not handle float well, but this is how other fuzzers do it.
+        float vbr_quality = fdp.ConsumeFloatingPointInRange<float>(0.0f, 10.0f);
+        speex_encoder_ctl(st, SPEEX_SET_VBR_QUALITY, &vbr_quality);
+    } else {
+        spx_int32_t quality = fdp.ConsumeIntegralInRange(0, 10);
+        speex_encoder_ctl(st, SPEEX_SET_QUALITY, &quality);
+    }
+    
+    spx_int32_t vad_enabled = fdp.ConsumeBool();
+    speex_encoder_ctl(st, SPEEX_SET_VAD, &vad_enabled);
+
+    spx_int32_t dtx_enabled = fdp.ConsumeBool();
+    speex_encoder_ctl(st, SPEEX_SET_DTX, &dtx_enabled);
+
+    spx_int32_t highpass_enabled = fdp.ConsumeBool();
+    speex_encoder_ctl(st, SPEEX_SET_HIGHPASS, &highpass_enabled);
+
+    // Get frame size from the encoder.
+    spx_int32_t frame_size;
+    speex_encoder_ctl(st, SPEEX_GET_FRAME_SIZE, &frame_size);
+    if (frame_size <= 0) {
+        speex_encoder_destroy(st);
+        return 0;
+    }
+
+    // Initialize SpeexBits for output.
+    SpeexBits bits;
+    speex_bits_init(&bits);
+
+    const size_t frame_bytes = frame_size * sizeof(spx_int16_t);
+    std::vector<spx_int16_t> input_frame(frame_size);
+
+    // Process as many full frames as the input data allows.
+    while (fdp.remaining_bytes() >= frame_bytes) {
+        fdp.ConsumeData(input_frame.data(), frame_bytes);
+        // Use the public API. This will call nb_encode internally.
+        speex_encode_int(st, input_frame.data(), &bits);
+        speex_bits_reset(&bits); // Reset for the next frame.
+    }
+
+    // Cleanup.
+    speex_bits_destroy(&bits);
+    speex_encoder_destroy(st);
+
+    return 0;
+}
+	

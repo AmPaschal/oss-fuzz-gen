@@ -1,0 +1,163 @@
+
+	
+<description>
+The `pjsip_endpt_respond_stateless` function sends a SIP response message without involving a transaction. It is used to quickly send a response to a request when no stateful processing is required or possible. For example, it is used to reject requests when the server is busy or when the request is malformed. The function first creates a response message based on the received request data (`rdata`) and the provided status code (`st_code`) and text (`st_text`). It then adds any optional headers (`hdr_list`) and a message body (`body`). Finally, it determines the destination address from the received request and sends the response. The function performs several checks, including verifying that the endpoint and received data are valid, and that no active transaction exists for the request.
+</description>
+<requirements>
+<requirement>
+The `endpt` argument must be a valid pointer to an initialized `pjsip_endpoint` structure. This is because the function uses this endpoint to create and send the response message, and a `NULL` or invalid endpoint will lead to a crash.
+</requirement>
+<requirement>
+The `rdata` argument must be a valid pointer to a `pjsip_rx_data` structure representing an incoming SIP request. This is because the function accesses fields within this structure to construct the response, and an invalid `rdata` will cause a dereference of a `NULL` or invalid pointer.
+</requirement>
+<requirement>
+The `msg_info.msg->type` field of the `rdata` structure must be `PJSIP_REQUEST_MSG`. The function asserts this condition, and a different message type will cause an assertion failure.
+</requirement>
+<requirement>
+The transaction associated with `rdata` (retrieved via `pjsip_rdata_get_tsx`) must either be `NULL` or in the `PJSIP_TSX_STATE_TERMINATED` state. This is because the function is for stateless responses, and an active transaction would imply a stateful response is required.
+</requirement>
+<requirement>
+The `st_code` argument should be a valid SIP status code (e.g., between 100 and 699). While the function may not crash with an invalid code, it is essential for correct protocol behavior.
+</requirement>
+<requirement>
+If the `st_text` argument is not `NULL`, it must point to a valid `pj_str_t` structure. This is because the function will use this string as the reason phrase in the SIP response.
+</requirement>
+<requirement>
+If the `hdr_list` argument is not `NULL`, it must point to a valid, circularly-linked list of `pjsip_hdr` structures. The function iterates through this list and clones each header, so an invalid list structure can lead to an infinite loop or a crash.
+</requirement>
+<requirement>
+If the `body` argument is not `NULL`, it must point to a valid `pjsip_msg_body` structure. The function clones the message body, so an invalid `body` can lead to a crash during the cloning process.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+pj_status_t pjsip_endpt_respond_stateless(pjsip_endpoint *, pjsip_rx_data *, int, const pj_str_t *, const pjsip_hdr *, const pjsip_msg_body *)
+</function_signature>
+<project_name>
+pjsip
+</project_name>
+
+	Fuzz target source:
+/*
+ * Copyright (C) 2023 Teluu Inc. (http://www.teluu.com)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <pjlib.h>
+#include <pjlib-util.h>
+#include <pjsip.h>
+#include <pjsip_ua.h>
+
+#include "/src/pjsip/pjsip/include/pjsip/sip_util.h"
+#include <pjsip/sip_msg.h>
+#include <pjsip/sip_parser.h>
+#include <pjsip/sip_endpoint.h>
+#include <pjsip/sip_transport.h>
+
+
+#define kMinInputLength 20
+#define kMaxInputLength 4096
+
+static pj_caching_pool cp;
+static pjsip_endpoint *sip_endpt = NULL;
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+  PJ_UNUSED_ARG(argc);
+  PJ_UNUSED_ARG(argv);
+
+  pj_init();
+  pj_caching_pool_init(&cp, &pj_pool_factory_default_policy, 0);
+  pjsip_endpt_create(&cp.factory, "fuzzer", &sip_endpt);
+  pj_log_set_level(0);
+
+  return 0;
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  if (sip_endpt == NULL) {
+    return 0;
+  }
+
+  pj_pool_t *pool = NULL;
+  pjsip_rx_data *rdata = NULL;
+  char *data_copy = NULL;
+
+  pool = pj_pool_create(&cp.factory, "fuzz-pool", 2048, 2048, NULL);
+  if (!pool) {
+    return 0;
+  }
+
+  data_copy = (char *)pj_pool_alloc(pool, size + 1);
+  if (!data_copy) {
+    pj_pool_release(pool);
+    return 0;
+  }
+  memcpy(data_copy, data, size);
+  data_copy[size] = '\0';
+
+  rdata = pj_pool_zalloc(pool, sizeof(pjsip_rx_data));
+  if (!rdata) {
+    pj_pool_release(pool);
+    return 0;
+  }
+
+  pjsip_msg *msg = pjsip_parse_rdata(data_copy, size, rdata);
+  if (msg == NULL) {
+    pj_pool_release(pool);
+    return 0;
+  }
+
+  if (rdata->msg_info.msg->type != PJSIP_REQUEST_MSG) {
+    pjsip_rx_data_free_cloned(rdata);
+    pj_pool_release(pool);
+    return 0;
+  }
+
+  if (rdata->msg_info.msg->line.req.method.id == PJSIP_ACK_METHOD) {
+    pjsip_rx_data_free_cloned(rdata);
+    pj_pool_release(pool);
+    return 0;
+  }
+
+  int st_code = 200;
+  if (size > 1) {
+    st_code = 100 + (data[0] % 6) * 100 + (data[1] % 100);
+  }
+
+  const pj_str_t *st_text = NULL;
+  pjsip_hdr hdr_list;
+  pj_list_init(&hdr_list);
+  const pjsip_msg_body *body = NULL;
+
+  pjsip_endpt_respond_stateless(sip_endpt, rdata, st_code, st_text,
+                                &hdr_list, body);
+
+  pjsip_rx_data_free_cloned(rdata);
+  pj_pool_release(pool);
+
+  return 0;
+}
+	

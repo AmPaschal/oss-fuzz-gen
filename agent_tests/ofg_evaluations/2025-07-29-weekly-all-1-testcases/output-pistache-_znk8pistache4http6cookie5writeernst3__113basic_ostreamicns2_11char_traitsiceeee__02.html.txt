@@ -1,0 +1,213 @@
+
+	
+<description>
+The `Pistache::Http::Cookie::write` function serializes a `Cookie` object to an output stream. It is a private member function called by the `operator<<` for the `Cookie` class. The function writes the cookie's name-value pair and then iterates through the optional attributes of the cookie (`path`, `domain`, `maxAge`, `expires`, `secure`, `httpOnly`, and `ext`), writing them to the stream if they are present. The `expires` attribute is a `FullDate` object which has its own `write` method to format the date correctly.
+</description>
+<requirements>
+<requirement>
+The `Cookie` object should be initialized before calling `write`. This can be done by calling the `Cookie` constructor `Cookie(name, value)` or by using the parsing functions `Cookie::fromRaw` or `Cookie::fromString`.
+</requirement>
+<requirement>
+The `name` and `value` members of the `Cookie` object should be valid strings. These are fundamental to the cookie and are always outputted.
+</requirement>
+<requirement>
+To achieve full path coverage, the optional members `path`, `domain`, `maxAge`, and `expires` should be populated. This will ensure all branches of the `if (member.has_value())` checks are executed.
+</requirement>
+<requirement>
+If the `expires` member is set, it must be a valid `FullDate` object. The `FullDate` object can be created using `Pistache::Http::FullDate::from_time_t(time(nullptr))` to ensure it is correctly formatted.
+</requirement>
+<requirement>
+The `ext` member, which is a `std::map`, should be populated with at least two key-value pairs. This is to ensure the logic for printing separators between extensions is exercised.
+</requirement>
+<requirement>
+The `secure` and `httpOnly` boolean flags should be tested with both `true` and `false` values. This ensures all parts of the output logic are tested.
+</requirement>
+<requirement>
+The `os` ostream object must be a valid, open stream. Any standard `ostringstream` or other `ostream` object will suffice.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Http::Cookie::write(const struct Cookie *, ostream &)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <pistache/http.h>
+#include <pistache/router.h>
+#include "/src/pistache/include/pistache/cookie.h"
+
+using namespace Pistache;
+
+template <class F> void ignoreExceptions(const F &func) {
+  try {
+    func();
+  } catch (...) {
+  }
+}
+
+template <class T> void parseHttpHeader(const std::string &input) {
+  T header;
+  ignoreExceptions([&] { header.parse(input); });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+template <> void parseHttpHeader<Pistache::Http::Header::Authorization>(const std::string &input) {
+  Pistache::Http::Header::Authorization header;
+  ignoreExceptions([&] { header.parse(input); });
+  ignoreExceptions([&] { header.getMethod(); });
+  ignoreExceptions([&] {
+    const auto user = header.getBasicUser();
+    const auto password = header.getBasicPassword();
+    header.setBasicUserPassword(user, password);
+  });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+void fuzz_headers(const std::string &input) {
+  parseHttpHeader<Pistache::Http::Header::Accept>(input);
+  parseHttpHeader<Pistache::Http::Header::CacheControl>(input);
+  parseHttpHeader<Pistache::Http::Header::Connection>(input);
+  parseHttpHeader<Pistache::Http::Header::AcceptEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentLength>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentType>(input);
+  parseHttpHeader<Pistache::Http::Header::Authorization>(input);
+  parseHttpHeader<Pistache::Http::Header::Date>(input);
+  parseHttpHeader<Pistache::Http::Header::Expect>(input);
+  parseHttpHeader<Pistache::Http::Header::Host>(input);
+  parseHttpHeader<Pistache::Http::Header::Server>(input);
+}
+
+void fuzz_cookies(const std::string &input) {
+  // Fuzz parsing
+  Pistache::Http::CookieJar cookie_jar;
+  ignoreExceptions([&] { Pistache::Http::Cookie::fromString(input); });
+  ignoreExceptions([&] { cookie_jar.addFromRaw(input.data(), input.size()); });
+
+  // Fuzz writing of Pistache::Http::Cookie::write
+  FuzzedDataProvider provider(reinterpret_cast<const uint8_t*>(input.data()), input.size());
+
+  std::string name = provider.ConsumeRandomLengthString(32);
+  std::string value = provider.ConsumeRandomLengthString(128);
+  Pistache::Http::Cookie cookie(name, value);
+
+  if (provider.ConsumeBool()) {
+    cookie.path = provider.ConsumeRandomLengthString(64);
+  }
+  if (provider.ConsumeBool()) {
+    cookie.domain = provider.ConsumeRandomLengthString(64);
+  }
+  if (provider.ConsumeBool()) {
+    cookie.maxAge = provider.ConsumeIntegral<int>();
+  }
+  if (provider.ConsumeBool()) {
+    time_t t = provider.ConsumeIntegral<time_t>();
+    cookie.expires = Pistache::Http::FullDate(std::chrono::system_clock::from_time_t(t));
+  }
+  cookie.secure = provider.ConsumeBool();
+  cookie.httpOnly = provider.ConsumeBool();
+
+  size_t ext_count = provider.ConsumeIntegralInRange<size_t>(0, 5);
+  for (size_t i = 0; i < ext_count; ++i) {
+    cookie.ext.insert({provider.ConsumeRandomLengthString(16), provider.ConsumeRandomLengthString(32)});
+  }
+
+  std::stringstream ss;
+  // This calls the private write method via the friend operator<<
+  ignoreExceptions([&] { ss << cookie; });
+}
+
+void fuzz_request_parser(const std::string &input) {
+  constexpr size_t maxDataSize = 4096;
+  Pistache::Http::RequestParser rparser(maxDataSize);
+
+  if (rparser.feed(input.data(), input.size())) {
+    auto state = Pistache::Http::Private::State::Done;
+    ignoreExceptions([&] { state = rparser.parse(); });
+
+    if (state == Pistache::Http::Private::State::Again)
+      ignoreExceptions([&] { rparser.parse(); });
+  }
+}
+
+void fuzz_router(const std::string &input) {
+  std::string path_input;
+  std::stringstream input_stream(input);
+  Pistache::Rest::SegmentTreeNode tree;
+
+  while (std::getline(input_stream, path_input, '\n')) {
+    if (path_input.size() < 2)
+      continue;
+
+    const int test_case = path_input.back();
+    path_input.pop_back();
+
+    const auto sanitized = Pistache::Rest::SegmentTreeNode::sanitizeResource(path_input);
+    std::shared_ptr<char> ptr(new char[sanitized.length()], std::default_delete<char[]>());
+    memcpy(ptr.get(), sanitized.data(), sanitized.length());
+    const std::string_view path{ptr.get(), sanitized.length()};
+
+    switch (test_case) {
+    case 'A':
+      ignoreExceptions([&] {
+        Pistache::Rest::Route::Handler handler = [](auto...) { return Pistache::Rest::Route::Result::Ok; };
+        std::shared_ptr<char> ptr(new char[sanitized.length()], std::default_delete<char[]>());
+        memcpy(ptr.get(), sanitized.data(), sanitized.length());
+        const std::string_view path{ptr.get(), sanitized.length()};
+        tree.addRoute(path, handler, ptr);
+      });
+      break;
+    case 'R':
+      ignoreExceptions([&] { tree.removeRoute(path); });
+      break;
+    case 'F':
+      ignoreExceptions([&] { tree.findRoute(path); });
+      break;
+    }
+  }
+}
+
+void fuzz_other(const std::string &input) {
+  // URI parsing
+  Http::Uri::Query query1;
+  query1.add(input, input);
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1)
+    return -1;
+
+  const uint8_t type = data[0];
+  const std::string input(reinterpret_cast<const char *>(data + 1), size - 1);
+
+  switch (type) {
+  case 'H':
+    fuzz_headers(input);
+    break;
+  case 'C':
+    fuzz_cookies(input);
+    break;
+  case 'R':
+    fuzz_request_parser(input);
+    break;
+  case 'S':
+    fuzz_router(input);
+    break;
+  case 'O':
+    fuzz_other(input);
+    break;
+  }
+
+  return 0;
+}
+	

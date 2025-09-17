@@ -1,0 +1,146 @@
+
+	
+<description>
+The `onReady` function is a central event handling function in the Pistache TCP transport layer. It is responsible for processing I/O events on file descriptors that are being monitored. The function receives a set of ready file descriptors in an `Aio::FdSet` object and iterates through them. For each ready descriptor, it determines the type of event (e.g., readable, writable, timer, new connection) by checking its associated tag and dispatches the event to the appropriate handler function. This function is crucial for the asynchronous, event-driven architecture of the Pistache library.
+</description>
+<requirements>
+
+<requirement>
+A `Pistache::Tcp::Transport` object must be properly initialized before calling `onReady`. The `registerPoller` and `init` methods must be called to set up the necessary internal state, including pollable queues and the notifier. This ensures that the transport is ready to handle I/O events.</requirement>
+<requirement>
+To avoid a crash when handling readable events for peers, the `peers` map within the `Transport` object must be populated. Call `handleNewPeer` to add a peer and use the peer's file descriptor as the tag in the `Polling::Event`. This prevents `getPeer` from failing when looking up a non-existent peer.</requirement>
+<requirement>
+To prevent a crash when handling timer events, the `timers` map in the `Transport` object must contain the timer being processed. Use `armTimerMs` to add a timer and use the returned file descriptor as the tag in the `Polling::Event`. This ensures that the timer can be found in the `timers` map, preventing an invalid memory access.</requirement>
+<requirement>
+The `Aio::FdSet` object passed to `onReady` must be constructed with a vector of `Polling::Event` objects. These events should have their tags and flags appropriately set to simulate various I/O scenarios. The tags should correspond to valid file descriptors for peers, timers, or other event sources, and the flags should indicate the type of event, such as read or write readiness.</requirement>
+<requirement>
+To thoroughly test the robustness of the `onReady` function, the `Aio::FdSet` should include events with invalid or random tags. This helps to verify that the function correctly handles unexpected events and does not crash when encountering a tag that does not correspond to any known peer, timer, or other resource. This is important for preventing denial-of-service vulnerabilities.</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Tcp::Transport::onReady(const FdSet &)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <pistache/async.h>
+#include <pistache/net.h>
+#include <pistache/peer.h>
+#include <pistache/tcp.h>
+
+#include "/src/pistache/include/pistache/transport.h"
+
+#include <sys/socket.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+
+// Mock handler to satisfy the Transport's dependency
+class MockHandler : public Pistache::Tcp::Handler {
+public:
+  // Pistache::Tcp::Handler pure virtual functions
+  void onConnection(const std::shared_ptr<Pistache::Tcp::Peer> &) override {}
+  void onDisconnection(const std::shared_ptr<Pistache::Tcp::Peer> &) override {}
+  void onInput(const char *, size_t, const std::shared_ptr<Pistache::Tcp::Peer> &) override {}
+
+  // These are implemented in the base Tcp::Handler but are not virtual.
+  // We are hiding them, which is fine for this mock.
+  void onReady(const Pistache::Aio::FdSet &) {}
+  void registerPoller(Pistache::Polling::Epoll &) {}
+  void unregisterPoller(Pistache::Polling::Epoll &) {}
+
+  // Prototype<Pistache::Tcp::Handler> override
+  std::shared_ptr<Pistache::Tcp::Handler> clone() const override { return std::make_shared<MockHandler>(); }
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+
+  auto handler = std::make_shared<MockHandler>();
+  Pistache::Tcp::Transport transport(handler);
+
+  Pistache::Polling::Epoll poller;
+  transport.registerPoller(poller);
+
+  std::vector<Pistache::Polling::Event> events;
+  std::vector<int> fds_to_close;
+
+  const int event_count = fdp.ConsumeIntegralInRange<int>(1, 10);
+  for (int i = 0; i < event_count; ++i) {
+    if (fdp.remaining_bytes() < 2) {
+      break;
+    }
+
+    const auto event_type = Pistache::Polling::NotifyOn(fdp.ConsumeIntegralInRange<uint8_t>(1, 15));
+
+    switch (fdp.ConsumeIntegralInRange<uint8_t>(0, 3)) {
+    case 0: { // Readable Peer Event
+      int fds[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0) {
+        auto peer = Pistache::Tcp::Peer::Create(fds[0], Pistache::Address("127.0.0.1", 1234));
+        transport.handleNewPeer(peer);
+        Pistache::Polling::Event ev{Pistache::Polling::Tag(fds[0])};
+        ev.flags |= Pistache::Polling::NotifyOn::Read;
+        events.push_back(ev);
+        fds_to_close.push_back(fds[0]);
+        fds_to_close.push_back(fds[1]);
+      }
+      break;
+    }
+    case 1: { // Writable Peer Event
+      int fds[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0) {
+        auto peer = Pistache::Tcp::Peer::Create(fds[0], Pistache::Address("127.0.0.1", 1235));
+        transport.handleNewPeer(peer);
+        Pistache::Polling::Event ev{Pistache::Polling::Tag(fds[0])};
+        ev.flags |= Pistache::Polling::NotifyOn::Write;
+        events.push_back(ev);
+        fds_to_close.push_back(fds[0]);
+        fds_to_close.push_back(fds[1]);
+      }
+      break;
+    }
+    case 2: { // Timer Event
+      int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+      if (tfd >= 0) {
+        Pistache::Async::Deferred<uint64_t> deferred;
+        transport.armTimer(tfd, std::chrono::milliseconds(fdp.ConsumeIntegralInRange<uint8_t>(1, 255)), std::move(deferred));
+        Pistache::Polling::Event ev{Pistache::Polling::Tag(tfd)};
+        ev.flags |= Pistache::Polling::NotifyOn::Read;
+        events.push_back(ev);
+        fds_to_close.push_back(tfd);
+      }
+      break;
+    }
+    case 3: { // Invalid/Random Event
+      Pistache::Fd rand_fd = fdp.ConsumeIntegral<Pistache::Fd>();
+      if (rand_fd > 0) {
+        Pistache::Polling::Event ev{Pistache::Polling::Tag(rand_fd)};
+        ev.flags |= event_type;
+        events.push_back(ev);
+      }
+      break;
+    }
+    }
+  }
+
+  if (!events.empty()) {
+    Pistache::Aio::FdSet fdSet(std::move(events));
+    transport.onReady(fdSet);
+  }
+
+  // Cleanup
+  for (int fd : fds_to_close) {
+    close(fd);
+  }
+
+  transport.unregisterPoller(poller);
+
+  return 0;
+}
+	

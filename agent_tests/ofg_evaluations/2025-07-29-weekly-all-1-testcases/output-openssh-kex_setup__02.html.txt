@@ -1,0 +1,125 @@
+
+	
+<description>
+The `kex_setup` function initializes and sets up the key exchange process for an SSH connection. It prepares the key exchange parameters based on a given proposal of algorithms and sends the initial key exchange message (KEXINIT) to the other party. It's a fundamental part of establishing a secure SSH channel.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `ssh`, must be a pointer to a valid `ssh` struct, which can be initialized by `ssh_new` or `ssh_packet_set_connection`. This is because the function accesses members of the `ssh` struct (`ssh->kex`, `ssh->state`) to manage the key exchange state.
+</requirement>
+<requirement>
+The `ssh->kex` member can be `NULL`. The function checks if `ssh->kex` is `NULL` and allocates a new `kex` struct using `kex_new()` if it is.
+</requirement>
+<requirement>
+The second argument, `proposal`, must be an array of `PROPOSAL_MAX` (10) C strings. This is because the function expects an array of this specific size to hold the lists of cryptographic algorithms for key exchange.
+</requirement>
+<requirement>
+The `proposal` array should be initialized with valid SSH algorithm identifiers, for example using the `KEX_CLIENT` macro from `myproposal.h`. The `proposal` array's contents are used to negotiate the cryptographic algorithms, and invalid strings can lead to failures.
+</requirement>
+<requirement>
+Specific indices of the `proposal` array, such as `PROPOSAL_SERVER_HOST_KEY_ALGS`, can be customized after initializing with `KEX_CLIENT`. Callers like `ssh-keyscan.c` demonstrate a pattern of initializing with `KEX_CLIENT` and then overwriting specific proposals.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_setup(struct ssh *, char **)
+</function_signature>
+<project_name>
+openssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <string>
+#include <vector>
+#include <cstring>
+
+extern "C" {
+#include "includes.h"
+#include "ssh_api.h"
+#include "kex.h"
+#include "myproposal.h"
+#include "log.h"
+#include "sshkey.h"
+#include "packet.h"
+#include "xmalloc.h"
+}
+
+// Function under test
+// int kex_setup(struct ssh *, char **);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider provider(data, size);
+
+    static bool initialized = false;
+    if (!initialized) {
+        log_init("fuzz", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_USER, 1);
+        initialized = true;
+    }
+
+    struct ssh *client = NULL;
+    struct sshkey *hostkey = NULL;
+    char *proposal[PROPOSAL_MAX];
+
+    // 1. Prepare proposal array by copying const strings from the macro.
+    const char *default_proposal[PROPOSAL_MAX] = { KEX_CLIENT };
+    for (int i = 0; i < PROPOSAL_MAX; i++) {
+        proposal[i] = strdup(default_proposal[i]);
+        if (proposal[i] == NULL) {
+            for (int j = 0; j < i; j++) free(proposal[j]);
+            return 0;
+        }
+    }
+
+    // 2. Fuzz the host key algorithm
+    std::string key_type_name;
+    int key_type;
+    switch (provider.ConsumeIntegralInRange<int>(0, 2)) {
+        case 0:
+            key_type = KEY_RSA;
+            key_type_name = "rsa-sha2-512"; 
+            break;
+        case 1:
+            key_type = KEY_ECDSA;
+            key_type_name = "ecdsa-sha2-nistp256";
+            break;
+        default:
+            key_type = KEY_ED25519;
+            key_type_name = "ssh-ed25519";
+            break;
+    }
+    free(proposal[PROPOSAL_SERVER_HOST_KEY_ALGS]);
+    proposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = strdup(key_type_name.c_str());
+    if (proposal[PROPOSAL_SERVER_HOST_KEY_ALGS] == NULL) {
+        goto cleanup;
+    }
+
+    // 3. Explicitly initialize the ssh struct to make the call path clear.
+    client = ssh_alloc_session_state();
+    if (client == NULL) {
+        goto cleanup;
+    }
+    ssh_packet_set_connection(client, -1, -1);
+
+    // 4. Add a hostkey, which is required by kex_ready() inside kex_setup().
+    if (sshkey_generate(key_type, (key_type == KEY_RSA) ? 2048 : 256, &hostkey) == 0) {
+        ssh_add_hostkey(client, hostkey);
+        sshkey_free(hostkey);
+    }
+
+    // 5. Call the target function explicitly.
+    kex_setup(client, proposal);
+
+cleanup:
+    ssh_free(client);
+    for (int i = 0; i < PROPOSAL_MAX; i++) {
+        free(proposal[i]);
+    }
+
+    return 0;
+}
+	

@@ -1,0 +1,163 @@
+
+	
+<description>
+The `auth_zones_notify` function processes a DNS NOTIFY request. It first finds the corresponding authoritative zone based on the domain name and class in the request. If a matching zone is found, it then checks if the source address of the NOTIFY is in the zone's configured list of allowed notification providers. If the source is allowed, the function proceeds to process the notification, which may involve updating the zone's serial number and initiating a zone transfer. The function returns 1 if the notification is processed and 0 otherwise, and it uses the `refused` parameter to indicate whether the notification was denied due to the source address not being on the allow list.
+</description>
+<requirements>
+<requirement>
+The `az` argument, a pointer to a `struct auth_zones`, must be initialized by calling `auth_zones_create()`. This is because the function expects a valid and properly initialized `auth_zones` structure to work with.
+</requirement>
+<requirement>
+A zone must be added to the `auth_zones` structure that matches the provided `nm`, `nmlen`, and `dclass` arguments. This ensures that the call to `auth_xfer_find` within the function will successfully find a zone to process, preventing an early exit.
+</requirement>
+<requirement>
+The `addr` and `addrlen` arguments, representing a socket address, must correspond to a master server configured in the `allow_notify_list` for the zone. This is because the function will only process the notification if the sending address is authorized, as checked by `az_xfr_allowed_notify`.
+</requirement>
+<requirement>
+The `refused` argument must be a valid pointer to an integer. This is essential as the function uses this pointer to communicate back to the caller whether the notification was refused.
+</requirement>
+<requirement>
+The `env` argument must be a valid pointer to a `module_env` structure. This structure is passed to `xfr_process_notify` and is required for its operation.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int auth_zones_notify(struct auth_zones *, struct module_env *, uint8_t *, size_t, uint16_t, struct sockaddr_storage *, socklen_t, int, uint32_t, int *)
+</function_signature>
+<project_name>
+unbound
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include "/src/unbound/services/authzone.h"
+#include "util/module.h"
+#include "util/config_file.h"
+#include "util/regional.h"
+
+// Forward declaration as requested by the prompt.
+int auth_zones_notify(struct auth_zones *, struct module_env *, uint8_t *, size_t, uint16_t, struct sockaddr_storage *, socklen_t, int, uint32_t, int *);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Minimum size to safely read all fixed-size fields.
+    // This includes: dclass, has_serial, serial, addr_type, sockaddr_in6, and 1 byte for the name.
+    if (size < sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint8_t) + sizeof(struct sockaddr_in6) + 1) {
+        return 0;
+    }
+
+    struct auth_zones* az = auth_zones_create();
+    if (!az) {
+        return 0;
+    }
+
+    struct module_env env;
+    memset(&env, 0, sizeof(struct module_env));
+
+    // Allocate and set env.now_tv to avoid a crash in deeper functions.
+    env.now_tv = (struct timeval*)malloc(sizeof(struct timeval));
+    if(!env.now_tv) {
+        auth_zones_delete(az);
+        return 0;
+    }
+    time_t now = time(NULL);
+    env.now_tv->tv_sec = now;
+    env.now_tv->tv_usec = 0;
+    env.now = &env.now_tv->tv_sec;
+
+    // Allocate a config file and regional scratch space, as they might be used.
+    env.cfg = config_create();
+    if(!env.cfg) {
+        free(env.now_tv);
+        auth_zones_delete(az);
+        return 0;
+    }
+
+    env.scratch = regional_create();
+    if(!env.scratch) {
+        config_delete(env.cfg);
+        free(env.now_tv);
+        auth_zones_delete(az);
+        return 0;
+    }
+
+    size_t offset = 0;
+    const uint16_t dclass = *(const uint16_t*)(data + offset);
+    offset += sizeof(uint16_t);
+
+    const int has_serial = (int)(data[offset] & 1);
+    offset += sizeof(uint8_t);
+
+    const uint32_t serial = *(const uint32_t*)(data + offset);
+    offset += sizeof(uint32_t);
+
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    memset(&addr, 0, sizeof(addr));
+
+    const uint8_t addr_type = data[offset++];
+    if (addr_type % 2 == 0) { // IPv4
+        if (offset + sizeof(struct sockaddr_in) > size) {
+            regional_destroy(env.scratch);
+            config_delete(env.cfg);
+            free(env.now_tv);
+            auth_zones_delete(az);
+            return 0;
+        }
+        struct sockaddr_in* sin = (struct sockaddr_in*)&addr;
+        sin->sin_family = AF_INET;
+        memcpy(&sin->sin_port, data + offset, sizeof(sin->sin_port));
+        offset += sizeof(sin->sin_port);
+        memcpy(&sin->sin_addr, data + offset, sizeof(sin->sin_addr));
+        offset += sizeof(sin->sin_addr);
+        addrlen = sizeof(struct sockaddr_in);
+    } else { // IPv6
+        if (offset + sizeof(struct sockaddr_in6) > size) {
+            regional_destroy(env.scratch);
+            config_delete(env.cfg);
+            free(env.now_tv);
+            auth_zones_delete(az);
+            return 0;
+        }
+        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&addr;
+        sin6->sin6_family = AF_INET6;
+        memcpy(&sin6->sin6_port, data + offset, sizeof(sin6->sin6_port));
+        offset += sizeof(sin6->sin6_port);
+        memcpy(&sin6->sin6_addr, data + offset, sizeof(sin6->sin6_addr));
+        offset += sizeof(sin6->sin6_addr);
+        addrlen = sizeof(struct sockaddr_in6);
+    }
+
+    if (offset >= size) {
+        regional_destroy(env.scratch);
+        config_delete(env.cfg);
+        free(env.now_tv);
+        auth_zones_delete(az);
+        return 0;
+    }
+
+    uint8_t* nm = (uint8_t*)(data + offset);
+    size_t nmlen = size - offset;
+
+    int refused = 0;
+
+    auth_zones_notify(az, &env, nm, nmlen, dclass, &addr, addrlen,
+                      has_serial, serial, &refused);
+
+    regional_destroy(env.scratch);
+    config_delete(env.cfg);
+    free(env.now_tv);
+    auth_zones_delete(az);
+
+    return 0;
+}
+	

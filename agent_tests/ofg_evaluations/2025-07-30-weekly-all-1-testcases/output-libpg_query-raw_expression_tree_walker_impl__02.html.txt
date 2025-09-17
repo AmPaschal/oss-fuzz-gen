@@ -1,0 +1,107 @@
+
+	
+<description>
+The function `raw_expression_tree_walker_impl` is a recursive tree walker for raw PostgreSQL parse trees. It traverses a `Node` tree and calls a user-provided callback function for each node. The primary purpose is to allow for custom analysis or manipulation of the parse tree. The callers in `pg_query_normalize.c` and `pg_query_parse_plpgsql.c` use it to find and process specific types of nodes within the larger parse tree.
+</description>
+<requirements>
+<requirement>
+The first argument, `node`, should be a pointer to a valid `Node` structure, typically obtained by parsing a SQL query with a function like `pg_query_parse`. The `Node` structure is complex, and creating it manually is difficult; using the parser ensures it's well-formed, which is necessary to avoid crashes during tree traversal.
+</requirement>
+<requirement>
+The `node`'s tag, accessed via `nodeTag(node)`, must be a valid `NodeTag` enum value. An unrecognized tag will cause the program to terminate via an `elog(ERROR, ...)` call in the default case of the switch statement.
+</requirement>
+<requirement>
+The second argument, `walker`, must be a valid function pointer to a callback function. This callback must accept a `Node*` and a `void*` context as arguments and return a boolean. Providing a NULL pointer will lead to a crash when it's called.
+</requirement>
+<requirement>
+The `walker` callback function should return `true` to terminate the tree walk early, or `false` to continue traversal. This is important for efficiency if the desired node has been found.
+</requirement>
+<requirement>
+The `walker` callback can recursively call `raw_expression_tree_walker_impl` to continue traversal, but it must have a condition to avoid infinite recursion. For example, it should not call the walker on the exact same node it received.
+</requirement>
+<requirement>
+The third argument, `context`, is a void pointer passed to the `walker` callback. Its structure and initialization are entirely dependent on the needs of the `walker` function. It can be used to maintain state across callback invocations.
+</requirement>
+<requirement>
+The `check_stack_depth()` function is called at the beginning of the function. This implies that a very deeply nested `Node` structure could cause a stack overflow. The fuzzer should generate inputs with varying depths to test this.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool raw_expression_tree_walker_impl(Node *, tree_walker_callback, void *)
+</function_signature>
+<project_name>
+libpg_query
+</project_name>
+
+	Fuzz target source:
+#include <pg_query.h>
+#include "pg_query_internal.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// A callback function that matches the `tree_walker_callback` signature.
+// This function is passed to the walker. For fuzzing the walker itself,
+// the callback's logic can be minimal. Returning false tells the walker
+// to continue its traversal of the expression tree.
+bool walker_callback(Node *node, void *context) {
+  // These parameters are not used in this simple callback.
+  (void)node;
+  (void)context;
+  return false;
+}
+
+// The main fuzzing entry point.
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  // The parser expects a null-terminated C string.
+  char *new_str = (char *)malloc(size + 1);
+  if (new_str == NULL) {
+    return 0; // Allocation failed
+  }
+  memcpy(new_str, data, size);
+  new_str[size] = '\0';
+
+  // libpg_query's internal functions require a memory context to be set up.
+  MemoryContext ctx = pg_query_enter_memory_context();
+
+  // Use the internal "raw" parsing function to get the abstract syntax tree (AST)
+  // as a List of Nodes, rather than a serialized JSON string.
+  PgQueryInternalParsetreeAndError result = pg_query_raw_parse(new_str, PG_QUERY_PARSE_DEFAULT);
+
+  // Only proceed if parsing was successful and produced a valid parse tree.
+  if (result.tree != NULL && result.error == NULL) {
+    ListCell *cell;
+
+    // The parse result is a list of statements. We iterate through them.
+    foreach(cell, result.tree)
+    {
+      // Extract the Node from the list cell.
+      Node *node = (Node *) lfirst(cell);
+
+      // Call the function-under-test with the parsed node and the callback.
+      raw_expression_tree_walker_impl(node, walker_callback, NULL);
+    }
+  }
+
+  // Clean up the memory context used by the parser.
+  pg_query_exit_memory_context(ctx);
+
+  // Free resources allocated by pg_query_raw_parse.
+  if (result.error) {
+    pg_query_free_error(result.error);
+  }
+  free(result.stderr_buffer);
+
+  // Free the input string.
+  free(new_str);
+
+  return 0;
+}
+	

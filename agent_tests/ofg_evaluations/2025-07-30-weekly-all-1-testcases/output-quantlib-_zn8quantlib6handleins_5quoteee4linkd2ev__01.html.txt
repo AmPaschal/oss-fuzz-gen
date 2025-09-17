@@ -1,0 +1,148 @@
+
+	
+<description>
+The `AmortizingFixedRateBond` constructor creates a bond with a fixed coupon rate and an amortizing principal. The constructor takes several arguments to define the bond's characteristics, including its settlement terms, notional values, payment schedule, coupon rates, and day counting conventions. The core of its functionality is to construct a `FixedRateLeg` of cash flows based on the provided schedule, notionals, and coupons. It also handles the addition of redemption payments. For the constructor to succeed, the input arguments must be consistent with each other, especially the sizes of the vectors and their relationship to the schedule.
+</description>
+<requirements>
+<requirement>
+The `schedule` and `notionals` arguments should be generated using the `sinkingSchedule` and `sinkingNotionals` helper functions. This ensures that the size of the `notionals` vector is consistent with the number of dates in the `schedule`, which is a prerequisite for creating the cash flow leg.
+</requirement>
+<requirement>
+The `bondLength` and `sinkingFrequency` arguments passed to `sinkingNotionals` must be compatible. The `isSubPeriod` check within `sinkingNotionals` requires that the bond's total length is an integer multiple of the sinking period to avoid a runtime assertion.
+</requirement>
+<requirement>
+The `coupons` vector must either contain a single rate or its size must be equal to one less than the number of dates in the `schedule`. This is because a single rate is applied to all coupons, but if multiple rates are provided, the number of rates must match the number of coupons to be created.
+</requirement>
+<requirement>
+The `redemptions` vector must be empty, contain a single element, or have a size equal to the number of cash flows generated. If the vector's size is greater than one, it must match the number of cash flows to prevent a runtime error when redemption values are added to the cash flow leg.
+</requirement>
+<requirement>
+A valid `DayCounter` object, such as `ActualActual`, must be provided. This object is essential for the accurate calculation of coupon accrual periods and amounts.
+</requirement>
+<requirement>
+The `settlementDays` argument must be a non-negative integer. This value is used to determine the bond's settlement date and is expected to be a valid number of days.
+</requirement>
+<requirement>
+The `Settings::instance().evaluationDate()` must be set to a valid date before calling the constructor. The evaluation date is used as a reference for generating the bond's schedule and is critical for all subsequent calculations.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+AmortizingFixedRateBond::AmortizingFixedRateBond(Natural settlementDays, const std::vector<Real>& notionals, Schedule schedule, const std::vector<Rate>& coupons, const DayCounter& accrualDayCounter, BusinessDayConvention paymentConvention, const Date& issueDate, const Period& exCouponPeriod, const Calendar& exCouponCalendar, const BusinessDayConvention exCouponConvention, bool exCouponEndOfMonth, const std::vector<Real>& redemptions, Integer paymentLag)
+</function_signature>
+<project_name>
+quantlib
+</project_name>
+
+	Fuzz target source:
+/*
+ Copyright (C) 2022-2023, Mike Pall, Security Testing
+
+ This file is part of QuantLib, a free-software/open-source library
+ for financial quantitative analysts and developers - https://www.quantlib.org/
+
+ QuantLib is free software: you can redistribute it and/or modify it
+ under the terms of the QuantLib license.  You should have received a
+ copy of the license along with this program; if not, please email
+ <quantlib-dev@lists.sf.net>. The license is also available online at
+ <https://www.quantlib.org/license.shtml>.
+
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE.  See the license for more details.
+*/
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <limits>
+#include <ql/exercise.hpp>
+#include <ql/instruments/vanillaoption.hpp>
+#include <ql/pricingengines/vanilla/baroneadesiwhaleyengine.hpp>
+#include <ql/processes/blackscholesprocess.hpp>
+#include <ql/quotes/simplequote.hpp>
+#include <ql/termstructures/volatility/equityfx/blackconstantvol.hpp>
+#include <ql/termstructures/yield/flatforward.hpp>
+#include <ql/time/calendars/target.hpp>
+#include <ql/time/daycounters/actual365fixed.hpp>
+
+using namespace QuantLib;
+
+namespace {
+
+struct AmericanOptionData {
+  Option::Type type;
+  Real strike;
+  Real s;       // spot
+  Rate q;       // dividend
+  Rate r;       // risk-free rate
+  Time t;       // time to maturity
+  Volatility v; // volatility
+};
+
+} // namespace
+
+AmericanOptionData fuzzedAmericanOptionData(FuzzedDataProvider &fdp) {
+  return AmericanOptionData{
+      .type = fdp.PickValueInArray({Option::Type::Put, Option::Type::Call}),
+      .strike = fdp.ConsumeFloatingPointInRange<Real>(
+          0.0, std::numeric_limits<Real>::max()),
+      .s = fdp.ConsumeFloatingPointInRange<Real>(
+          0.0, std::numeric_limits<Real>::max()),
+      .q = fdp.ConsumeProbability<Rate>(),
+      .r = fdp.ConsumeProbability<Rate>(),
+      .t = fdp.ConsumeFloatingPointInRange<Time>(
+          0.001, 30.0), // Avoid t=0 as it can cause issues
+      .v = fdp.ConsumeFloatingPointInRange<Volatility>(
+          0.0001, 4.0), // Avoid v=0
+  };
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+  SavedSettings saved_settings;
+
+  AmericanOptionData value = fuzzedAmericanOptionData(fdp);
+
+  Date today = Date(2, March, 2020);
+  Settings::instance().evaluationDate() = today;
+  DayCounter dc = Actual365Fixed();
+  Calendar calendar = TARGET();
+
+  ext::shared_ptr<SimpleQuote> spot(new SimpleQuote(value.s));
+  ext::shared_ptr<SimpleQuote> qRate(new SimpleQuote(value.q));
+  ext::shared_ptr<YieldTermStructure> qTS(
+      new FlatForward(today, Handle<Quote>(qRate), dc));
+  ext::shared_ptr<SimpleQuote> rRate(new SimpleQuote(value.r));
+  ext::shared_ptr<YieldTermStructure> rTS(
+      new FlatForward(today, Handle<Quote>(rRate), dc));
+  ext::shared_ptr<SimpleQuote> vol(new SimpleQuote(value.v));
+  ext::shared_ptr<BlackVolTermStructure> volTS(new BlackConstantVol(
+      today, calendar, Handle<Quote>(vol), dc));
+
+  ext::shared_ptr<BlackScholesMertonProcess> process(
+      new BlackScholesMertonProcess(Handle<Quote>(spot),
+                                    Handle<YieldTermStructure>(qTS),
+                                    Handle<YieldTermStructure>(rTS),
+                                    Handle<BlackVolTermStructure>(volTS)));
+
+  ext::shared_ptr<PricingEngine> engine(
+      new BaroneAdesiWhaleyApproximationEngine(process));
+
+  ext::shared_ptr<StrikedTypePayoff> payoff(
+      new PlainVanillaPayoff(value.type, value.strike));
+  Date exDate = today + Integer(std::lround(365 * value.t));
+  ext::shared_ptr<Exercise> exercise(new AmericanExercise(today, exDate));
+
+  VanillaOption option(payoff, exercise);
+  option.setPricingEngine(engine);
+
+  try {
+    (void)option.NPV();
+  } catch (const std::exception &) {
+    // Catch exceptions from invalid inputs
+  }
+
+  return 0;
+}
+	

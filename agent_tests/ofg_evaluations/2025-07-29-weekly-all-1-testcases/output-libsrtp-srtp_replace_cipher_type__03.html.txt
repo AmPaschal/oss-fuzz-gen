@@ -1,0 +1,202 @@
+
+	
+<description>
+The `srtp_replace_cipher_type` function replaces an existing cipher implementation with a new one. It is a wrapper around the internal function `srtp_crypto_kernel_do_load_cipher_type`, which performs the replacement. The new cipher must pass its own self-tests, as well as the self-tests of the cipher it is replacing. This ensures that the new cipher is a valid and compatible replacement.
+</description>
+<requirements>
+<requirement>
+The `new_ct` argument must not be a NULL pointer. This is because the function dereferences this pointer without a prior null check.
+</requirement>
+<requirement>
+The `id` field of the `new_ct` argument must match the `id` argument. This is to ensure that the correct cipher is being replaced.
+</requirement>
+<requirement>
+The `new_ct` argument must be a valid `srtp_cipher_type_t` structure. All function pointers within the struct must be initialized to valid functions, as they are called by `srtp_cipher_type_self_test`.
+</requirement>
+<requirement>
+The `test_data` field of the `new_ct` structure must point to a valid `srtp_cipher_test_case_t` structure. This is because the `srtp_cipher_type_self_test` function uses this data to perform self-tests on the new cipher.
+</requirement>
+<requirement>
+The `id` argument should be one of the values from the `srtp_cipher_type_id_t` enum. This is because the function uses this id to find the cipher to replace in the internal list of ciphers.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+srtp_err_status_t srtp_replace_cipher_type(const srtp_cipher_type_t *, srtp_cipher_type_id_t)
+</function_signature>
+<project_name>
+libsrtp
+</project_name>
+
+	Fuzz target source:
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <limits.h>
+#include "srtp.h"
+#include "srtp_priv.h"
+#include "/src/libsrtp/crypto/include/cipher.h"
+#include "mt19937.h"
+#include "testmem.h"
+
+/* Extern declaration for the null cipher implementation */
+extern const srtp_cipher_type_t srtp_null_cipher;
+
+/* Global variables from the original fuzzer */
+static bool g_post_init = false;
+
+#ifdef FUZZ_32BIT
+#include <sys/mman.h>
+static void *g_mmap_allocation = NULL;
+static size_t g_mmap_allocation_size = 0;
+#endif
+
+/*
+ * The following memory allocation functions are kept from the original fuzzer
+ * to help detect memory corruption issues.
+ */
+static void *fuzz_alloc(const size_t size, const bool do_zero) {
+  void *ret = NULL;
+#ifdef FUZZ_32BIT
+  bool do_malloc = true;
+#endif
+  bool do_mmap, mmap_high = true;
+
+  if (size == 0) {
+    size_t ret;
+    ret = 0x01 + (fuzz_mt19937_get() % 1024);
+    return (void *)ret;
+  }
+
+  if (g_post_init == true) {
+    do_mmap = (fuzz_mt19937_get() % 64) == 0 ? true : false;
+    if (do_mmap == true) {
+      mmap_high = (fuzz_mt19937_get() % 2) == 0 ? true : false;
+    }
+  } else {
+    do_mmap = false;
+  }
+
+#ifdef FUZZ_32BIT
+  if (g_mmap_allocation == NULL && do_mmap == true) {
+    void *mmap_address;
+    if (mmap_high == true) {
+      mmap_address = (void *)0xFFFF0000;
+    } else {
+      mmap_address = (void *)0x00010000;
+    }
+    g_mmap_allocation_size = size;
+
+    ret = mmap(mmap_address, g_mmap_allocation_size, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (ret == MAP_FAILED) {
+      ret = NULL;
+      g_mmap_allocation_size = 0;
+    }
+    g_mmap_allocation = ret;
+    do_malloc = false;
+  }
+
+  if (do_malloc == true)
+#endif
+  {
+    ret = malloc(size);
+  }
+
+  if (ret != NULL && do_zero) {
+    memset(ret, 0, size);
+  }
+
+  return ret;
+}
+
+void *fuzz_calloc(const size_t nmemb, const size_t size) {
+  if (g_post_init == true) {
+    if ((fuzz_mt19937_get() % 64) == 0) {
+      return NULL;
+    }
+  }
+  return fuzz_alloc(nmemb * size, true);
+}
+
+static bool fuzz_is_special_pointer(void *ptr) {
+  if ((size_t)ptr >= 0x01 && (size_t)ptr < (0x01 + 1024)) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void fuzz_free(void *ptr) {
+  if (fuzz_is_special_pointer(ptr) == true) {
+    return;
+  }
+
+#ifdef FUZZ_32BIT
+  if (g_post_init == true && ptr != NULL && ptr == g_mmap_allocation) {
+    if (munmap(g_mmap_allocation, g_mmap_allocation_size) == -1) {
+      abort();
+    }
+    g_mmap_allocation = NULL;
+  } else
+#endif
+  {
+    free(ptr);
+  }
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+  (void)argc;
+  (void)argv;
+  if (srtp_init() != srtp_err_status_ok) {
+    abort();
+  }
+  g_post_init = true;
+  return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1) {
+    return 0;
+  }
+
+  uint32_t randseed;
+  if (size < sizeof(randseed)) {
+    randseed = 1;
+  } else {
+    memcpy(&randseed, data, sizeof(randseed));
+    data += sizeof(randseed);
+    size -= sizeof(randseed);
+  }
+  fuzz_mt19937_init(randseed);
+  srand(randseed);
+
+  /*
+   * The list of cipher types that are built-in. We will try to replace one
+   * of these.
+   */
+  srtp_cipher_type_id_t id_to_replace = SRTP_NULL_CIPHER;
+
+  /*
+   * Create a new cipher type based on a known-good one.
+   * This ensures all function pointers are valid.
+   */
+  srtp_cipher_type_t new_cipher = srtp_null_cipher;
+
+  /*
+   * The function under test requires that the id of the new cipher
+   * matches the id of the cipher being replaced.
+   */
+  new_cipher.id = id_to_replace;
+
+  /* Call the function under test */
+  srtp_replace_cipher_type(&new_cipher, id_to_replace);
+
+  fuzz_mt19937_destroy();
+  return 0;
+}
+	

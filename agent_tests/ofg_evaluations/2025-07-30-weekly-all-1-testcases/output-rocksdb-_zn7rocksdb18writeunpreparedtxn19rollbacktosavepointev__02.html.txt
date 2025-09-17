@@ -1,0 +1,120 @@
+
+	
+<description>
+The function `rocksdb::WriteUnpreparedTxn::RollbackToSavePoint()` is used to roll back a transaction to a previously created savepoint. It handles two cases: when the savepoint is unflushed and when it has been flushed to the database. If there are unflushed savepoints, it calls `PessimisticTransaction::RollbackToSavePoint()`. If the savepoint has been flushed, it calls `RollbackToSavePointInternal()` to handle the rollback of flushed data.
+</description>
+<requirements>
+<requirement>
+The `WriteUnpreparedTxn::SetSavePoint()` function must be called before calling `RollbackToSavePoint()`. This is because `RollbackToSavePoint()` requires at least one savepoint to be present, either in the `unflushed_save_points_` or `flushed_save_points_` vectors. Calling `SetSavePoint()` creates a savepoint and adds it to `unflushed_save_points_`.
+</requirement>
+<requirement>
+To exercise the code path that calls `RollbackToSavePointInternal()`, a flush operation must be triggered after `SetSavePoint()` and before `RollbackToSavePoint()`. The `MaybeFlushWriteBatchToDB()` function can be used to trigger a flush. This moves the savepoint from `unflushed_save_points_` to `flushed_save_points_` which is a precondition for `RollbackToSavePointInternal()` to be called.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+Status rocksdb::WriteUnpreparedTxn::RollbackToSavePoint()
+</function_signature>
+<project_name>
+rocksdb
+</project_name>
+
+	Fuzz target source:
+// Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
+// This source code is licensed under both the GPLv2 (found in the
+// COPYING file in the root directory) and Apache 2.0 License
+// (found in the LICENSE.Apache file in the root directory).
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <string>
+
+#include "rocksdb/db.h"
+#include "rocksdb/options.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
+#include "rocksdb/utilities/transaction.h"
+#include "rocksdb/utilities/transaction_db.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+  FuzzedDataProvider fdp(data, size);
+
+  const std::string kDbPath = "/tmp/write_unprepared_txn_fuzzer_test";
+  ROCKSDB_NAMESPACE::Options options;
+  options.create_if_missing = true;
+  
+  // Clean up database from previous runs, ignore errors
+  ROCKSDB_NAMESPACE::DestroyDB(kDbPath, options);
+
+  ROCKSDB_NAMESPACE::TransactionDBOptions txn_db_options;
+  txn_db_options.write_policy = ROCKSDB_NAMESPACE::WRITE_UNPREPARED;
+  
+  ROCKSDB_NAMESPACE::TransactionDB* txn_db = nullptr;
+  ROCKSDB_NAMESPACE::Status s = ROCKSDB_NAMESPACE::TransactionDB::Open(
+      options, txn_db_options, kDbPath, &txn_db);
+
+  if (!s.ok()) {
+    // If DB cannot be opened, clean up and exit.
+    ROCKSDB_NAMESPACE::DestroyDB(kDbPath, options);
+    return 0;
+  }
+
+  ROCKSDB_NAMESPACE::WriteOptions write_options;
+  ROCKSDB_NAMESPACE::TransactionOptions txn_options;
+  
+  ROCKSDB_NAMESPACE::Transaction* txn =
+      txn_db->BeginTransaction(write_options, txn_options, nullptr);
+
+  if (txn == nullptr) {
+    delete txn_db;
+    ROCKSDB_NAMESPACE::DestroyDB(kDbPath, options);
+    return 0;
+  }
+
+  // Write-unprepared transactions must have a name.
+  std::string txn_name = "fuzz_txn_" + fdp.ConsumeRandomLengthString(10);
+  txn->SetName(txn_name);
+  
+  // Loop performing various transaction operations
+  while (fdp.remaining_bytes() > 0) {
+    auto op_type = fdp.ConsumeIntegralInRange<uint8_t>(0, 3);
+    switch (op_type) {
+      case 0: { // Put
+        std::string key = fdp.ConsumeRandomLengthString(16);
+        std::string value = fdp.ConsumeRandomLengthString(64);
+        txn->Put(key, value);
+        break;
+      }
+      case 1: { // Delete
+        std::string key = fdp.ConsumeRandomLengthString(16);
+        txn->Delete(key);
+        break;
+      }
+      case 2: { // SetSavePoint
+        txn->SetSavePoint();
+        break;
+      }
+      case 3: { // RollbackToSavePoint
+        // Function under test
+        txn->RollbackToSavePoint();
+        break;
+      }
+    }
+  }
+
+  // The transaction destructor will roll back if not committed.
+  if (fdp.ConsumeBool()) {
+      txn->Commit();
+  }
+  
+  delete txn;
+  delete txn_db;
+  ROCKSDB_NAMESPACE::DestroyDB(kDbPath, options);
+
+  return 0;
+}
+	

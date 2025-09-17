@@ -1,0 +1,127 @@
+
+	
+<description>
+This function, `FDKaacEnc_EncodeFrame`, is the core of the AAC encoding process. It takes PCM audio data and encodes it into an AAC frame. The function's primary role is to orchestrate the various stages of the AAC encoding pipeline, which includes psychoacoustic analysis, quantization, and bitstream formatting. It is a complex function with many dependencies on the state of the encoder, which is encapsulated in the `hAacEnc` handle. The caller, `aacEncEncode`, prepares the input buffers and extension payloads before invoking this function.
+
+A significant part of the function's logic is dedicated to handling extension payloads, such as SBR data, metadata, and ancillary data. It iterates through the provided `extPayload` array, processes the valid payloads, and integrates them into the final bitstream. The function also manages the bit reservoir to ensure that the bitrate constraints are met. Finally, it uses the transport encoder, represented by the `hTpEnc` handle, to package the encoded data into a transport stream.
+
+The function's execution flow is highly dependent on the encoder's configuration, which is stored in `hAacEnc->config`. Different configurations can enable or disable various features, such as SBR or error resilience, which in turn affects the execution path within the function. Therefore, proper initialization of the encoder handle is crucial for the correct execution of this function.
+</description>
+<requirements>
+
+<requirement>
+The `hAacEnc` handle must be initialized by calling `aacEncOpen` and `aacEncInit`. This is to ensure that the handle and its internal state, which are used extensively throughout the function, are properly set up.
+</requirement>
+<requirement>
+The `hTpEnc` handle must be a valid handle initialized via `aacEncOpen` and `aacEncInit`. The function uses this handle to interact with the transport layer for bitstream writing.
+</requirement>
+<requirement>
+The `inputBuffer` should point to a valid memory region with a size of at least `inputBufferBufSize` bytes. This buffer contains the raw audio data to be encoded, and a `NULL` or invalid pointer will lead to a crash.
+</requirement>
+<requirement>
+The `nOutBytes` argument must be a valid pointer to an integer. The function writes the size of the encoded frame to this location, so a `NULL` pointer will cause a crash.
+</requirement>
+<requirement>
+The `extPayload` array should have a size of `MAX_TOTAL_EXT_PAYLOADS`, which is defined as 16. For each element in the array, if `dataSize` is greater than 0, `pData` must point to a valid buffer of that size to avoid memory errors.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+AAC_ENCODER_ERROR FDKaacEnc_EncodeFrame(HANDLE_AAC_ENC, HANDLE_TRANSPORTENC, INT_PCM *, const UINT, INT *, AACENC_EXT_PAYLOAD *)
+</function_signature>
+<project_name>
+libfdk-aac
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include "aacenc_lib.h"
+#include <vector>
+#include <cstring>
+
+// A limited set of valid parameters to guide the fuzzer towards valid states.
+constexpr CHANNEL_MODE kChannelModes[] = {MODE_1, MODE_2};
+constexpr int32_t kSampleRates[] = {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000};
+constexpr AUDIO_OBJECT_TYPE kAudioObjectTypes[] = {AOT_AAC_LC, AOT_SBR, AOT_ER_AAC_LD, AOT_ER_AAC_ELD, AOT_AAC_MAIN, AOT_USAC};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 16) {
+        return 0;
+    }
+    FuzzedDataProvider provider(data, size);
+
+    HANDLE_AACENCODER hAacEncoder = NULL;
+    if (aacEncOpen(&hAacEncoder, 0, 0) != AACENC_OK) {
+        return 0;
+    }
+
+    // Configure the encoder with fuzzed parameters
+    aacEncoder_SetParam(hAacEncoder, AACENC_AOT, provider.PickValueInArray(kAudioObjectTypes));
+    aacEncoder_SetParam(hAacEncoder, AACENC_SAMPLERATE, provider.PickValueInArray(kSampleRates));
+    aacEncoder_SetParam(hAacEncoder, AACENC_BITRATE, provider.ConsumeIntegralInRange<UINT>(8000, 960000));
+    aacEncoder_SetParam(hAacEncoder, AACENC_CHANNELMODE, provider.PickValueInArray(kChannelModes));
+    aacEncoder_SetParam(hAacEncoder, AACENC_TRANSMUX, TT_MP4_RAW);
+    aacEncoder_SetParam(hAacEncoder, AACENC_AFTERBURNER, provider.ConsumeBool());
+
+    // Finalize initialization by calling aacEncEncode with NULL args
+    if (aacEncEncode(hAacEncoder, NULL, NULL, NULL, NULL) != AACENC_OK) {
+        aacEncClose(&hAacEncoder);
+        return 0;
+    }
+
+    AACENC_InfoStruct info;
+    if (aacEncInfo(hAacEncoder, &info) != AACENC_OK) {
+        aacEncClose(&hAacEncoder);
+        return 0;
+    }
+
+    if (info.frameLength == 0 || info.inputChannels == 0) {
+        aacEncClose(&hAacEncoder);
+        return 0;
+    }
+
+    // Prepare input buffer
+    const UINT pcm_size = info.inputChannels * info.frameLength;
+    std::vector<INT_PCM> pcm_buf(pcm_size);
+    size_t consumed_bytes = provider.ConsumeData(pcm_buf.data(), pcm_size * sizeof(INT_PCM));
+    
+    // Not enough data, but we can still proceed with what we have.
+    // The vector is already zero-initialized, so any unconsumed portion is zero-padded.
+    if (consumed_bytes < pcm_size * sizeof(INT_PCM)) {
+        // To be safe, explicitly zero out the rest of the buffer.
+        memset(reinterpret_cast<uint8_t*>(pcm_buf.data()) + consumed_bytes, 0, (pcm_size * sizeof(INT_PCM)) - consumed_bytes);
+    }
+
+    // Prepare output buffer
+    std::vector<UCHAR> out_buf(info.maxOutBufBytes);
+
+    // Prepare buffer descriptors
+    void *in_buf_ptr = pcm_buf.data();
+    INT in_buf_size = pcm_size * sizeof(INT_PCM);
+    INT in_buf_el_size = sizeof(INT_PCM);
+    INT in_buf_id = IN_AUDIO_DATA;
+    AACENC_BufDesc in_buf_desc = {1, &in_buf_ptr, &in_buf_id, &in_buf_size, &in_buf_el_size};
+
+    void *out_buf_ptr = out_buf.data();
+    INT out_buf_size = out_buf.size();
+    INT out_buf_el_size = sizeof(UCHAR);
+    INT out_buf_id = OUT_BITSTREAM_DATA;
+    AACENC_BufDesc out_buf_desc = {1, &out_buf_ptr, &out_buf_id, &out_buf_size, &out_buf_el_size};
+    
+    // Prepare arguments
+    AACENC_InArgs in_args = {0};
+    in_args.numInSamples = pcm_size;
+
+    AACENC_OutArgs out_args = {0};
+
+    // Encode the frame. This will call FDKaacEnc_EncodeFrame internally.
+    aacEncEncode(hAacEncoder, &in_buf_desc, &out_buf_desc, &in_args, &out_args);
+
+    aacEncClose(&hAacEncoder);
+
+    return 0;
+}
+	

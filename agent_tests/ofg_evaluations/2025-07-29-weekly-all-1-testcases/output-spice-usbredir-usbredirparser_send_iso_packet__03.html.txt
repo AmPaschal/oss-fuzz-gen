@@ -1,0 +1,98 @@
+
+	
+<description>
+The function `usbredirparser_send_iso_packet` is a wrapper around `usbredirparser_queue`. Its main purpose is to queue an ISOchronous packet to be sent. The function takes a parser, a 64-bit id, a pointer to a `usb_redir_iso_packet_header`, a data buffer and the length of the data buffer. The callers of this function are located in `usbredirhost.c`. The callers create a `usb_redir_iso_packet_header` on the stack and initialize its fields. The `data` and `data_len` arguments are either passed from the caller of the `usbredirhost` function, or are set to `NULL` and 0. The `usbredirparser_queue` function performs a `memcpy` on both the header and the data, so it's important that the pointers are valid and the lengths are correct. It also performs some verification on the header. Therefore, the fuzzer should focus on creating valid inputs for this function to avoid crashes in the underlying queueing and sending logic.
+</description>
+<requirements>
+
+<requirement>
+The `parser` argument must be a valid, initialized `usbredirparser` struct. This is because the underlying `usbredirparser_queue` function will access members of this struct.
+</requirement>
+<requirement>
+The `iso_header` argument must be a valid pointer to a `usb_redir_iso_packet_header` struct. This is because the function will dereference this pointer to read the header data.
+</requirement>
+<requirement>
+The `length` field of the `iso_header` struct must be equal to the `data_len` argument. This is to ensure consistency between the header and the data, as expected by the underlying queueing function.
+</requirement>
+<requirement>
+If `data_len` is greater than 0, the `data` argument must be a valid pointer to a buffer of at least `data_len` bytes. This is to prevent a buffer over-read in the `memcpy` operation within the `usbredirparser_queue` function.
+</requirement>
+<requirement>
+If `data_len` is 0, the `data` argument can be `NULL`. The callers in `usbredirhost.c` pass `NULL` for `data` when `data_len` is 0.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void usbredirparser_send_iso_packet(struct usbredirparser *, uint64_t, struct usb_redir_iso_packet_header *, uint8_t *, int)
+</function_signature>
+<project_name>
+spice-usbredir
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include <cstdint>
+
+#include "/src/spice-usbredir/usbredirparser/usbredirparser.h"
+#include "usbredirproto.h"
+
+// Dummy write callback. The parser needs this to be able to "send" data.
+// We don't need it to do anything for this test.
+int parser_write_dummy(void *priv, uint8_t *data, int count) {
+    // Return the count to simulate a successful write.
+    return count;
+}
+
+// The function under test is declared in usbredirparser.h, but we
+// add it here for clarity.
+void usbredirparser_send_iso_packet(struct usbredirparser *, uint64_t, struct usb_redir_iso_packet_header *, uint8_t *, int);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    struct usbredirparser *parser = usbredirparser_create();
+    if (!parser) {
+        return 0;
+    }
+
+    // A write function must be set for the parser to be able to queue data
+    // and for usbredirparser_do_write to process it.
+    parser->write_func = parser_write_dummy;
+    usbredirparser_init(parser, "fuzzer", nullptr, 0, 0);
+
+    const uint64_t id = fdp.ConsumeIntegral<uint64_t>();
+    // Limit data length to a reasonable size to avoid OOM issues.
+    const int data_len = fdp.ConsumeIntegralInRange<int>(0, 4096);
+
+    struct usb_redir_iso_packet_header iso_header;
+    iso_header.endpoint = fdp.ConsumeIntegral<uint8_t>();
+    iso_header.status = fdp.ConsumeIntegral<uint8_t>();
+    iso_header.length = static_cast<uint16_t>(data_len);
+
+    std::vector<uint8_t> packet_data = fdp.ConsumeBytes<uint8_t>(data_len);
+    // The fuzzer might not provide enough data, so we must check the actual size
+    // and exit if it's insufficient to prevent reading out of bounds.
+    if (packet_data.size() != data_len) {
+        usbredirparser_destroy(parser);
+        return 0;
+    }
+
+    usbredirparser_send_iso_packet(parser, id, &iso_header, packet_data.data(), data_len);
+
+    // usbredirparser_send_* functions queue data. To actually process it and
+    // hit the underlying write logic, we need to call usbredirparser_do_write.
+    while (usbredirparser_has_data_to_write(parser)) {
+        if (usbredirparser_do_write(parser) < 0) {
+            break;
+        }
+    }
+
+    usbredirparser_destroy(parser);
+
+    return 0;
+}
+	

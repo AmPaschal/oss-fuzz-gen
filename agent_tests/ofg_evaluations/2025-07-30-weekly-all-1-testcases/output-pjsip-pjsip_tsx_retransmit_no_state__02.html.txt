@@ -1,0 +1,149 @@
+
+	
+<description>
+The function `pjsip_tsx_retransmit_no_state` retransmits a SIP message. It takes a transaction and a transmission data object as input. If the transmission data is NULL, it uses the last transmitted data from the transaction. The function is used in two places in the codebase: in `pjsua_call.c` to retransmit provisional responses for ICE trickle, and in `sip_100rel.c` for reliable provisional responses (100rel).
+</description>
+<requirements>
+
+<requirement>
+The `tsx` argument, a pointer to a `pjsip_transaction` struct, must be a valid, initialized object. This is because the function dereferences this pointer to access the `grp_lock` and `last_tx` members.
+</requirement>
+<requirement>
+The `tsx->grp_lock` member of the `pjsip_transaction` struct must be a valid group lock. This is because it is used in a call to `pj_grp_lock_acquire`, and an invalid lock will lead to a crash.
+</requirement>
+<requirement>
+If the `tdata` argument is NULL, the `tsx->last_tx` member must point to a valid `pjsip_tx_data` object. This is because `tsx->last_tx` is used as the transmission data in this case, and a NULL value would cause a crash in `pjsip_tx_data_add_ref`.
+</requirement>
+<requirement>
+The `tdata` argument, a pointer to a `pjsip_tx_data` struct, should be a valid object created with `pjsip_tx_data_create`. This is because the function will call `pjsip_tx_data_add_ref` and `pjsip_tx_data_dec_ref` on this object, which expect a valid, reference-counted object.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+pj_status_t pjsip_tsx_retransmit_no_state(pjsip_transaction *, pjsip_tx_data *)
+</function_signature>
+<project_name>
+pjsip
+</project_name>
+
+	Fuzz target source:
+/*
+ * Copyright (C) 2023 Teluu Inc. (http://www.teluu.com)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <pjlib.h>
+#include <pjsip.h>
+#include <pjsip/sip_endpoint.h>
+#include <pjsip/sip_transport.h>
+#include "/src/pjsip/pjsip/include/pjsip/sip_transaction.h"
+
+#define kMinInputLength 10
+#define kMaxInputLength 5120
+
+static pj_caching_pool caching_pool;
+static pjsip_endpoint *endpt = NULL;
+static pj_grp_lock_t *grp_lock = NULL;
+
+/*
+ * This function initializes the necessary PJSIP components.
+ * It is called only once.
+ */
+static void init_fuzzer() {
+    if (endpt)
+        return;
+
+    pj_init();
+    pj_caching_pool_init(&caching_pool, &pj_pool_factory_default_policy, 0);
+    pj_log_set_level(0);
+
+    pjsip_endpt_create(&caching_pool.factory, "fuzzer", &endpt);
+
+    /* Create a group lock required by the transaction */
+    pj_pool_t *pool = pj_pool_create(&caching_pool.factory, "lock-pool", 256, 256, NULL);
+    if (pool) {
+        pj_grp_lock_create(pool, NULL, &grp_lock);
+    }
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+    pj_pool_t *pool = NULL;
+    pjsip_transaction *tsx = NULL;
+    pjsip_tx_data *tdata = NULL;
+    pj_status_t status;
+
+    if (Size < kMinInputLength || Size > kMaxInputLength) {
+        return 0;
+    }
+
+    init_fuzzer();
+    if (!endpt || !grp_lock) {
+        return 0;
+    }
+
+    pool = pj_pool_create(&caching_pool.factory, "fuzz-pool", 4000, 4000, NULL);
+    if (!pool) {
+        return 0;
+    }
+
+    /* Manually create and partially initialize transaction */
+    tsx = PJ_POOL_ZALLOC_T(pool, pjsip_transaction);
+    tsx->pool = pool;
+    tsx->endpt = endpt;
+    tsx->grp_lock = grp_lock;
+
+    /* Create tx_data */
+    status = pjsip_endpt_create_tdata(endpt, &tdata);
+    if (status != PJ_SUCCESS) {
+        pj_pool_release(pool);
+        return 0;
+    }
+
+    /* Populate tx_data with fuzzer input */
+    tdata->buf.start = (char*)pj_pool_alloc(tdata->pool, Size);
+    memcpy(tdata->buf.start, Data, Size);
+    tdata->buf.cur = tdata->buf.start + Size;
+    tdata->buf.end = tdata->buf.start + Size;
+
+    /* Set last_tx for the NULL tdata case and add reference */
+    tsx->last_tx = tdata;
+    pjsip_tx_data_add_ref(tsx->last_tx);
+
+    /*
+     * Call the function under test.
+     * The function will take ownership of tdata and decrement its
+     * reference counter on success.
+     */
+    pjsip_tsx_retransmit_no_state(tsx, tdata);
+
+    /*
+     * Call with NULL tdata. This will use tsx->last_tx.
+     * The function will decrement the reference counter of tsx->last_tx
+     * on success.
+     */
+    pjsip_tsx_retransmit_no_state(tsx, NULL);
+
+    pj_pool_release(pool);
+
+    return 0;
+}
+	

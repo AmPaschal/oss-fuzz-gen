@@ -1,0 +1,144 @@
+
+	
+<description>
+The function `H5D__virtual_set_extent_unlim` is an internal HDF5 library function responsible for dynamically determining and setting the extent (dimensions) of a virtual dataset (VDS). A virtual dataset is a dataset whose raw data is composed of data from other source datasets. This function is called when the extent of the VDS needs to be updated, which typically happens before accessing the VDS's dataspace. It iterates through the mappings of the virtual dataset. For each mapping, it checks if there's an unlimited dimension. If so, it determines the size of this dimension based on the corresponding source dataset's extent. It handles two types of mappings: simple mappings to a single source dataset and "printf"-style mappings to a series of source datasets. The function calculates the new extent of the VDS based on the resolved sizes of the unlimited dimensions from all mappings and the view setting (`H5D_VDS_FIRST_MISSING` or `H5D_VDS_LAST_AVAILABLE`). If the extent has changed, it updates the VDS's dataspace and marks it as dirty to be written back to the file. It also updates internal cached information about the mappings.
+</description>
+<requirements>
+
+<requirement>
+The `dset` argument must be a pointer to a valid and initialized `H5D_t` object. This is because the function directly accesses its members without extensive validation, and a NULL or invalid pointer will lead to a crash.
+</requirement>
+<requirement>
+The `dset->shared->layout.storage.type` field must be set to `H5D_VIRTUAL` (3). The function asserts this condition, and its entire logic is specific to virtual datasets.
+</requirement>
+<requirement>
+The `dset->shared->layout.storage.u.virt.view` field must be either `H5D_VDS_FIRST_MISSING` (0) or `H5D_VDS_LAST_AVAILABLE` (1). An assertion enforces this, as the view setting dictates how the extent of unlimited dimensions is resolved.
+</requirement>
+<requirement>
+The `dset->shared->space` field must point to a valid dataspace object (`H5S_t`). The function relies on this dataspace to get the current dimensions and rank of the virtual dataset.
+</requirement>
+<requirement>
+For each mapping in `dset->shared->layout.storage.u.virt.list`, if a source dataset is not already open, the file and dataset name information within the mapping must be valid and resolvable. The function attempts to open source datasets on-the-fly, and incorrect information will cause an error.
+</requirement>
+<requirement>
+If the file is opened for writing, `dset->oloc.file` must be a valid file handle. This is required for the function to mark the dataspace as dirty using `H5D__mark` after changing its extent.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+herr_t H5D__virtual_set_extent_unlim(const H5D_t *)
+</function_signature>
+<project_name>
+hdf5
+</project_name>
+
+	Fuzz target source:
+#include "hdf5.h"
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+
+    char filename[256];
+    sprintf(filename, "/tmp/libfuzzer.%d", getpid());
+
+    hid_t file_id = -1, src_space_id = -1, src_dset_id = -1;
+    hid_t vspace_id = -1, dcpl_id = -1, dapl_id = -1, vds_dset_id = -1;
+    hid_t returned_space_id = -1;
+
+    /* Use the core VFD to avoid writing to disk */
+    hid_t fapl_id = H5Pcreate(H5P_FILE_ACCESS);
+    if (fapl_id < 0) {
+        goto cleanup;
+    }
+    if (H5Pset_fapl_core(fapl_id, 4096, 0) < 0) {
+        H5Pclose(fapl_id);
+        goto cleanup;
+    }
+
+    file_id = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id);
+    if (file_id < 0) {
+        goto cleanup;
+    }
+
+    /* --- Create Source Dataset --- */
+    hsize_t src_dims[] = {10};
+    src_space_id = H5Screate_simple(1, src_dims, NULL);
+    if (src_space_id < 0) {
+        goto cleanup;
+    }
+
+    src_dset_id = H5Dcreate2(file_id, "src_dset", H5T_NATIVE_INT, src_space_id,
+                             H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    if (src_dset_id < 0) {
+        goto cleanup;
+    }
+
+    /* --- Create Virtual Dataset --- */
+    hsize_t virt_dims[] = {10};
+    hsize_t virt_max_dims[] = {H5S_UNLIMITED};
+    vspace_id = H5Screate_simple(1, virt_dims, virt_max_dims);
+    if (vspace_id < 0) {
+        goto cleanup;
+    }
+
+    dcpl_id = H5Pcreate(H5P_DATASET_CREATE);
+    if (dcpl_id < 0) {
+        goto cleanup;
+    }
+    if (H5Pset_layout(dcpl_id, H5D_VIRTUAL) < 0) {
+        goto cleanup;
+    }
+
+    dapl_id = H5Pcreate(H5P_DATASET_ACCESS);
+    if (dapl_id < 0) {
+        goto cleanup;
+    }
+
+    /* Fuzz the view property */
+    H5D_vds_view_t view = (data[0] % 2) ? H5D_VDS_LAST_AVAILABLE : H5D_VDS_FIRST_MISSING;
+    if (H5Pset_virtual_view(dapl_id, view) < 0) {
+        goto cleanup;
+    }
+
+    /* Map the virtual dataset to the source dataset */
+    if (H5Sselect_all(vspace_id) < 0 || H5Sselect_all(src_space_id) < 0 ||
+        H5Pset_virtual(dcpl_id, vspace_id, ".", "src_dset", src_space_id) < 0) {
+        goto cleanup;
+    }
+
+    vds_dset_id = H5Dcreate2(file_id, "vds_dset", H5T_NATIVE_INT, vspace_id,
+                             H5P_DEFAULT, dcpl_id, dapl_id);
+    if (vds_dset_id < 0) {
+        goto cleanup;
+    }
+
+    /*
+     * Call H5Dget_space, which will internally call H5D__get_space,
+     * which in turn calls H5D__virtual_set_extent_unlim for virtual datasets.
+     */
+    returned_space_id = H5Dget_space(vds_dset_id);
+
+cleanup:
+    /* Cleanup all resources */
+    if (returned_space_id >= 0) H5Sclose(returned_space_id);
+    if (vds_dset_id >= 0) H5Dclose(vds_dset_id);
+    if (dapl_id >= 0) H5Pclose(dapl_id);
+    if (dcpl_id >= 0) H5Pclose(dcpl_id);
+    if (vspace_id >= 0) H5Sclose(vspace_id);
+    if (src_dset_id >= 0) H5Dclose(src_dset_id);
+    if (src_space_id >= 0) H5Sclose(src_space_id);
+    if (fapl_id >= 0) H5Pclose(fapl_id);
+    if (file_id >= 0) H5Fclose(file_id);
+    unlink(filename);
+
+    return 0;
+}
+	

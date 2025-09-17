@@ -1,0 +1,146 @@
+
+	
+<description>
+The `g_obex_get_req` function initiates an OBEX GET request to retrieve data from a remote device. It operates asynchronously. The function sends a GET request packet with specified headers and manages the data transfer through callbacks. It is a variadic function, allowing callers to pass a variable number of OBEX headers. The process is handled in the background, and the provided callbacks are invoked to process incoming data and to signal the completion or failure of the transfer.
+</description>
+<requirements>
+<requirement>
+The first argument, `obex`, must be a valid and connected `GObex` object. This object is typically created using `g_obex_new()` and then connected using a transport-specific function like `g_obex_connect()`.
+</requirement>
+<requirement>
+The `data_func` argument must be a valid function pointer of type `GObexDataConsumer`. This callback is responsible for processing the received data chunks and must return `TRUE` on success and `FALSE` on failure to manage the flow of data.
+</requirement>
+<requirement>
+The `complete_func` argument must be a valid function pointer of type `GObexFunc`. This callback is invoked when the transfer is finished or an error occurs, and it is essential for performing necessary cleanup operations, such as freeing memory or closing file handles.
+</requirement>
+<requirement>
+The `user_data` argument is a pointer that can be used to pass custom data to the `data_func` and `complete_func` callbacks. This is important for maintaining state and context across the asynchronous operations of the data transfer.
+</requirement>
+<requirement>
+The `err` argument must be the address of a `GError *` variable that is initialized to `NULL`. This allows the function to report errors that occur during the setup of the GET request.
+</requirement>
+<requirement>
+The list of variadic arguments, which represent OBEX headers, must be terminated with `G_OBEX_HDR_INVALID`. This is crucial to prevent the function from reading an incorrect number of arguments from the stack.
+</requirement>
+<requirement>
+The header arguments passed to the function must be valid OBEX header IDs. For headers that include data, the ID must be followed by a pointer to the data and the length of the data. For example: `G_OBEX_HDR_NAME`, `"filename.txt"`, `G_OBEX_HDR_TYPE`, `"text/plain"`, `sizeof("text/plain")`. This ensures that the headers are correctly parsed and added to the OBEX packet.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+guint g_obex_get_req(GObex *, GObexDataConsumer, GObexFunc, gpointer, GError **, guint, void)
+</function_signature>
+<project_name>
+bluez
+</project_name>
+
+	Fuzz target source:
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <glib.h>
+
+#include "gobex/gobex.h"
+#include "gobex/gobex-header.h"
+
+/*
+ * This dummy callback is for the GObexDataConsumer, which is called when data
+ * is received. It simply returns TRUE to acknowledge the data.
+ */
+static gboolean data_consumer_cb(const void *buf, gsize len, gpointer user_data)
+{
+	return TRUE;
+}
+
+/*
+ * This dummy callback is for the GObexFunc, which is called when a
+ * transfer is complete. It frees the GError if one occurred.
+ */
+static void transfer_complete_cb(GObex *obex, GError *err, gpointer user_data)
+{
+	if (err)
+		g_error_free(err);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	if (size < 1)
+		return 0;
+
+	int fds[2];
+	if (pipe(fds) != 0)
+		return 0;
+
+	/* Set pipes to non-blocking to prevent the fuzzer from hanging */
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	fcntl(fds[1], F_SETFL, O_NONBLOCK);
+
+	GIOChannel *io_server = g_io_channel_unix_new(fds[0]);
+	g_io_channel_set_encoding(io_server, NULL, NULL);
+	g_io_channel_set_buffered(io_server, FALSE);
+	g_io_channel_set_close_on_unref(io_server, TRUE);
+
+	GObex *obex = g_obex_new(io_server, G_OBEX_TRANSPORT_STREAM, -1, -1);
+	g_io_channel_unref(io_server);
+
+	if (!obex) {
+		close(fds[1]);
+		return 0;
+	}
+
+	GError *err = NULL;
+
+	/* Use fuzzer data to drive which headers are sent */
+	switch (data[0] % 3) {
+	case 0:
+		g_obex_get_req(obex, data_consumer_cb, transfer_complete_cb,
+				NULL, &err, G_OBEX_HDR_TYPE, data, size,
+				G_OBEX_HDR_INVALID);
+		break;
+	case 1:
+		g_obex_get_req(obex, data_consumer_cb, transfer_complete_cb,
+				NULL, &err, G_OBEX_HDR_LENGTH, (guint32)size,
+				G_OBEX_HDR_INVALID);
+		break;
+	case 2:
+		/* Create a null-terminated string for the name header */
+		{
+			char *name = g_strndup((const char *)data, size);
+			g_obex_get_req(obex, data_consumer_cb,
+					transfer_complete_cb, NULL, &err,
+					G_OBEX_HDR_NAME, name,
+					G_OBEX_HDR_INVALID);
+			g_free(name);
+		}
+		break;
+	}
+
+	if (err)
+		g_error_free(err);
+
+	/*
+	 * Write the raw fuzzer data to the pipe to simulate a server response.
+	 * This will test how the client handles potentially malformed packets.
+	 */
+	ssize_t written = write(fds[1], data, size);
+	(void)written;
+
+	/*
+	 * The g_obex functions are async. We need to run the glib main context
+	 * to process the I/O events on the pipe. A few iterations are usually
+	 * enough to send the request and process the response.
+	 */
+	for (int i = 0; i < 5; i++)
+		g_main_context_iteration(g_main_context_default(), FALSE);
+
+	g_obex_unref(obex);
+	close(fds[1]);
+
+	return 0;
+}
+	

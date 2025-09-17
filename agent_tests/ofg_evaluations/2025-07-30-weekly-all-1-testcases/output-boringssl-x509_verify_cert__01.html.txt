@@ -1,0 +1,138 @@
+
+	
+<description>
+The X509_verify_cert function verifies a certificate chain. It takes a pointer to an X509_STORE_CTX structure as input. This structure contains the certificate to be verified, the trusted store, and other verification parameters. The function returns 1 on success and 0 on failure.
+</description>
+<requirements>
+<requirement>
+The X509_STORE_CTX object should be created by calling X509_STORE_CTX_new(). This is the standard way to allocate memory for the context.
+</requirement>
+<requirement>
+The X509_STORE_CTX object must be initialized by calling X509_STORE_CTX_init() before calling X509_verify_cert(). This function sets up the context with the certificate to be verified and the trusted store.
+</requirement>
+<requirement>
+The |cert| member of the X509_STORE_CTX must not be NULL. The function will fail with X509_V_ERR_INVALID_CALL if this member is NULL.
+</requirement>
+<requirement>
+The |chain| member of the X509_STORE_CTX must be NULL when calling X509_verify_cert. This is because the function will populate this member with the verified chain, and a non-NULL value indicates that the context has already been used.
+</requirement>
+<requirement>
+The |param->flags| member of the X509_STORE_CTX must not contain the X509_V_FLAG_EXTENDED_CRL_SUPPORT or X509_V_FLAG_USE_DELTAS flags. These flags correspond to unsupported CRL features and will cause the verification to fail.
+</requirement>
+<requirement>
+The |untrusted| member of the X509_STORE_CTX, if not NULL, should be a valid STACK_OF(X509). This is because it is duplicated and used in the certificate chain building process.
+</requirement>
+<requirement>
+The certificate to be verified (the third argument to X509_STORE_CTX_init) should be created from fuzzer input. This allows for testing of various certificate parsing and validation scenarios.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int X509_verify_cert(X509_STORE_CTX *)
+</function_signature>
+<project_name>
+boringssl
+</project_name>
+
+	Fuzz target source:
+#include <openssl/err.h>
+#include <openssl/mem.h>
+#include <openssl/x509.h>
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <vector>
+#include <cstdint>
+#include <cstddef>
+
+// A helper to parse a certificate from the FuzzedDataProvider.
+// Returns a non-owning pointer. The certificate's lifetime is managed
+// by the |certs| vector in the main function.
+static X509* ParseCert(FuzzedDataProvider* provider,
+                       std::vector<bssl::UniquePtr<X509>>* certs) {
+  // Consume up to 4KB for a certificate.
+  const size_t len = provider->ConsumeIntegralInRange<size_t>(0, 4096);
+  const std::vector<uint8_t> cert_data = provider->ConsumeBytes<uint8_t>(len);
+  if (cert_data.empty()) {
+    return nullptr;
+  }
+
+  const uint8_t* p = cert_data.data();
+  X509* x = d2i_X509(nullptr, &p, cert_data.size());
+  if (x) {
+    // Transfer ownership to the vector.
+    certs->emplace_back(x);
+  }
+  return x;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // This vector will own all the certificates we parse.
+  std::vector<bssl::UniquePtr<X509>> all_certs;
+
+  // Create the trust store.
+  bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+  if (!store) {
+    return 0;
+  }
+
+  // Populate the trust store with some "root" certificates.
+  const size_t num_roots = provider.ConsumeIntegralInRange<size_t>(0, 5);
+  for (size_t i = 0; i < num_roots; ++i) {
+    X509* root = ParseCert(&provider, &all_certs);
+    if (root) {
+      X509_STORE_add_cert(store.get(), root);
+    }
+  }
+
+  // Get the leaf certificate to be verified.
+  X509* leaf = ParseCert(&provider, &all_certs);
+  if (!leaf) {
+    return 0;
+  }
+
+  // Create the stack of untrusted intermediate certificates.
+  bssl::UniquePtr<STACK_OF(X509)> intermediates(sk_X509_new_null());
+  if (!intermediates) {
+    return 0;
+  }
+  const size_t num_intermediates = provider.ConsumeIntegralInRange<size_t>(0, 5);
+  for (size_t i = 0; i < num_intermediates; ++i) {
+    X509* inter = ParseCert(&provider, &all_certs);
+    if (inter) {
+      // sk_X509_push does not take ownership.
+      if (!sk_X509_push(intermediates.get(), inter)) {
+          // In case of an error, we can just stop adding certs.
+          break;
+      }
+    }
+  }
+
+  // Create and initialize the verification context.
+  bssl::UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  if (!ctx) {
+    return 0;
+  }
+  if (!X509_STORE_CTX_init(ctx.get(), store.get(), leaf, intermediates.get())) {
+    return 0;
+  }
+
+  // Fuzz some verification parameters.
+  unsigned long flags = provider.ConsumeIntegral<unsigned long>();
+  X509_STORE_CTX_set_flags(ctx.get(), flags);
+
+  if (provider.ConsumeBool()) {
+    time_t time = provider.ConsumeIntegral<time_t>();
+    X509_STORE_CTX_set_time(ctx.get(), 0, time);
+  }
+
+  // The function we want to fuzz.
+  X509_verify_cert(ctx.get());
+
+  ERR_clear_error();
+  return 0;
+}
+	

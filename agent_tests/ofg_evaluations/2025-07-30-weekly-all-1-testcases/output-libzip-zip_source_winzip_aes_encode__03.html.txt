@@ -1,0 +1,137 @@
+
+	
+<description>
+The function `zip_source_winzip_aes_encode` creates a new `zip_source_t` that encrypts the data from an existing source `src` using WinZip AES encryption. It takes the zip archive `za`, the source `src`, the AES encryption method (`128`, `192`, or `256` bit), flags, and a password. It is not called directly, but returned as a function pointer by `_zip_get_encryption_implementation` when encoding with AES is requested. The primary caller context is within `zip_close` when writing or updating a zip archive with AES encrypted entries. The function first validates its inputs, then creates a WinZip AES context, and finally creates a new layered source that applies the encryption.
+</description>
+<requirements>
+
+<requirement>
+The first argument `za` must be a valid pointer to a `zip_t` struct, created by functions like `zip_open` or `zip_open_from_source`. It is dereferenced to store error information, so a NULL pointer would lead to a crash.
+</requirement>
+<requirement>
+The second argument `src` must be a valid pointer to a `zip_source_t` structure. Although the function checks for NULL, a valid source (e.g., from `zip_source_buffer`) is required for the encryption layer to be created correctly.
+</requirement>
+<requirement>
+The third argument `encryption_method` must be one of `ZIP_EM_AES_128` (0x0101), `ZIP_EM_AES_192` (0x0102), or `ZIP_EM_AES_256` (0x0103). The function contains a check and will return NULL if an unsupported method is provided.
+</requirement>
+<requirement>
+The fifth argument `password` must be a valid, null-terminated string. The function checks for NULL, and a valid string is necessary for the underlying `winzip_aes_new` function to derive the encryption keys.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+zip_source_t * zip_source_winzip_aes_encode(zip_t *, zip_source_t *, zip_uint16_t, int, const char *)
+</function_signature>
+<project_name>
+libzip
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zip.h>
+
+// Since the build system may use either a C or C++ compiler, we need to use
+// __cplusplus guards to make the extern "C" directive conditional. This ensures
+// C-style linkage when compiled as C++, preventing name-mangling issues, while
+// remaining compatible with a C compiler.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "/src/libzip/lib/zipint.h"
+
+#ifdef __cplusplus
+}
+#endif
+
+/**
+This fuzzing target takes input data, creates a ZIP archive in a
+buffer, creates a source from the input data, encrypts that source
+using WinZip AES encryption, adds the encrypted data as a file
+to the archive, and then closes the archive.
+
+The purpose of this fuzzer is to test the WinZip AES encryption
+implementation in libzip by subjecting it to various inputs.
+**/
+
+// The fuzzer entry point must have C linkage.
+#ifdef __cplusplus
+extern "C"
+#endif
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+
+    const char *password = "fuzz-password";
+    zip_uint16_t encryption_method;
+
+    // Use the first byte of data to select the encryption method.
+    switch (data[0] % 3) {
+    case 0:
+        encryption_method = ZIP_EM_AES_128;
+        break;
+    case 1:
+        encryption_method = ZIP_EM_AES_192;
+        break;
+    default:
+        encryption_method = ZIP_EM_AES_256;
+        break;
+    }
+
+    // The rest of the data is the file content.
+    const uint8_t *file_content = data + 1;
+    size_t file_content_size = size - 1;
+
+    zip_error_t error;
+    zip_error_init(&error);
+
+    // Create a zip archive in a buffer. This avoids file I/O.
+    zip_source_t *source_archive;
+    if ((source_archive = zip_source_buffer_create(NULL, 0, 0, &error)) == NULL) {
+        zip_error_fini(&error);
+        return 0;
+    }
+
+    zip_t *archive;
+    if ((archive = zip_open_from_source(source_archive, ZIP_CREATE, &error)) == NULL) {
+        zip_source_free(source_archive);
+        zip_error_fini(&error);
+        return 0;
+    }
+    zip_error_fini(&error);
+
+    // Create a source for the file content.
+    zip_source_t *source_original = zip_source_buffer(archive, file_content, file_content_size, 0);
+    if (source_original == NULL) {
+        zip_discard(archive);
+        return 0;
+    }
+
+    // Call the function under test to create an encrypted source.
+    zip_source_t *source_encrypted = zip_source_winzip_aes_encode(archive, source_original, encryption_method, 0, password);
+    if (source_encrypted == NULL) {
+        zip_source_free(source_original);
+        zip_discard(archive);
+        return 0;
+    }
+
+    // Add the encrypted source as a file to the archive. This consumes the source.
+    // On failure, zip_file_add frees the source, so we only need to discard the archive.
+    if (zip_file_add(archive, "fuzzed-file", source_encrypted, ZIP_FL_OVERWRITE) < 0) {
+        zip_discard(archive);
+        return 0;
+    }
+
+    // Close the archive. This writes all data to the archive source and frees resources.
+    zip_close(archive);
+
+    return 0;
+}
+	

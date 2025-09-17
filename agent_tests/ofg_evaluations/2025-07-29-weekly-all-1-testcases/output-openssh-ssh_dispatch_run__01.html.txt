@@ -1,0 +1,107 @@
+
+	
+<description>
+The ssh_dispatch_run function is the main message-dispatch loop of the SSH protocol. It reads incoming packets, determines their type, and calls the appropriate handler function from a dispatch table within the ssh struct. The function's behavior (blocking or non-blocking) is controlled by the 'mode' parameter. The loop continues until the connection is closed, an error occurs, or a 'done' flag is set.
+</description>
+<requirements>
+
+<requirement>
+The `ssh` argument must be a valid pointer to a `struct ssh` initialized by `ssh_alloc_session_state`. This ensures that the structure's members, including the dispatch table, are properly initialized.
+</requirement>
+<requirement>
+The `ssh->dispatch` table must be initialized by calling `ssh_dispatch_init`. This prevents null pointer dereferences when the function attempts to call a dispatch handler.
+</requirement>
+<requirement>
+Before calling `ssh_dispatch_run`, a connection must be established and associated with the `ssh` object using `ssh_packet_set_connection`. This is crucial for the packet reading functions to operate correctly.
+</requirement>
+<requirement>
+The `mode` parameter must be either `DISPATCH_BLOCK` (0) or `DISPATCH_NONBLOCK` (1). These values control the packet reading mode, and other values may lead to unexpected behavior.
+</requirement>
+<requirement>
+The `done` parameter, if not NULL, must point to a valid `volatile sig_atomic_t` variable. This variable is used to signal the dispatch loop to terminate gracefully.
+</requirement>
+<requirement>
+For any given packet type that is expected to be handled, a corresponding handler function must be registered in the `ssh->dispatch` table using `ssh_dispatch_set`. This ensures that packets are properly processed and not just ignored or treated as errors.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int ssh_dispatch_run(struct ssh *, int, DW_TAG_volatile_typesig_atomic_t *)
+</function_signature>
+<project_name>
+openssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <unistd.h>
+#include <signal.h>
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+
+extern "C" {
+#include "includes.h"
+#include "packet.h"
+#include "dispatch.h"
+#include "log.h"
+#include "ssh_api.h"
+}
+
+// A simple default dispatch handler that does nothing.
+static int
+null_dispatch_handler(int, uint32_t, struct ssh *)
+{
+	return 0;
+}
+
+extern "C" int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	FuzzedDataProvider stream(data, size);
+	struct ssh *ssh = NULL;
+	volatile sig_atomic_t done = 0;
+	int p[2];
+
+	// Set up a pipe to feed fuzzer data to the dispatch loop.
+	if (pipe(p) == -1) {
+		return 0;
+	}
+
+	// 1. Allocate session state
+	ssh = ssh_alloc_session_state();
+	if (ssh == NULL) {
+		close(p[0]);
+		close(p[1]);
+		return 0;
+	}
+
+	// 2. Initialize dispatch table
+	ssh_dispatch_init(ssh, &null_dispatch_handler);
+
+	// 3. Set up the connection to read from our pipe
+	ssh_packet_set_connection(ssh, p[0], p[1]);
+
+	// Write the fuzzer data to the pipe.
+	auto input_data = stream.ConsumeRemainingBytes<uint8_t>();
+	if (write(p[1], input_data.data(), input_data.size()) < 0) {
+		// Ignore errors, pipe might be full or closed
+	}
+	close(p[1]); // Close the write end.
+
+	// 4. Get mode from fuzzer
+	int mode = stream.PickValueInArray({DISPATCH_BLOCK, DISPATCH_NONBLOCK});
+
+	// 5. Call the function under test
+	ssh_dispatch_run(ssh, mode, &done);
+
+	// Cleanup
+	ssh_free(ssh);
+	// p[0] is closed by ssh_free
+
+	return 0;
+}
+	

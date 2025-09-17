@@ -1,0 +1,124 @@
+
+	
+<description>
+The function `usbredirparser_send_filter_filter` sends a filter packet to a peer. It first checks if the peer has the `usb_redir_cap_filter` capability. If it does, it converts the filter rules into a string and sends them to the peer. The function's primary purpose is to communicate USB device filtering rules between a client and a host.
+</description>
+<requirements>
+<requirement>
+The `usbredirparser_handle_hello` function should be called before `usbredirparser_send_filter_filter`. This is to initialize the parser and set the `usb_redir_cap_filter` capability, which is required by the target function.
+</requirement>
+<requirement>
+The `rules` argument must be an array of `usbredirfilter_rule` structs with `rules_count` elements. Each element in the array must have its `device_class` member initialized to a value between -1 and 255, and its `vendor_id`, `product_id`, and `device_version_bcd` members initialized to values between -1 and 65535. This is to prevent `usbredirfilter_verify` from returning an error.
+</requirement>
+<requirement>
+The `rules_count` argument must be a non-negative integer. This is to ensure that the loop in `usbredirfilter_rules_to_string` does not have a buffer overflow.
+</requirement>
+<requirement>
+The `parser_pub` argument must be a valid pointer to a `usbredirparser` struct. This is because it is dereferenced in the `usbredirparser_peer_has_cap` function.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void usbredirparser_send_filter_filter(struct usbredirparser *, const struct usbredirfilter_rule *, int)
+</function_signature>
+<project_name>
+spice-usbredir
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include <cstdint>
+#include <cstring>
+
+#include "usbredirparser.h"
+#include "usbredirfilter.h"
+#include "usbredirproto.h"
+
+// Forward declaration for the function under test
+void usbredirparser_send_filter_filter(struct usbredirparser *, const struct usbredirfilter_rule *, int);
+
+// Helper to append a 32-bit integer to a vector of bytes
+void append_u32(std::vector<uint8_t>& vec, uint32_t val) {
+    vec.insert(vec.end(), (uint8_t*)&val, (uint8_t*)&val + sizeof(val));
+}
+
+// Helper to append a length-prefixed data block to a vector of bytes
+void append_data(std::vector<uint8_t>& vec, const void* data, uint32_t len) {
+    append_u32(vec, len);
+    if (len > 0) {
+        vec.insert(vec.end(), (const uint8_t*)data, (const uint8_t*)data + len);
+    }
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    // 1. Setup parser with peer filter capability using unserialize
+    struct usbredirparser *parser = usbredirparser_create();
+    if (!parser) {
+        return 0;
+    }
+    // Per usbredirparser_unserialize documentation, init with no_hello flag
+    usbredirparser_init(parser, "fuzzer", nullptr, 0, usbredirparser_fl_no_hello);
+
+    // Create a minimal serialized state to set the peer capabilities
+    std::vector<uint8_t> state;
+    // Magic
+    append_u32(state, USBREDIRPARSER_SERIALIZE_MAGIC);
+    // Length (placeholder, patched later)
+    size_t len_offset = state.size();
+    append_u32(state, 0);
+    // our_caps (not important for this test)
+    uint32_t our_caps[USB_REDIR_CAPS_SIZE] = {0};
+    append_data(state, our_caps, sizeof(our_caps));
+    // peer_caps (the important part)
+    uint32_t peer_caps[USB_REDIR_CAPS_SIZE] = {0};
+    usbredirparser_caps_set_cap(peer_caps, usb_redir_cap_filter);
+    append_data(state, peer_caps, sizeof(peer_caps));
+    // to_skip
+    append_u32(state, 0);
+    // header
+    append_data(state, nullptr, 0);
+    // type_header
+    append_data(state, nullptr, 0);
+    // packet-data
+    append_data(state, nullptr, 0);
+    // write_buf_count
+    append_u32(state, 0);
+
+    // Patch the total length into the state buffer
+    uint32_t total_len = state.size();
+    memcpy(state.data() + len_offset, &total_len, sizeof(total_len));
+
+    // Unserialize the state to configure the parser
+    if (usbredirparser_unserialize(parser, state.data(), state.size()) != 0) {
+        usbredirparser_destroy(parser);
+        return 0;
+    }
+
+    // 2. Fuzz the filter rules
+    const int rules_count = fdp.ConsumeIntegralInRange<int>(0, 32);
+    std::vector<usbredirfilter_rule> rules;
+    rules.reserve(rules_count);
+    for (int i = 0; i < rules_count; i++) {
+        usbredirfilter_rule rule;
+        rule.device_class = fdp.ConsumeIntegralInRange<int>(-1, 255);
+        rule.vendor_id = fdp.ConsumeIntegralInRange<int>(-1, 65535);
+        rule.product_id = fdp.ConsumeIntegralInRange<int>(-1, 65535);
+        rule.device_version_bcd = fdp.ConsumeIntegralInRange<int>(-1, 65535);
+        rule.allow = fdp.ConsumeBool();
+        rules.push_back(rule);
+    }
+
+    // 3. Call the target function
+    usbredirparser_send_filter_filter(parser, rules.data(), rules.size());
+
+    // 4. Cleanup
+    usbredirparser_destroy(parser);
+
+    return 0;
+}
+	

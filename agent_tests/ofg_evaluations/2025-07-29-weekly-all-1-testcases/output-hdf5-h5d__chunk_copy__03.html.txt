@@ -1,0 +1,143 @@
+
+	
+<description>
+This function copies chunked dataset data from a source to a destination file. It handles data type conversions, including for variable-length (VLEN) and reference types, and manages memory for the copy process. The function iterates through the chunks in the source, copying each one to the destination. It also handles special cases, such as chunks stored in the cache.
+
+The function is called by `H5O__layout_copy_file` when copying a dataset with a chunked layout. The caller prepares the necessary structures, including the source and destination file pointers, layout and storage information for the chunks, and the dataspace and datatype of the source dataset. The caller also provides copy options through the `cpy_info` parameter.
+</description>
+<requirements>
+<requirement>
+The `f_src`, `storage_src`, `layout_src`, `f_dst`, `storage_dst`, `ds_extent_src`, and `dt_src` parameters must not be NULL. This is because the function dereferences these pointers without any prior null checks, and the function's assertions confirm this requirement.
+</requirement>
+<requirement>
+The `storage_src->ops` and `storage_dst->ops` pointers must be non-NULL and point to valid `H5D_chunk_ops_t` objects. This is because the function calls `storage_src->ops->copy_setup`, `storage_src->ops->iterate`, and `storage_src->ops->copy_shutdown` through these pointers.
+</requirement>
+<requirement>
+The `storage_src->idx_type` and `storage_dst->idx_type` members must be less than `H5D_CHUNK_IDX_NTYPES`. This is because the `H5D_CHUNK_STORAGE_INDEX_CHK` macro, which is called on both `storage_src` and `storage_dst`, enforces this check.
+</requirement>
+<requirement>
+The `ds_extent_src` parameter must point to a valid `H5S_extent_t` object with a valid rank and dimensions. This is because the function calls `H5S_extent_get_dims` on `ds_extent_src` to get the dataspace dimensions, which are used in subsequent calculations.
+</requirement>
+<requirement>
+If the `pline_src` parameter is NULL, a temporary `H5O_pline_t` object is created and initialized to zero. Otherwise, the provided `pline_src` is used, and it should point to a valid `H5O_pline_t` object.
+</requirement>
+<requirement>
+If `cpy_info->shared_fo` is not NULL, it must point to a valid `H5D_shared_t` object. This is because the function casts `cpy_info->shared_fo` to a `H5D_shared_t` pointer and accesses its members.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+H5D__chunk_copy(H5F_t *, H5O_storage_chunk_t *, H5O_layout_chunk_t *, H5F_t *, H5O_storage_chunk_t *, const H5S_extent_t *, H5T_t *, const H5O_pline_t *, H5O_copy_t *)
+</function_signature>
+<project_name>
+hdf5
+</project_name>
+
+	Fuzz target source:
+#include "hdf5.h"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Need at least 1 byte for rank, and 2 per rank for dims/cdims.
+    // Let's set a reasonable minimum.
+    if (size < 3) {
+        return 0;
+    }
+
+    // Suppress error messages.
+    H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+    char src_filename[256];
+    char dst_filename[256];
+    sprintf(src_filename, "/tmp/fuzz_src.%d", getpid());
+    sprintf(dst_filename, "/tmp/fuzz_dst.%d", getpid());
+
+    // Create source and destination files.
+    hid_t src_fid = H5Fcreate(src_filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (src_fid < 0) {
+        remove(src_filename);
+        return 0;
+    }
+
+    hid_t dst_fid = H5Fcreate(dst_filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (dst_fid < 0) {
+        H5Fclose(src_fid);
+        remove(src_filename);
+        remove(dst_filename);
+        return 0;
+    }
+
+    // Use fuzzer data to define dataset and chunk properties.
+    int rank = (data[0] % H5S_MAX_RANK);
+    if (rank == 0) rank = 1;
+
+    if (size < (1 + (size_t)rank * 2)) {
+        H5Fclose(src_fid);
+        H5Fclose(dst_fid);
+        remove(src_filename);
+        remove(dst_filename);
+        return 0;
+    }
+
+    hsize_t dims[H5S_MAX_RANK];
+    hsize_t cdims[H5S_MAX_RANK];
+    const uint8_t *params = data + 1;
+    for (int i = 0; i < rank; i++) {
+        // Keep dimensions small to avoid excessive memory usage.
+        dims[i] = (params[i] % 128) + 1;
+        cdims[i] = (params[i + rank] % 128) + 1;
+        if (cdims[i] > dims[i]) {
+            cdims[i] = dims[i];
+        }
+    }
+
+    // Create a dataspace.
+    hid_t sid = H5Screate_simple(rank, dims, NULL);
+    if (sid >= 0) {
+        // Create a dataset creation property list for chunking.
+        hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+        if (dcpl >= 0) {
+            if (H5Pset_chunk(dcpl, rank, cdims) >= 0) {
+                // Create the chunked dataset in the source file.
+                hid_t did = H5Dcreate2(src_fid, "dset", H5T_NATIVE_INT, sid, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+                if (did >= 0) {
+                    // Write some data to ensure chunks are allocated.
+                    hssize_t n_points = H5Sget_simple_extent_npoints(sid);
+                    if (n_points > 0) {
+                        size_t buf_size = (size_t)n_points * sizeof(int);
+                        // Limit allocation size.
+                        if (buf_size > 0 && buf_size < 500000) {
+                            int *buf = (int *)malloc(buf_size);
+                            if (buf) {
+                                for (size_t i = 0; i < (size_t)n_points; i++) {
+                                    buf[i] = (int)i;
+                                }
+                                H5Dwrite(did, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf);
+                                free(buf);
+                            }
+                        }
+                    }
+
+                    // Copy the dataset, which should trigger H5D__chunk_copy.
+                    H5Ocopy(src_fid, "dset", dst_fid, "dset_copy", H5P_DEFAULT, H5P_DEFAULT);
+                    H5Dclose(did);
+                }
+            }
+            H5Pclose(dcpl);
+        }
+        H5Sclose(sid);
+    }
+
+    // Clean up.
+    H5Fclose(src_fid);
+    H5Fclose(dst_fid);
+    remove(src_filename);
+    remove(dst_filename);
+
+    return 0;
+}
+	

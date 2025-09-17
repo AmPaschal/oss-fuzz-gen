@@ -1,0 +1,148 @@
+
+	
+<description>
+The `g_obex_put_req_pkt` function is responsible for initiating an OBEX PUT request. It takes a `GObex` session object, a `GObexPacket` representing the request, a data producer callback, a completion callback, user data, and an error object.
+
+The function first validates that the request packet's operation code is `G_OBEX_OP_PUT`. It then creates and initializes a `transfer` structure to manage the state of the PUT operation. This structure stores the `obex` session, the data producer and completion callbacks, and user data. The function then sets up the request packet's body by associating it with the `put_get_data` callback, which in turn uses the provided `data_producer` to get the data for the transfer. Finally, it sends the request using `g_obex_send_req`.
+
+The main caller of this function is `g_obex_put_req`, a variadic function that simplifies creating and sending OBEX PUT requests by constructing the `GObexPacket` from a variable list of headers. Another caller, found in `obexd/client/transfer.c`, manually constructs the `GObexPacket` before calling `g_obex_put_req_pkt`. This indicates that the `req` packet must be properly formed with all necessary headers before being passed to `g_obex_put_req_pkt`. The `GObexDataProducer` callback is expected to provide the data to be sent, and the `GObexFunc` callback is invoked upon completion of the transfer.
+</description>
+<requirements>
+<requirement>
+The `req` GObexPacket argument must be created with the `G_OBEX_OP_PUT` opcode. This is a precondition checked by the function, and failure to meet it will result in an immediate return with a value of 0.
+</requirement>
+<requirement>
+The `req` GObexPacket argument should be initialized using `g_obex_packet_new()` or `g_obex_packet_new_valist()` and populated with necessary headers. This is to ensure the packet is correctly formatted for the OBEX PUT operation as demonstrated by its callers.
+</requirement>
+<requirement>
+The `data_func` argument must be a valid `GObexDataProducer` function pointer. This function is responsible for providing the data to be sent and is critical for the data transfer part of the PUT operation.
+</requirement>
+<requirement>
+The `complete_func` argument must be a valid `GObexFunc` function pointer. This function is called upon completion of the transfer, and its absence could lead to resource leaks or improper handling of the transfer's final state.
+</requirement>
+<requirement>
+The `obex` argument must be a valid `GObex` object, properly initialized. This object represents the OBEX session and is essential for sending the request and managing the transfer.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+guint g_obex_put_req_pkt(GObex *, GObexPacket *, GObexDataProducer, GObexFunc, gpointer, GError **)
+</function_signature>
+<project_name>
+bluez
+</project_name>
+
+	Fuzz target source:
+#include <config.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <glib.h>
+#include "gobex/gobex.h"
+#include "gobex/gobex-packet.h"
+
+// A struct to hold the fuzzer input state for the data producer callback.
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t offset;
+} FuzzDataContext;
+
+// Callback for GObexDataProducer. This function provides the data for the PUT request.
+static gssize data_producer_cb(void *buf, gsize len, gpointer user_data) {
+    FuzzDataContext *ctx = (FuzzDataContext *)user_data;
+
+    if (ctx == NULL || ctx->offset >= ctx->size) {
+        return 0; // No more data
+    }
+
+    gsize to_copy = len;
+    if (ctx->offset + to_copy > ctx->size) {
+        to_copy = ctx->size - ctx->offset;
+    }
+
+    memcpy(buf, ctx->data + ctx->offset, to_copy);
+    ctx->offset += to_copy;
+
+    return to_copy;
+}
+
+// Callback for GObexFunc. This is called when the transfer is complete.
+static void complete_cb(GObex *obex, GError *err, gpointer user_data) {
+    // This callback is required but can be empty for our fuzzing purposes,
+    // as we manually clean up the transfer.
+    (void)obex;
+    (void)err;
+    (void)user_data;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size == 0) {
+        return 0;
+    }
+
+    // Create a pipe to use for the GIOChannel, simulating a transport connection.
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return 0;
+    }
+
+    GIOChannel *channel = g_io_channel_unix_new(fds[0]);
+    if (!channel) {
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+    // Set the channel to non-blocking to prevent hangs.
+    g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL);
+
+    // Create a GObex session object.
+    GObex *obex = g_obex_new(channel, G_OBEX_TRANSPORT_STREAM, 1024, 1024);
+    if (!obex) {
+        g_io_channel_unref(channel);
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+
+    // Create a GObexPacket for the PUT request, as required by the function.
+    GObexPacket *req = g_obex_packet_new(G_OBEX_OP_PUT, FALSE, G_OBEX_HDR_INVALID);
+    if (!req) {
+        g_obex_unref(obex);
+        g_io_channel_unref(channel);
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+
+    FuzzDataContext fuzz_ctx = { .data = data, .size = size, .offset = 0 };
+    GError *err = NULL;
+
+    // Call the function under test.
+    guint transfer_id = g_obex_put_req_pkt(obex, req, data_producer_cb, complete_cb, &fuzz_ctx, &err);
+
+    // If a transfer was started, run the main context a few times to process
+    // asynchronous events and then cancel the transfer to clean up resources.
+    if (transfer_id > 0) {
+        GMainContext *context = g_main_context_default();
+        for (int i = 0; i < 5 && g_main_context_pending(context); i++) {
+            g_main_context_iteration(context, FALSE);
+        }
+        g_obex_cancel_transfer(transfer_id, NULL, NULL);
+    }
+
+    // Cleanup resources.
+    if (err) {
+        g_error_free(err);
+    }
+    // g_obex_put_req_pkt takes ownership of 'req'.
+    g_obex_unref(obex);
+    g_io_channel_unref(channel);
+    close(fds[0]);
+    close(fds[1]);
+
+    return 0;
+}
+	

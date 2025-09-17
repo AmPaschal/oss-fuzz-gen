@@ -1,0 +1,103 @@
+
+	
+<description>
+The `opus_multistream_encode_float` function encodes a multistream Opus frame from floating-point input. It is a wrapper for the `opus_multistream_encode_native` function, which performs the core encoding logic. The function takes an initialized `OpusMSEncoder` state, a PCM audio buffer, the frame size, an output buffer for the encoded data, and the maximum size of the output buffer. It returns the number of bytes written to the output buffer or an error code.
+</description>
+<requirements>
+<requirement>
+The `OpusMSEncoder` struct must be initialized by calling `opus_multistream_encoder_create` or `opus_multistream_surround_encoder_create`. This is because these functions allocate and initialize the necessary memory and structures for the encoder.
+</requirement>
+<requirement>
+The `frame_size` argument must be a value that is supported by the encoder, which can be calculated by `frame_size_ms_x2 * frequency / 2000` where `frame_size_ms_x2` is one of `{5, 10, 20, 40, 80, 120, 160, 200, 240}` and `frequency` is one of `{8000, 12000, 16000, 24000, 48000, 96000}`. Using an unsupported frame size can lead to an `OPUS_BAD_ARG` error.
+</requirement>
+<requirement>
+The `pcm` buffer should be allocated to a size of at least `frame_size * nb_channels * sizeof(opus_val16)`, where `nb_channels` is the number of channels passed to `opus_multistream_encoder_create`. This is to prevent buffer overflows when the encoder reads from the PCM buffer.
+</requirement>
+<requirement>
+The `max_data_bytes` argument should be set to a value large enough to hold the encoded data, such as `MAX_PACKET` (1500) which is used in the fuzzer. A small value may result in an `OPUS_BUFFER_TOO_SMALL` error.
+</requirement>
+<requirement>
+It is recommended to call `opus_multistream_encoder_ctl` with various options to configure the encoder. This allows for testing of different encoder features and can help to achieve higher code coverage.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int opus_multistream_encode_float(OpusMSEncoder *, const opus_val16 *, int, unsigned char *, opus_int32)
+</function_signature>
+<project_name>
+opus
+</project_name>
+
+	Fuzz target source:
+#define VAR_ARRAYS 1
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <vector>
+
+#include "opus.h"
+#include "opus_multistream.h"
+#include "/src/opus/celt/rate.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    // Encoder creation parameters
+    const opus_int32 rates[] = {8000, 12000, 16000, 24000, 48000};
+    opus_int32 Fs = fdp.PickValueInArray(rates);
+
+    int channels = fdp.ConsumeIntegralInRange<int>(1, 8);
+    // Mapping family 0 is mono/stereo, 1 is surround.
+    int mapping_family = fdp.PickValueInArray({0, 1});
+
+    // Ensure valid channel count for surround sound.
+    if (mapping_family == 1 && channels < 2) {
+        channels = fdp.ConsumeIntegralInRange<int>(2, 8);
+    }
+
+    int streams;
+    int coupled_streams;
+    std::vector<unsigned char> mapping(channels);
+
+    const int applications[] = {OPUS_APPLICATION_VOIP, OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_RESTRICTED_LOWDELAY};
+    int application = fdp.PickValueInArray(applications);
+
+    int error;
+    OpusMSEncoder *enc = opus_multistream_surround_encoder_create(
+        Fs, channels, mapping_family, &streams, &coupled_streams, mapping.data(), application, &error);
+
+    if (error != OPUS_OK || enc == nullptr) {
+        return 0;
+    }
+
+    // Encoding parameters
+    const int frame_sizes_ms[] = {5, 10, 20, 40, 60};
+    int frame_duration_ms = fdp.PickValueInArray(frame_sizes_ms);
+    int frame_size = (Fs / 1000 * frame_duration_ms);
+    if (frame_size <= 0) {
+        opus_multistream_encoder_destroy(enc);
+        return 0;
+    }
+
+    const size_t pcm_size = frame_size * channels;
+    std::vector<opus_val16> pcm_data;
+    if (fdp.remaining_bytes() < pcm_size * sizeof(opus_val16)) {
+        opus_multistream_encoder_destroy(enc);
+        return 0;
+    }
+    pcm_data.reserve(pcm_size);
+    for (size_t i = 0; i < pcm_size; ++i) {
+        pcm_data.push_back(fdp.ConsumeFloatingPointInRange<float>(-1.0f, 1.0f));
+    }
+    
+    const opus_int32 max_output_bytes = fdp.ConsumeIntegralInRange<opus_int32>(1, 4000);
+    std::vector<unsigned char> output_data(max_output_bytes);
+
+    (void)opus_multistream_encode_float(enc, pcm_data.data(), frame_size, output_data.data(), max_output_bytes);
+
+    opus_multistream_encoder_destroy(enc);
+
+    return 0;
+}
+	

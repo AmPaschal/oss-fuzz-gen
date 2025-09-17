@@ -1,0 +1,138 @@
+
+	
+<description>
+The function `auth_zones_startprobesequence` is responsible for initiating a probe sequence for a given authentication zone. It takes as input an `auth_zones` structure, a `module_env` structure, a domain name, its length, and the domain class. The function first acquires a read lock on the `auth_zones` structure and attempts to find an `auth_xfer` structure associated with the provided domain name and class using `auth_xfer_find`. If found, it acquires a lock on the `auth_xfer` structure and then releases the lock on `auth_zones`. Finally, it calls `xfr_process_notify` to process the notify event for the transfer, effectively starting the probe sequence. The function returns 1 on success and 0 on failure. The caller of this function in `daemon/remote.c` is responsible for ensuring that the `auth_zones` and `module_env` structures are properly initialized and that the domain name and class are valid.
+</description>
+<requirements>
+
+<requirement>
+The `az` parameter, a pointer to a `struct auth_zones`, must not be NULL. The function attempts to lock and access members of this struct, and a NULL pointer would lead to a crash.
+</requirement>
+<requirement>
+The `env` parameter, a pointer to a `struct module_env`, must not be NULL. This parameter is passed to the `xfr_process_notify` function, which likely dereferences it.
+</requirement>
+<requirement>
+The `nm` parameter should be a valid DNS domain name, and `nmlen` should be its corresponding length. The function `auth_xfer_find` uses these parameters to search for an entry in a red-black tree, and an invalid name could lead to incorrect behavior or crashes.
+</requirement>
+<requirement>
+An `auth_xfer` entry for the given `nm`, `nmlen`, and `dclass` must exist in the `az->xtree`. The function returns 0 if no such entry is found, but for successful execution and to trigger the intended logic, the entry should be present.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int auth_zones_startprobesequence(struct auth_zones* az, struct module_env* env, uint8_t* nm, size_t nmlen, uint16_t dclass)
+</function_signature>
+<project_name>
+unbound
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "util/module.h"
+#include "util/config_file.h"
+#include "util/regional.h"
+#include "util/data/dname.h"
+#include "services/authzone.h"
+#include "sldns/sbuffer.h"
+#include "util/configyyrename.h"
+
+// Forward declaration from the task.
+int auth_zones_startprobesequence(struct auth_zones *, struct module_env *, uint8_t *, size_t, uint16_t);
+
+static struct module_env* env = NULL;
+
+int LLVMFuzzerInitialize(int* argc, char*** argv)
+{
+	(void)argc;
+	(void)argv;
+	log_init(NULL, 0, NULL);
+	return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	struct auth_zones* az;
+	struct config_file* cfg;
+	const char* az_name = ".";
+	uint8_t* dname_buf;
+	size_t dname_len;
+	struct config_auth* zcfg;
+	int is_rpz = 0;
+
+	if (size == 0) {
+		return 0;
+	}
+
+	// Create env and config
+	if(!(env = (struct module_env*)calloc(1, sizeof(*env))))
+		return 0;
+	env->unique_mesh = 1;
+	if(!(cfg = config_create())) {
+		free(env);
+		env = NULL;
+		return 0;
+	}
+	env->cfg = cfg;
+	if(!(env->scratch = regional_create())) {
+		config_delete(env->cfg);
+		free(env);
+		env = NULL;
+		return 0;
+	}
+
+	// Create auth_zones
+	az = auth_zones_create();
+	if(!az) {
+		regional_destroy(env->scratch);
+		config_delete(env->cfg);
+		free(env);
+		env = NULL;
+		return 0;
+	}
+
+	// Add a zone to the config, then apply it to auth_zones.
+	// This uses the public API to populate auth_zones correctly.
+	zcfg = (struct config_auth*)calloc(1, sizeof(*zcfg));
+	if(zcfg) {
+		zcfg->name = strdup(az_name);
+		if(zcfg->name) {
+			zcfg->next = cfg->auths;
+			cfg->auths = zcfg;
+			// Call with the correct number of arguments.
+			if(!auth_zones_apply_cfg(az, cfg, 1, &is_rpz, env, NULL)) {
+				// config apply failed, but continue anyway
+			}
+		} else {
+			free(zcfg);
+		}
+	}
+
+	// Call the function under test
+	// First with fuzzer data
+	auth_zones_startprobesequence(az, env, (uint8_t*)data, size, LDNS_RR_CLASS_IN);
+
+	// Second with a known-to-exist zone to exercise the success path
+	dname_buf = sldns_str2wire_dname(az_name, &dname_len);
+	if(dname_buf) {
+		auth_zones_startprobesequence(az, env, dname_buf, dname_len, LDNS_RR_CLASS_IN);
+		free(dname_buf);
+	}
+
+	// Cleanup
+	auth_zones_delete(az);
+	regional_destroy(env->scratch);
+	config_delete(env->cfg);
+	free(env);
+	env = NULL;
+
+	return 0;
+}
+	

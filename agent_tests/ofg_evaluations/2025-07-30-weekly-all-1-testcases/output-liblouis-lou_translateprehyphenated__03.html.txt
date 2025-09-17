@@ -1,0 +1,190 @@
+
+	
+<description>
+The function `lou_translatePrehyphenated` translates a pre-hyphenated wide character string (`inbufx`) into a braille representation (`outbuf`). It is a wrapper around the `lou_translate` function, with additional logic to handle hyphens. The function takes a list of translation tables (`tableList`) and various other parameters to control the translation process. The function handles hyphenation information provided in `inputHyphens` and stores the output hyphenation in `outputHyphens`.
+</description>
+<requirements>
+<requirement>
+The `tableList` argument must be a comma-separated list of valid, existing table names. This is because `lou_translate` uses this list to load the necessary translation tables.</requirement>
+<requirement>
+The `inbufx` argument must be a valid pointer to an array of `widechar` and `inlen` must point to an integer representing the number of elements in `inbufx`. This is to prevent memory access violations when reading from `inbufx`.</requirement>
+<requirement>
+The `outbuf` argument must be a pointer to a writable buffer of `widechar`, and `outlen` must point to an integer that is initialized to the size of `outbuf`. This is because `*outlen` is used for memory allocation and as a loop bound, and an uninitialized value could lead to memory corruption or crashes.</requirement>
+<requirement>
+If the `inputHyphens` argument is not `NULL`, `outputHyphens` must also not be `NULL`. `outputHyphens` must be a buffer of at least size `*outlen` to prevent a buffer overflow.</requirement>
+<requirement>
+If the `inputHyphens` argument is not `NULL`, `inputPos` should be a valid pointer to an integer array of at least size `*outlen`. If `inputPos` is `NULL`, `*outlen` must be a positive integer to ensure proper memory allocation.</requirement>
+<requirement>
+The `inputHyphens` array must be large enough to be indexed by the values from the `inputPos` array, which are derived from the translation process within `lou_translate`. The values in `inputPos` can be as large as the original `*inlen`. Therefore, `inputHyphens` should be at least of size `*inlen`.</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int lou_translatePrehyphenated(const char *, const widechar *, int *, widechar *, int *, formtype *, char *, int *, int *, int *, char *, char *, int)
+</function_signature>
+<project_name>
+liblouis
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
+#include <vector>
+
+extern "C" {
+#include "liblouis/liblouis.h"
+#include "liblouis/internal.h"
+}
+
+// Dummy log callback to prevent noisy output
+void avoid_log(logLevels level, const char *msg) {
+  (void)level;
+  (void)msg;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  static bool initialized = false;
+  if (!initialized) {
+    lou_registerLogCallback(avoid_log);
+    initialized = true;
+  }
+
+  if (size < 512) { // Reserve 512 bytes for the table
+    return 0;
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  // Create a temporary table file from the first part of the input.
+  std::vector<uint8_t> table_data = provider.ConsumeBytes<uint8_t>(512);
+  char table_filename[] = "/tmp/fuzz-XXXXXX.ctb";
+  int fd = mkstemps(table_filename, 4);
+  if (fd < 0) {
+    return 0;
+  }
+  FILE *fp = fdopen(fd, "wb");
+  if (!fp) {
+    close(fd);
+    unlink(table_filename);
+    return 0;
+  }
+  fwrite(table_data.data(), 1, table_data.size(), fp);
+  fclose(fp);
+
+  if (lou_checkTable(table_filename) == 0) {
+    lou_free();
+    unlink(table_filename);
+    return 0;
+  }
+
+  std::string text_to_translate = provider.ConsumeRemainingBytesAsString();
+  if (text_to_translate.empty()) {
+    lou_free();
+    unlink(table_filename);
+    return 0;
+  }
+
+  // Convert char* to widechar*
+  int inlen_alloc = text_to_translate.length() * 4 + 1;
+  widechar *inbuf = (widechar *)malloc(inlen_alloc * sizeof(widechar));
+  if (!inbuf) {
+    lou_free();
+    unlink(table_filename);
+    return 0;
+  }
+  int inlen = _lou_extParseChars(text_to_translate.c_str(), inbuf);
+  if (inlen <= 0) {
+    free(inbuf);
+    lou_free();
+    unlink(table_filename);
+    return 0;
+  }
+
+  // Prepare output buffer
+  int outlen_alloc = inlen * 16 + 1;
+  widechar *outbuf = (widechar *)malloc(outlen_alloc * sizeof(widechar));
+  if (!outbuf) {
+    free(inbuf);
+    lou_free();
+    unlink(table_filename);
+    return 0;
+  }
+  int outlen = outlen_alloc;
+
+  // Prepare optional parameters
+  formtype *typeform = nullptr;
+  std::vector<formtype> typeform_vec;
+  if (provider.ConsumeBool()) {
+    typeform_vec.resize(inlen);
+    for (int i = 0; i < inlen; i++) {
+      typeform_vec[i] = provider.ConsumeIntegral<formtype>();
+    }
+    typeform = typeform_vec.data();
+  }
+
+  char *spacing = nullptr;
+  std::vector<char> spacing_vec;
+  if (provider.ConsumeBool()) {
+    spacing_vec.resize(outlen);
+    spacing = spacing_vec.data();
+  }
+
+  int *outputPos = nullptr;
+  std::vector<int> outputPos_vec;
+  if (provider.ConsumeBool()) {
+    outputPos_vec.resize(outlen);
+    outputPos = outputPos_vec.data();
+  }
+
+  int *inputPos = nullptr;
+  std::vector<int> inputPos_vec;
+  if (provider.ConsumeBool()) {
+    inputPos_vec.resize(outlen);
+    inputPos = inputPos_vec.data();
+  }
+
+  int *cursorPos = nullptr;
+  int cursorPos_val;
+  if (provider.ConsumeBool()) {
+    cursorPos_val = provider.ConsumeIntegralInRange<int>(0, inlen);
+    cursorPos = &cursorPos_val;
+  }
+
+  char *inputHyphens = nullptr;
+  char *outputHyphens = nullptr;
+  std::vector<char> inputHyphens_vec;
+  std::vector<char> outputHyphens_vec;
+  if (provider.ConsumeBool()) {
+    inputHyphens_vec.resize(inlen + 1, '0');
+    for (int i = 0; i < inlen; i++) {
+      if (provider.ConsumeBool()) {
+        inputHyphens_vec[i] = '1';
+      }
+    }
+    inputHyphens_vec[inlen] = '\0';
+    inputHyphens = inputHyphens_vec.data();
+
+    outputHyphens_vec.resize(outlen, '0');
+    outputHyphens = outputHyphens_vec.data();
+  }
+
+  int mode = provider.ConsumeIntegral<int>();
+
+  lou_translatePrehyphenated(table_filename, inbuf, &inlen, outbuf, &outlen,
+                             typeform, spacing, outputPos, inputPos, cursorPos,
+                             inputHyphens, outputHyphens, mode);
+
+  // Cleanup
+  free(inbuf);
+  free(outbuf);
+  lou_free();
+  unlink(table_filename);
+
+  return 0;
+}
+	

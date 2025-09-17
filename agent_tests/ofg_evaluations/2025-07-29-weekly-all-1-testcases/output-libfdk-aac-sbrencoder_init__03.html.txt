@@ -1,0 +1,128 @@
+
+	
+<description>
+The `sbrEncoder_Init` function initializes the Spectral Band Replication (SBR) encoder. It takes a handle to the SBR encoder, information about the audio elements, input buffer details, and various configuration parameters. The function sets up the SBR encoder's internal state, including the downsampler, filter banks, and delay compensation. The function's behavior is highly dependent on the `aot` (Audio Object Type) parameter, which dictates the processing path and constraints on other inputs. It also modifies several of its pointer arguments, which act as both input and output. A crucial pre-condition is that `sbrEncoder_Open` must be called to obtain a valid handle for the `hSbrEncoder` parameter.
+</description>
+<requirements>
+<requirement>
+The `hSbrEncoder` handle must be initialized by calling `sbrEncoder_Open` before calling `sbrEncoder_Init`. This is to ensure that `hSbrEncoder` is a valid pointer to an allocated `SBR_ENCODER` structure.
+</requirement>
+<requirement>
+The `noElements` parameter must be an integer between 1 and 8, inclusive. This is to prevent out-of-bounds access on the `elInfo` array, which is declared with a size of 8.
+</requirement>
+<requirement>
+For each element in the `elInfo` array, from index 0 to `noElements - 1`, the `elType` member must be either `ID_SCE` or `ID_CPE`. This is because the function only handles Single Channel Elements and Channel Pair Elements.
+</requirement>
+<requirement>
+If the `aot` parameter is `AOT_PS`, the `*numChannels` parameter must be 2 and the `noElements` parameter must be 1. This is a specific requirement for the Parametric Stereo mode to function correctly.
+</requirement>
+<requirement>
+The `aot` parameter must not be `AOT_ER_AAC_LD`. The function explicitly checks for this value and returns an error if it is provided.
+</requirement>
+<requirement>
+The `downSampleFactor` pointer must point to a value of 1 or 2. The function's internal logic only handles these two values and will return an error for any other value.
+</requirement>
+<requirement>
+All pointer arguments (`hSbrEncoder`, `elInfo`, `inputBuffer`, `coreBandwidth`, `inputBufferOffset`, `numChannels`, `coreSampleRate`, `downSampleFactor`, `frameLength`, `delay`) must not be NULL. The function directly dereferences these pointers without any null checks.
+</requirement>
+<requirement>
+The combination of `elInfo[i].bitRate`, `elInfo[i].nChannelsInEl`, `*coreSampleRate`, `inputSampleRate`, and `aot` must represent a valid SBR configuration. The function verifies this using `FDKsbrEnc_IsSbrSettingAvail` and will fail if the configuration is not supported.
+</requirement>
+<requirement>
+The `inputBuffer` must be large enough to hold the delay compensation data, with its size provided by `inputBufferBufSize`. This is to prevent buffer overflows when `FDKsbrEnc_DelayCompensation` is called.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+INT sbrEncoder_Init(HANDLE_SBR_ENCODER, SBR_ELEMENT_INFO *, int, INT_PCM *, UINT, INT *, INT *, INT *, const UINT, INT *, UINT *, INT *, AUDIO_OBJECT_TYPE, int *, int, const int, ULONG)
+</function_signature>
+<project_name>
+libfdk-aac
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <cstdlib>
+
+#include "sbr_encoder.h"
+#include "FDK_audio.h"
+#include "genericStds.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  HANDLE_SBR_ENCODER hSbrEncoder = NULL;
+
+  // Fuzz parameters for sbrEncoder_Open
+  INT nElementsOpen = provider.ConsumeIntegralInRange<INT>(1, 8);
+  INT nChannelsOpen = provider.ConsumeIntegralInRange<INT>(1, 2);
+  INT supportPS = provider.ConsumeBool();
+  
+  // Requirement: Initialize handle with sbrEncoder_Open
+  // The function signature is: INT sbrEncoder_Open(HANDLE_SBR_ENCODER*, INT, INT, INT)
+  if (sbrEncoder_Open(&hSbrEncoder, nElementsOpen, nChannelsOpen, supportPS) != 0) {
+    return 0;
+  }
+
+  // Requirement: noElements must be between 1 and 8
+  int noElements = nElementsOpen;
+
+  SBR_ELEMENT_INFO elInfo[8];
+  for (int i = 0; i < noElements; i++) {
+    // Use MP4_ELEMENT_ID directly to avoid typedef issues.
+    elInfo[i].elType = provider.PickValueInArray({(MP4_ELEMENT_ID)ID_SCE, (MP4_ELEMENT_ID)ID_CPE});
+    elInfo[i].bitRate = provider.ConsumeIntegral<INT>();
+    elInfo[i].nChannelsInEl = provider.ConsumeIntegralInRange<int>(1, 2);
+    elInfo[i].fParametricStereo = provider.ConsumeBool();
+  }
+
+  // Requirement: inputBuffer must be large enough
+  const UINT inputBufferBufSize = provider.ConsumeIntegralInRange<UINT>(2048, 8192);
+  INT_PCM *inputBuffer = (INT_PCM *)malloc(sizeof(INT_PCM) * inputBufferBufSize);
+  if (!inputBuffer) {
+    sbrEncoder_Close(&hSbrEncoder);
+    return 0;
+  }
+  provider.ConsumeData(inputBuffer, sizeof(INT_PCM) * inputBufferBufSize);
+
+  INT coreBandwidth = provider.ConsumeIntegral<INT>();
+  INT inputBufferOffset = provider.ConsumeIntegral<INT>();
+  INT numChannels = nChannelsOpen;
+  const UINT syntaxFlags = provider.ConsumeIntegral<UINT>();
+  INT coreSampleRate = provider.ConsumeIntegral<INT>();
+  // Requirement: downSampleFactor must be 1 or 2
+  UINT downSampleFactor = provider.PickValueInArray<UINT>({1, 2});
+  INT frameLength = provider.ConsumeIntegral<INT>();
+  
+  // Requirement: aot must not be AOT_ER_AAC_LD.
+  // Replace ConsumeEnum with ConsumeIntegralInRange and cast.
+  AUDIO_OBJECT_TYPE aot = (AUDIO_OBJECT_TYPE)provider.ConsumeIntegralInRange<int>(AOT_AAC_LC, AOT_USAC);
+  if (aot == AOT_ER_AAC_LD) {
+      aot = AOT_AAC_LC; // Replace invalid AOT
+  }
+  // Requirement: if aot is AOT_PS, numChannels must be 2 and noElements must be 1
+  if (aot == AOT_PS) {
+      numChannels = 2;
+      noElements = 1;
+  }
+
+  int delay = provider.ConsumeIntegral<int>();
+  int transformFactor = provider.ConsumeIntegral<int>();
+  const int headerPeriod = provider.ConsumeIntegral<int>();
+  ULONG statesInitFlag = provider.ConsumeIntegral<ULONG>();
+
+  sbrEncoder_Init(hSbrEncoder, elInfo, noElements, inputBuffer,
+                  inputBufferBufSize, &coreBandwidth, &inputBufferOffset,
+                  &numChannels, syntaxFlags, &coreSampleRate,
+                  &downSampleFactor, &frameLength, aot, &delay,
+                  transformFactor, headerPeriod, statesInitFlag);
+
+  sbrEncoder_Close(&hSbrEncoder);
+  free(inputBuffer);
+
+  return 0;
+}
+	

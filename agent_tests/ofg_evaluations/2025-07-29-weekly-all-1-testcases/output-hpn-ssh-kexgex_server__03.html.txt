@@ -1,0 +1,126 @@
+
+	
+<description>
+The `kexgex_server` function is a callback function used in the SSH key exchange process. It is responsible for handling the SSH2_MSG_KEX_DH_GEX_REQUEST message from the client. The function is assigned to the `kex` array within the `ssh` struct and is called when the corresponding key exchange algorithm is selected. To fuzz this function, it is necessary to first set up the `ssh` struct as a server, and then call `kex_setup` to initialize the key exchange process. The `kexgex_server` function will then be called when the fuzzer provides the SSH2_MSG_KEX_DH_GEX_REQUEST message as input.
+</description>
+<requirements>
+
+<requirement>
+The `ssh` struct should be initialized as a server. This is because `kexgex_server` is only used on the server side of the SSH protocol.
+</requirement>
+<requirement>
+The `kex_setup` function must be called before calling `kexgex_server`. This function initializes the key exchange process and sets up the necessary state for `kexgex_server` to be called.
+</requirement>
+<requirement>
+A valid `proposal` array must be passed to `kex_setup`. The `kex_proposal_populate_entries` function can be used to create a valid proposal, using the values from `KEX_SERVER` as a default.
+</requirement>
+<requirement>
+The input to the fuzzer should be the SSH2_MSG_KEX_DH_GEX_REQUEST message. This is the message that `kexgex_server` is responsible for handling.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kexgex_server(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern "C" {
+#include "includes.h"
+#include "ssh_api.h"
+#include "/src/hpn-ssh/kex.h"
+#include "packet.h"
+#include "sshbuf.h"
+#include "ssherr.h"
+#include "log.h"
+#include "myproposal.h"
+#include "sshkey.h"
+#include "dispatch.h"
+#include "fixed-keys.h"
+
+int kexgex_server(struct ssh *);
+
+static struct sshkey *host_key = NULL;
+
+static void setup_once(void) {
+  if (host_key != NULL)
+    return;
+  struct sshbuf *b = NULL;
+  int r;
+
+  log_init("kexgex_fuzz", SYSLOG_LEVEL_ERROR, SYSLOG_FACILITY_AUTH, 1);
+  if ((b = sshbuf_from(PRIV_RSA, strlen(PRIV_RSA))) == NULL)
+    abort();
+  if ((r = sshkey_parse_private_fileblob(b, "", &host_key, NULL)) != 0) {
+    fprintf(stderr, "sshkey_parse_private_fileblob failed: %s\n", ssh_err(r));
+    abort();
+  }
+  sshbuf_free(b);
+}
+} // extern "C"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  setup_once();
+
+  FuzzedDataProvider provider(data, size);
+  struct ssh *ssh = NULL;
+  char *proposal[PROPOSAL_MAX] = {0};
+  int r;
+
+  if (ssh_init(&ssh, 1, NULL) != 0) /* is_server = 1 */
+    return 0;
+
+  if (ssh_add_hostkey(ssh, host_key) != 0) {
+    ssh_free(ssh);
+    return 0;
+  }
+
+  kex_proposal_populate_entries(ssh, proposal, "diffie-hellman-group-exchange-sha256", NULL, NULL, NULL, NULL);
+
+  /* kex_setup will call kexgex_server for GEX algorithms */
+  if ((r = kex_setup(ssh, proposal)) != 0) {
+    kex_prop_free(proposal);
+    ssh_free(ssh);
+    return 0;
+  }
+  kex_prop_free(proposal);
+
+  /*
+   * After kex_setup, the dispatch for SSH2_MSG_KEX_DH_GEX_REQUEST
+   * should be set to input_kex_dh_gex_request. We can now fuzz it.
+   */
+  if (ssh->kex == NULL || ssh->dispatch[SSH2_MSG_KEX_DH_GEX_REQUEST] == NULL || ssh->dispatch[SSH2_MSG_KEX_DH_GEX_REQUEST] == kex_protocol_error) {
+    ssh_free(ssh);
+    return 0;
+  }
+
+  struct sshbuf *input = (struct sshbuf *)ssh_packet_get_input(ssh);
+  sshbuf_reset(input);
+
+  std::vector<uint8_t> packet_body = provider.ConsumeRemainingBytes<uint8_t>();
+  if (sshbuf_put(input, packet_body.data(), packet_body.size()) != 0) {
+    ssh_free(ssh);
+    return 0;
+  }
+
+  /*
+   * Directly call the handler for the packet we've prepared.
+   * The handler will read from the 'input' buffer we just filled.
+   */
+  ssh->dispatch[SSH2_MSG_KEX_DH_GEX_REQUEST](SSH2_MSG_KEX_DH_GEX_REQUEST, 0, ssh);
+
+  ssh_free(ssh);
+  return 0;
+}
+	

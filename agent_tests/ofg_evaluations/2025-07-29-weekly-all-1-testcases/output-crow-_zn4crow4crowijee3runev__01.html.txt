@@ -1,0 +1,130 @@
+
+	
+<description>
+The `crow::Crow<>::run()` function starts the Crow web server. It can be configured to run in one of three modes: TCP, Unix socket, or SSL. The behavior of the `run` function is primarily determined by the values of the member variables of the `crow::Crow` object, which can be set using various member functions.
+
+In TCP mode, the server listens on a TCP socket. This requires `bindaddr_` to be a valid IP address and `port_` to be a valid port number.
+
+In Unix socket mode, the server listens on a Unix domain socket. This is enabled by calling the `local_socket_path()` member function, which sets the `use_unix_` flag to true and sets `bindaddr_` to the provided socket path.
+
+In SSL mode, the server listens on a TCP socket with SSL encryption. This is enabled by using one of the `ssl_file()`, `ssl_chainfile()`, or `ssl()` member functions to configure the SSL context. In this mode, `bindaddr_` must be a valid IP address and `port_` a valid port.
+
+The `run` function also sets up signal handlers based on the `signals_` vector and can execute a periodic function defined by `tick_interval_` and `tick_function_`. The number of threads can be configured with `concurrency()`.
+</description>
+<requirements>
+
+<requirement>
+The `bindaddr()` member function should be called to set a valid IP address string for the `bindaddr_` member variable. This is necessary because an invalid IP address will cause the server to fail to start.
+</requirement>
+<requirement>
+The `port()` member function should be called to set a valid port number for the `port_` member variable. This ensures the server listens on the correct port.
+</requirement>
+<requirement>
+To use a Unix socket, the `local_socket_path()` member function should be called with a valid file path. This will set the `use_unix_` flag to true, and the server will use the provided path for the Unix socket.
+</requirement>
+<requirement>
+To enable SSL, the `ssl_file()` or `ssl_chainfile()` member functions must be called with valid paths to certificate and key files. This is required for the SSL server to be initialized correctly.
+</requirement>
+<requirement>
+The `tick()` member function can be used to set a periodic callback function. The first argument should be a `std::chrono::duration` and the second a `std::function<void()>`.
+</requirement>
+<requirement>
+The `concurrency()` member function should be called with a value of at least 2 to run the server on multiple threads. This is because the minimum number of threads for a Crow server is 2.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void crow::Crow<>::run()
+</function_signature>
+<project_name>
+crow
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include "crow.h"
+#include <thread>
+#include <chrono>
+#include <string>
+#include <vector>
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    crow::SimpleApp app;
+
+    // Set concurrency. Crow requires at least 2 threads for the server to run.
+    app.concurrency(fdp.ConsumeIntegralInRange<unsigned int>(2, 8));
+
+    // Add a simple route so the server has something to handle.
+    CROW_ROUTE(app, "/")([]{
+        return "Hello, fuzzer!";
+    });
+
+    // Optionally set a tick function with a fuzzed interval.
+    if (fdp.ConsumeBool()) {
+        app.tick(std::chrono::milliseconds(fdp.ConsumeIntegralInRange<int>(1, 50)), []{});
+    }
+
+    // Decide which server mode to fuzz.
+    enum class ServerMode { TCP, UNIX, SSL };
+    
+    uint8_t mode_index;
+#ifdef CROW_ENABLE_SSL
+    mode_index = fdp.ConsumeIntegralInRange<uint8_t>(0, 2);
+#else
+    mode_index = fdp.ConsumeIntegralInRange<uint8_t>(0, 1);
+#endif
+
+    ServerMode mode = static_cast<ServerMode>(mode_index);
+
+    switch(mode) {
+        case ServerMode::TCP:
+            // Use port 0 to let the OS pick an ephemeral port.
+            app.port(0).bindaddr("127.0.0.1");
+            break;
+        case ServerMode::UNIX:
+            // Use a path in /tmp to avoid filesystem permission issues.
+            app.local_socket_path("/tmp/crow_fuzz_" + fdp.ConsumeRandomLengthString(16) + ".sock");
+            break;
+#ifdef CROW_ENABLE_SSL
+        case ServerMode::SSL:
+            // SSL needs cert and key files. Fuzzing the paths will test error handling
+            // when files are not found or are invalid.
+            app.port(0).bindaddr("127.0.0.1");
+            {
+                std::string cert_file = fdp.ConsumeRandomLengthString(64);
+                std::string key_file = fdp.ConsumeRandomLengthString(64);
+                app.ssl_file(cert_file, key_file);
+            }
+            break;
+#endif
+    }
+
+    std::thread server_thread;
+
+    // The run() method blocks, so it must be run in a separate thread.
+    // It can also throw exceptions during setup, which must be caught inside the thread.
+    server_thread = std::thread([&](){
+        try {
+            app.run();
+        } catch (const std::exception& e) {
+            // Catch exceptions during setup/run and continue.
+        }
+    });
+
+    // Give the server a moment to attempt to start up before stopping it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    app.stop();
+
+    if (server_thread.joinable()) {
+        server_thread.join();
+    }
+
+    return 0;
+}
+	

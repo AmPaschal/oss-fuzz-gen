@@ -1,0 +1,129 @@
+
+	
+<description>
+The function `usbredirparser_send_filter_filter` sends a filter to the peer. It takes a usbredirparser, an array of filter rules, and the number of rules as input. The function first checks if the peer has the `usb_redir_cap_filter` capability. If it does, it converts the filter rules to a string and sends it to the peer.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `parser_pub`, should be a valid pointer to a `usbredirparser` struct initialized by `usbredirparser_new`. This is because the function casts it to an internal private struct and accesses its members.
+</requirement>
+<requirement>
+The peer associated with the parser must have the `usb_redir_cap_filter` capability. The function returns without doing anything if the peer does not have this capability.
+</requirement>
+<requirement>
+The second argument, `rules`, should be a valid pointer to an array of `usbredirfilter_rule` structs. The `usbredirfilter_string_to_rules` function can be used to generate valid rules from a string.
+</requirement>
+<requirement>
+The `device_class` member of each `usbredirfilter_rule` struct should be in the range [0, 255] or -1. This is to ensure that the filter rule is valid and can be correctly interpreted.
+</requirement>
+<requirement>
+The `vendor_id`, `product_id`, and `device_version_bcd` members of each `usbredirfilter_rule` struct should be in the range [0, 65535] or -1. This is to ensure that the filter rule is valid and can be correctly interpreted.
+</requirement>
+<requirement>
+The third argument, `rules_count`, must be the number of elements in the `rules` array. This is to prevent out-of-bounds reads when converting the rules to a string.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void usbredirparser_send_filter_filter(struct usbredirparser *, const struct usbredirfilter_rule *, int)
+</function_signature>
+<project_name>
+spice-usbredir
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <memory>
+#include <string>
+#include <vector>
+#include <array>
+
+#include "usbredirfilter.h"
+#include "usbredirparser.h"
+#include "usbredirproto.h"
+
+namespace {
+
+// Deleter for usbredirparser
+struct ParserDeleter {
+  void operator()(struct usbredirparser *p) {
+    if (p) {
+      usbredirparser_destroy(p);
+    }
+  }
+};
+
+// Deleter for usbredirfilter_rule
+struct FilterRuleDeleter {
+    void operator()(void *ptr) {
+        usbredirfilter_free(ptr);
+    }
+};
+
+// Dummy write function to satisfy the parser's potential need for it.
+int dummy_write(void *priv, uint8_t *data, int count) {
+    // Consume the data to prevent the compiler from optimizing it out
+    volatile uint8_t sink = 0;
+    for (int i = 0; i < count; i++) {
+        sink = data[i];
+    }
+    (void)sink;
+    return count;
+}
+
+} // namespace
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    // 1. Create and initialize the parser
+    std::unique_ptr<usbredirparser, ParserDeleter> parser(usbredirparser_create());
+    if (!parser) {
+        return 0;
+    }
+
+    // Set the required capability for the filter function to proceed.
+    std::array<uint32_t, USB_REDIR_CAPS_SIZE> caps = {0};
+    caps[usb_redir_cap_filter / 32] |= (1 << (usb_redir_cap_filter % 32));
+
+    // Initialize the parser
+    usbredirparser_init(parser.get(), "fuzzer", caps.data(), caps.size(), 0);
+
+    // Set a dummy write function to be safe, as queueing might trigger writes.
+    parser->write_func = dummy_write;
+
+    // 2. Generate filter rules from fuzzed data
+    std::unique_ptr<usbredirfilter_rule, FilterRuleDeleter> rules;
+    int rules_count = 0;
+
+    const std::string filter_string = fdp.ConsumeRandomLengthString();
+    const std::string token_sep = fdp.ConsumeBytesAsString(1);
+    const std::string rule_sep = fdp.ConsumeBytesAsString(1);
+
+    usbredirfilter_rule *rules_ptr = nullptr;
+    int ret = usbredirfilter_string_to_rules(
+        filter_string.c_str(),
+        token_sep.c_str(),
+        rule_sep.c_str(),
+        &rules_ptr, &rules_count);
+
+    if (ret != 0 || rules_ptr == nullptr) {
+        return 0;
+    }
+    rules.reset(rules_ptr);
+
+    // 3. Call the function under test
+    usbredirparser_send_filter_filter(parser.get(), rules.get(), rules_count);
+
+    // Try to write out any queued data
+    if (usbredirparser_has_data_to_write(parser.get())) {
+        usbredirparser_do_write(parser.get());
+    }
+
+    return 0;
+}
+	

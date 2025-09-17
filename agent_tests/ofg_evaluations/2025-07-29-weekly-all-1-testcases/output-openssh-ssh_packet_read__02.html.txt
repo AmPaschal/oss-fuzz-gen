@@ -1,0 +1,252 @@
+
+	
+<description>
+The `ssh_packet_read` function reads a packet from the SSH connection. It is a wrapper around `ssh_packet_read_seqnr`, which handles the low-level details of reading from the socket, parsing the packet length, and handling timeouts. This function is fundamental to the SSH protocol, as it is the primary means of receiving data from the remote party.
+</description>
+<requirements>
+<requirement>
+The ssh object must be initialized by calling `ssh_init`. This function allocates and initializes the necessary structures for an SSH session.
+</requirement>
+<requirement>
+A connection must be established before calling `ssh_packet_read`. The `ssh->state->connection_in` file descriptor must be a valid, readable file descriptor, typically a socket connected to an SSH server or a pipe for testing purposes.
+</requirement>
+<requirement>
+The SSH handshake must be completed before calling `ssh_packet_read`. This includes exchanging protocol banners with the remote server via `ssh_send_banner` and `ssh_read_banner`.
+</requirement>
+<requirement>
+The `ssh->state` pointer must be a valid, initialized `session_state` structure. This is handled by `ssh_init` and subsequent connection setup functions.
+</requirement>
+<requirement>
+Input data must be available on the file descriptor `ssh->state->connection_in`. The fuzzer should provide data that represents valid or malformed SSH packets to this file descriptor to effectively test the packet parsing logic.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int ssh_packet_read(struct ssh *)
+</function_signature>
+<project_name>
+openssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <sys/types.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+extern "C" {
+
+#include "includes.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "packet.h"
+#include "myproposal.h"
+#include "xmalloc.h"
+#include "authfile.h"
+#include "log.h"
+#include "fixed-keys.h"
+
+// Helper functions adapted from kex_fuzz.cc to set up a key exchange.
+
+struct shared_state {
+	size_t nkeys;
+	struct sshkey **privkeys, **pubkeys;
+};
+
+static void
+store_key(struct shared_state *st, struct sshkey *pubkey,
+    struct sshkey *privkey)
+{
+	if (st == NULL || pubkey->type < 0 || pubkey->type > INT_MAX ||
+	    privkey->type != pubkey->type ||
+	    ((size_t)pubkey->type < st->nkeys &&
+	     st->pubkeys[pubkey->type] != NULL))
+		abort();
+	if ((size_t)pubkey->type >= st->nkeys) {
+		st->pubkeys = (struct sshkey **)xrecallocarray(st->pubkeys,
+		    st->nkeys, pubkey->type + 1, sizeof(*st->pubkeys));
+		st->privkeys = (struct sshkey **)xrecallocarray(st->privkeys,
+		    st->nkeys, privkey->type + 1, sizeof(*st->privkeys));
+		st->nkeys = privkey->type + 1;
+	}
+	st->pubkeys[pubkey->type] = pubkey;
+	st->privkeys[privkey->type] = privkey;
+}
+
+static int
+prepare_key_from_blob(struct shared_state *st, int kt)
+{
+	const char *pubstr = NULL, *privstr = NULL;
+	char *tmp, *cp;
+	struct sshkey *privkey = NULL, *pubkey = NULL;
+	struct sshbuf *b = NULL;
+	int r;
+
+	switch (kt) {
+	case KEY_RSA:
+		pubstr = PUB_RSA; privstr = PRIV_RSA; break;
+	case KEY_ECDSA:
+		pubstr = PUB_ECDSA; privstr = PRIV_ECDSA; break;
+	case KEY_ED25519:
+		pubstr = PUB_ED25519; privstr = PRIV_ED25519; break;
+	default:
+		abort();
+	}
+	if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+		abort();
+	if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0)
+		abort();
+	sshbuf_free(b);
+	tmp = cp = xstrdup(pubstr);
+	if ((pubkey = sshkey_new(KEY_UNSPEC)) == NULL)
+		abort();
+	if ((r = sshkey_read(pubkey, &cp)) != 0)
+		abort();
+	free(tmp);
+	store_key(st, pubkey, privkey);
+	return 0;
+}
+
+static int
+prepare_keys(struct shared_state *st)
+{
+	if (prepare_key_from_blob(st, KEY_RSA) != 0 ||
+	    prepare_key_from_blob(st, KEY_ECDSA) != 0 ||
+	    prepare_key_from_blob(st, KEY_ED25519) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static int
+do_send_and_receive(struct ssh *from, struct ssh *to, int clobber_to)
+{
+	u_char type;
+	size_t len;
+	const u_char *buf;
+	int r;
+
+	for (;;) {
+		if ((r = ssh_packet_next(from, &type)) != 0)
+			return r;
+		if (type != 0)
+			return 0; // No more packets for now
+		buf = ssh_output_ptr(from, &len);
+		if (len == 0)
+			return 0; // No more data
+		if ((r = ssh_output_consume(from, len)) != 0)
+			return r;
+		if (!clobber_to && (r = ssh_input_append(to, buf, len)) != 0)
+			return r;
+	}
+}
+
+static int
+run_kex(struct ssh *client, struct ssh *server, const uint8_t *kex_data, size_t kex_size)
+{
+	int r = 0;
+
+	if (kex_size > 0) {
+		if ((r = ssh_input_append(server, kex_data, kex_size)) != 0)
+			return r;
+	}
+
+	while (!server->kex->done || !client->kex->done) {
+		if ((r = do_send_and_receive(server, client, 0)) != 0)
+			break;
+		if ((r = do_send_and_receive(client, server, kex_size > 0)) != 0)
+			break;
+		// Break if stalled
+		if (sshbuf_len((const struct sshbuf *)ssh_packet_get_output(server)) == 0 &&
+		    sshbuf_len((const struct sshbuf *)ssh_packet_get_output(client)) == 0) {
+			r = SSH_ERR_PROTOCOL_ERROR;
+			break;
+		}
+	}
+	return r;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	static struct shared_state *st = NULL;
+	struct ssh *client = NULL, *server = NULL;
+	struct kex_params kex_params;
+	char *myproposal[PROPOSAL_MAX] = { NULL };
+	const char *base_proposal[] = { KEX_CLIENT };
+	int i, r;
+	int fds[2] = {-1, -1};
+	std::vector<uint8_t> kex_data;
+	std::vector<uint8_t> packet_data;
+
+	if (st == NULL) {
+		log_init("packet_read_fuzz", SYSLOG_LEVEL_ERROR,
+		    SYSLOG_FACILITY_AUTH, 1);
+		st = (struct shared_state *)xcalloc(1, sizeof(*st));
+		if (prepare_keys(st) != 0)
+			abort();
+	}
+
+	FuzzedDataProvider provider(data, size);
+	kex_data = provider.ConsumeBytes<uint8_t>(
+	    provider.ConsumeIntegralInRange<size_t>(0, 1024));
+
+	for (i = 0; i < PROPOSAL_MAX; i++) {
+		if ((myproposal[i] = strdup(base_proposal[i])) == NULL)
+			goto out;
+	}
+	free(myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS]);
+	myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = strdup("ssh-ed25519,ecdsa-sha2-nistp256,ssh-rsa");
+	if (myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] == NULL)
+		goto out;
+
+	memcpy(kex_params.proposal, myproposal, sizeof(kex_params.proposal));
+
+	if ((r = ssh_init(&client, 0, &kex_params)) != 0 ||
+	    (r = ssh_init(&server, 1, &kex_params)) != 0)
+		goto out;
+
+	if ((r = ssh_add_hostkey(server, st->privkeys[KEY_ED25519])) != 0 ||
+	    (r = ssh_add_hostkey(client, st->pubkeys[KEY_ED25519])) != 0)
+		goto out;
+
+	if (run_kex(client, server, kex_data.data(), kex_data.size()) != 0)
+		goto out;
+
+	// KEX succeeded, now fuzz ssh_packet_read
+	packet_data = provider.ConsumeRemainingBytes<uint8_t>();
+	if (packet_data.empty())
+		goto out;
+
+	if (pipe(fds) != 0)
+		goto out;
+
+	ssh_packet_set_connection(server, fds[0], fds[1]);
+	if (write(fds[1], packet_data.data(), packet_data.size()) == -1) {
+		// Ignore errors from write, e.g. if the pipe is full
+	}
+	close(fds[1]);
+	fds[1] = -1;
+
+	// This may call fatal(), which is expected.
+	ssh_packet_read(server);
+
+out:
+	for (i = 0; i < PROPOSAL_MAX; i++)
+		free(myproposal[i]);
+	ssh_free(client);
+	ssh_free(server);
+	if (fds[0] != -1)
+		close(fds[0]);
+	if (fds[1] != -1)
+		close(fds[1]);
+	return 0;
+}
+
+} // extern "C"
+	

@@ -1,0 +1,191 @@
+
+	
+<description>
+The function `kex_gen_client` is responsible for generating the client's ephemeral key pair for various key exchange methods in the SSH protocol. It is a part of the client-side key exchange process. The function is not called directly, but is assigned to a function pointer in the `ssh->kex->kex` array, and is called when the key exchange is initiated by the client. The specific key generation method is determined by the `kex->kex_type` field. After generating the key, it sends the public part to the server in a `SSH2_MSG_KEX_ECDH_INIT` message and sets a handler for the server's reply.
+</description>
+<requirements>
+
+<requirement>
+The ssh->kex pointer must be initialized by calling kex_new. This is because kex_gen_client accesses members of the kex struct, and kex_new allocates and initializes this structure.
+</requirement>
+<requirement>
+The ssh->kex->kex_type must be set to one of the supported key exchange methods (e.g., KEX_DH_GRP1_SHA1, KEX_ECDH_SHA2, etc.). This value determines the code path to be executed within the function's switch statement.
+</requirement>
+<requirement>
+For Diffie-Hellman (DH) based key exchanges, the ssh->kex->dh field must be initialized to a valid DH object. This is because the kex_dh_keypair function, which is called for DH methods, uses this object to generate the key pair.
+</requirement>
+<requirement>
+For Elliptic-Curve Diffie-Hellman (ECDH) based key exchanges, the ssh->kex->ec_group field must be initialized with a valid EC_GROUP object. The kex_ecdh_keypair function uses this to determine the elliptic curve for key generation.
+</requirement>
+<requirement>
+The ssh->kex->client_pub buffer must be a valid sshbuf. The generated public key is written to this buffer, so it must be properly allocated to prevent memory errors. This is handled by kex_new().
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_gen_client(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+extern "C" {
+#include "includes.h"
+#include "ssh.h"
+#include "kex.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "ssherr.h"
+#include "log.h"
+#include "packet.h"
+}
+
+// ssh_init calls seed_rng, which is not in the public API.
+// Provide a weak stub to satisfy the linker.
+extern "C" void seed_rng(void) __attribute__((weak));
+extern "C" void seed_rng(void) {}
+
+// Copied from myproposal.h to avoid include/dependency issues.
+static const char * const fuzzer_proposal[PROPOSAL_MAX] = {
+	"sntrup761x25519-sha512@openssh.com,"
+	"mlkem768x25519-sha256@openssh.com,"
+	"curve25519-sha256,"
+	"curve25519-sha256@libssh.org,"
+	"ecdh-sha2-nistp256,"
+	"ecdh-sha2-nistp384,"
+	"ecdh-sha2-nistp521,"
+	"diffie-hellman-group-exchange-sha256,"
+	"diffie-hellman-group18-sha512,"
+	"diffie-hellman-group16-sha512,"
+	"diffie-hellman-group14-sha256,"
+	"diffie-hellman-group14-sha1,"
+	"diffie-hellman-group1-sha1", // KEX
+	"ssh-ed25519-cert-v01@openssh.com,"
+	"ecdsa-sha2-nistp256-cert-v01@openssh.com,"
+	"ecdsa-sha2-nistp384-cert-v01@openssh.com,"
+	"ecdsa-sha2-nistp521-cert-v01@openssh.com,"
+	"sk-ssh-ed25519-cert-v01@openssh.com,"
+	"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,"
+	"rsa-sha2-512-cert-v01@openssh.com,"
+	"rsa-sha2-256-cert-v01@openssh.com,"
+	"ssh-ed25519,"
+	"ecdsa-sha2-nistp256,"
+	"ecdsa-sha2-nistp384,"
+	"ecdsa-sha2-nistp521,"
+	"sk-ssh-ed25519@openssh.com,"
+	"sk-ecdsa-sha2-nistp256@openssh.com,"
+	"rsa-sha2-512,"
+	"rsa-sha2-256", // PK
+	"chacha20-poly1305@openssh.com,"
+	"aes128-ctr,aes192-ctr,aes256-ctr,"
+	"aes128-gcm@openssh.com,aes256-gcm@openssh.com", // Ciphers CTOS
+	"chacha20-poly1305@openssh.com,"
+	"aes128-ctr,aes192-ctr,aes256-ctr,"
+	"aes128-gcm@openssh.com,aes256-gcm@openssh.com", // Ciphers STOC
+	"umac-64-etm@openssh.com,"
+	"umac-128-etm@openssh.com,"
+	"hmac-sha2-256-etm@openssh.com,"
+	"hmac-sha2-512-etm@openssh.com,"
+	"hmac-sha1-etm@openssh.com,"
+	"umac-64@openssh.com,"
+	"umac-128@openssh.com,"
+	"hmac-sha2-256,"
+	"hmac-sha2-512,"
+	"hmac-sha1", // MACs CTOS
+	"umac-64-etm@openssh.com,"
+	"umac-128-etm@openssh.com,"
+	"hmac-sha2-256-etm@openssh.com,"
+	"hmac-sha2-512-etm@openssh.com,"
+	"hmac-sha1-etm@openssh.com,"
+	"umac-64@openssh.com,"
+	"umac-128@openssh.com,"
+	"hmac-sha2-256,"
+	"hmac-sha2-512,"
+	"hmac-sha1", // MACs STOC
+	"none,zlib@openssh.com", // Compression CTOS
+	"none,zlib@openssh.com", // Compression STOC
+	"", // Languages CTOS
+	""  // Languages STOC
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Use the correct string literal definitions from kex.h
+  const char *const kex_algs[] = {
+#ifdef WITH_OPENSSL
+      "diffie-hellman-group1-sha1",
+      "diffie-hellman-group14-sha1",
+      "diffie-hellman-group14-sha256",
+      "diffie-hellman-group16-sha512",
+      "diffie-hellman-group18-sha512",
+      "ecdh-sha2-nistp256",
+      "ecdh-sha2-nistp384",
+      "ecdh-sha2-nistp521",
+#endif
+      "curve25519-sha256",
+      "curve25519-sha256@libssh.org",
+      "sntrup761x25519-sha512",
+      "mlkem768x25519-sha256",
+  };
+
+  if (size < 1) {
+    return 0;
+  }
+
+  static bool log_initialized = false;
+  if (!log_initialized) {
+    log_init("fuzz", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_AUTH, 1);
+    log_initialized = true;
+  }
+
+  struct ssh *client = NULL;
+  struct kex_params kex_params;
+  char *proposal_kex_alg = NULL;
+  int r;
+
+  memset(&kex_params, 0, sizeof(kex_params));
+  memcpy(kex_params.proposal, fuzzer_proposal, sizeof(kex_params.proposal));
+  
+  const char *kex_alg_choice = provider.PickValueInArray<const char *>(kex_algs);
+  proposal_kex_alg = strdup(kex_alg_choice);
+  if (proposal_kex_alg == NULL) {
+    return 0;
+  }
+  kex_params.proposal[PROPOSAL_KEX_ALGS] = proposal_kex_alg;
+
+  r = ssh_init(&client, 0 /* is_server */, &kex_params);
+  if (r != 0) {
+    free(proposal_kex_alg);
+    if (client) {
+        ssh_free(client);
+    }
+    return 0;
+  }
+
+  const std::string banner = "SSH-2.0-Fuzz\r\n";
+  if (ssh_input_append(client, (const uint8_t*)banner.c_str(), banner.size()) != 0) {
+      goto cleanup;
+  }
+  
+  (void)kex_gen_client(client);
+
+cleanup:
+  free(proposal_kex_alg);
+  if (client) {
+    ssh_free(client);
+  }
+
+  return 0;
+}
+	

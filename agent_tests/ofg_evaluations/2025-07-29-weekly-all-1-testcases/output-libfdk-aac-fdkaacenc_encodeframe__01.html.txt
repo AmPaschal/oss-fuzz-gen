@@ -1,0 +1,137 @@
+
+	
+<description>
+The FDKaacEnc_EncodeFrame function is the core encoding function of the AAC library. It takes an encoder handle, a transport encoder handle, an input buffer of PCM audio samples, and other parameters to produce an encoded AAC frame. It performs psychoacoustic analysis, quantization, and bitstream formatting. The caller, aacEncEncode, performs significant setup, including initializing the encoder and transport handles, managing input buffers, and preparing metadata and other extension payloads.
+</description>
+<requirements>
+
+<requirement>
+The `hAacEnc` handle must be initialized by calling `aacEncOpen` followed by `aacEncInit`. This is because `aacEncOpen` allocates the encoder and `aacEncInit` initializes its state, which is essential for `FDKaacEnc_EncodeFrame` to operate correctly.
+</requirement>
+<requirement>
+The `hTpEnc` handle must be initialized by calling `transportEnc_Open` and `transportEnc_Init`. This is because these functions allocate and initialize the transport encoder, which is used for bitstream writing and formatting.
+</requirement>
+<requirement>
+The `inputBuffer` must point to a valid memory region containing PCM audio samples. This is because the function reads from this buffer to perform encoding.
+</requirement>
+<requirement>
+The `inputBufferBufSize` argument should be the size of the `inputBuffer` in bytes. This is because this argument is used to prevent buffer overflows when reading from `inputBuffer`.
+</requirement>
+<requirement>
+The `nOutBytes` argument must point to a valid integer. This is because the function writes the size of the encoded frame to this location.
+</requirement>
+<requirement>
+The `extPayload` array must be initialized. The caller `aacEncEncode` initializes this array and its elements, which are then used in the target function to add extension data to the bitstream. Therefore, `extPayload` should not be a raw fuzzed input.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+AAC_ENCODER_ERROR FDKaacEnc_EncodeFrame(HANDLE_AAC_ENC, HANDLE_TRANSPORTENC, INT_PCM *, const UINT, INT *, AACENC_EXT_PAYLOAD *)
+</function_signature>
+<project_name>
+libfdk-aac
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include "aacenc_lib.h"
+#include "/src/aac/libAACenc/src/aacenc.h"
+
+#include <vector>
+#include <cstdint>
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 20) {
+        return 0;
+    }
+
+    FuzzedDataProvider provider(data, size);
+    HANDLE_AACENCODER hAacEncoder = NULL;
+
+    if (aacEncOpen(&hAacEncoder, 0, 0) != AACENC_OK) {
+        return 0;
+    }
+
+    const AUDIO_OBJECT_TYPE aots[] = { AOT_AAC_LC, AOT_SBR, AOT_PS, AOT_ER_AAC_LD, AOT_ER_AAC_ELD };
+    aacEncoder_SetParam(hAacEncoder, AACENC_AOT, provider.PickValueInArray(aots));
+
+    const int sampleRates[] = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
+    aacEncoder_SetParam(hAacEncoder, AACENC_SAMPLERATE, provider.PickValueInArray(sampleRates));
+
+    const CHANNEL_MODE channelModes[] = { MODE_1, MODE_2 };
+    aacEncoder_SetParam(hAacEncoder, AACENC_CHANNELMODE, provider.PickValueInArray(channelModes));
+    
+    aacEncoder_SetParam(hAacEncoder, AACENC_BITRATE, provider.ConsumeIntegralInRange<int>(8000, 256000));
+    
+    const TRANSPORT_TYPE transportTypes[] = { TT_MP4_RAW, TT_MP4_ADIF, TT_MP4_ADTS, TT_MP4_LATM_MCP1, TT_MP4_LOAS };
+    aacEncoder_SetParam(hAacEncoder, AACENC_TRANSMUX, provider.PickValueInArray(transportTypes));
+
+    aacEncoder_SetParam(hAacEncoder, AACENC_AFTERBURNER, provider.ConsumeBool());
+
+    if (aacEncEncode(hAacEncoder, NULL, NULL, NULL, NULL) != AACENC_OK) {
+        aacEncClose(&hAacEncoder);
+        return 0;
+    }
+
+    AACENC_InfoStruct info = {0};
+    if (aacEncInfo(hAacEncoder, &info) != AACENC_OK || info.maxOutBufBytes == 0) {
+        aacEncClose(&hAacEncoder);
+        return 0;
+    }
+
+    std::vector<uint8_t> outBuffer(info.maxOutBufBytes);
+    
+    AACENC_BufDesc inBufDesc, outBufDesc;
+    AACENC_InArgs inArgs;
+    AACENC_OutArgs outArgs;
+    
+    void *outBufs[] = {outBuffer.data()};
+    int outBufIds[] = {OUT_BITSTREAM_DATA};
+    int outBufSizes[] = {(int)outBuffer.size()};
+    int outBufElSizes[] = {sizeof(uint8_t)};
+    outBufDesc.numBufs = 1;
+    outBufDesc.bufs = outBufs;
+    outBufDesc.bufferIdentifiers = outBufIds;
+    outBufDesc.bufSizes = outBufSizes;
+    outBufDesc.bufElSizes = outBufElSizes;
+
+    void *inBufs[1];
+    int inBufIds[] = {IN_AUDIO_DATA};
+    int inBufSizes[1];
+    int inBufElSizes[] = {sizeof(INT_PCM)};
+    inBufDesc.numBufs = 1;
+    inBufDesc.bufs = inBufs;
+    inBufDesc.bufferIdentifiers = inBufIds;
+    inBufDesc.bufSizes = inBufSizes;
+    inBufDesc.bufElSizes = inBufElSizes;
+
+    while (provider.remaining_bytes() > 0) {
+        std::vector<uint8_t> pcm_chunk = provider.ConsumeBytes<uint8_t>(provider.ConsumeIntegralInRange<size_t>(1, provider.remaining_bytes()));
+        
+        if (pcm_chunk.size() < sizeof(INT_PCM)) {
+            continue;
+        }
+
+        inBufs[0] = pcm_chunk.data();
+        inBufSizes[0] = pcm_chunk.size();
+        
+        inArgs.numInSamples = pcm_chunk.size() / sizeof(INT_PCM);
+        inArgs.numAncBytes = 0;
+
+        AACENC_ERROR err = aacEncEncode(hAacEncoder, &inBufDesc, &outBufDesc, &inArgs, &outArgs);
+        if (err != AACENC_OK) {
+            break;
+        }
+    }
+
+    inArgs.numInSamples = -1;
+    aacEncEncode(hAacEncoder, NULL, &outBufDesc, &inArgs, &outArgs);
+
+    aacEncClose(&hAacEncoder);
+
+    return 0;
+}
+	

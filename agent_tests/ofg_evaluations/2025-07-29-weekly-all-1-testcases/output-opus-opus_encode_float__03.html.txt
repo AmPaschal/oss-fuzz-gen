@@ -1,0 +1,106 @@
+
+	
+<description>
+The opus_encode_float function encodes an Opus frame from floating-point input. It takes an OpusEncoder state, a buffer of PCM audio data, the frame size, an output buffer for the encoded data, and the maximum size of the output buffer.
+
+The function first determines the frame size to use based on the `analysis_frame_size` and the encoder's `variable_duration` setting. It then converts the input PCM data from float to an internal representation. Finally, it calls the internal `opus_encode_native` function to perform the actual encoding.
+
+The `OpusEncoder` state (`st`) must be created by `opus_encoder_create` and can be configured using `opus_encoder_ctl`. The `analysis_frame_size` parameter is constrained by the sample rate (`Fs`) and the `variable_duration` setting in the encoder state. The `pcm` buffer must be large enough to hold the input audio frame, and the `data` buffer must be large enough for the encoded output. The `max_data_bytes` parameter should be set to a sufficiently large value to prevent buffer overflows. A value of 4000 is recommended in the documentation. The callers of this function in the test suite use a variety of values, including the size of a 1500-byte buffer.
+</description>
+<requirements>
+
+<requirement>
+The `st` argument, a pointer to an `OpusEncoder` struct, must be initialized by calling `opus_encoder_create`. This is because `opus_encoder_create` allocates and initializes the encoder state required by `opus_encode_float`.
+</requirement>
+<requirement>
+The `Fs` argument of `opus_encoder_create` must be one of the following values: 8000, 12000, 16000, 24000, or 48000. These are the only sample rates supported by the Opus encoder.
+</requirement>
+<requirement>
+The `channels` argument of `opus_encoder_create` must be either 1 (mono) or 2 (stereo). The encoder only supports one or two audio channels.
+</requirement>
+<requirement>
+The `application` argument of `opus_encoder_create` must be one of `OPUS_APPLICATION_VOIP`, `OPUS_APPLICATION_AUDIO`, or `OPUS_APPLICATION_RESTRICTED_LOWDELAY`. These values configure the encoder for different use-cases.
+</requirement>
+<requirement>
+The `analysis_frame_size` argument must be a valid frame size, which is dependent on the sample rate `Fs`. Valid frame sizes correspond to frame durations of 2.5, 5, 10, 20, 40, or 60 ms. For example, with a 48000Hz sample rate, `analysis_frame_size` would be one of 120, 240, 480, 960, 1920, or 2880. An invalid frame size will cause `frame_size_select` to return an error, leading to `opus_encode_float` returning `OPUS_BAD_ARG`.
+</requirement>
+<requirement>
+The `pcm` buffer must have a size of at least `analysis_frame_size * st->channels * sizeof(float)`. This is to ensure that the memory access within the for loop that converts the pcm from float to opus_res does not go out of bounds.
+</requirement>
+<requirement>
+The `max_data_bytes` argument must be large enough to hold the encoded data. A value of at least 4000 bytes is recommended to avoid buffer overflows, which is a safe upper bound for opus packets.
+</requirement>
+<requirement>
+The `opus_encoder_ctl` function can be used to configure the encoder after creation with `opus_encoder_create`. The various requests like `OPUS_SET_BITRATE_REQUEST`, `OPUS_SET_COMPLEXITY_REQUEST` and `OPUS_SET_SIGNAL_REQUEST` should be called with valid values as per the documentation to avoid returning `OPUS_BAD_ARG`.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+opus_int32 opus_encode_float(OpusEncoder *, const float *, int, unsigned char *, opus_int32)
+</function_signature>
+<project_name>
+opus
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <vector>
+
+#include "/src/opus/include/opus.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+
+  // Initialize encoder
+  const opus_int32 sample_rates[] = {8000, 12000, 16000, 24000, 48000};
+  opus_int32 Fs = fdp.PickValueInArray(sample_rates);
+
+  int channels = fdp.ConsumeIntegralInRange(1, 2);
+
+  const int applications[] = {OPUS_APPLICATION_VOIP, OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_RESTRICTED_LOWDELAY};
+  int application = fdp.PickValueInArray(applications);
+
+  int error;
+  OpusEncoder *encoder = opus_encoder_create(Fs, channels, application, &error);
+  if (error != OPUS_OK || encoder == nullptr) {
+    return 0;
+  }
+
+  // Set various encoder options
+  opus_encoder_ctl(encoder, OPUS_SET_BITRATE(fdp.ConsumeIntegralInRange(500, 1000000)));
+  opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(fdp.ConsumeIntegralInRange(0, 10)));
+  const int signals[] = {OPUS_AUTO, OPUS_SIGNAL_VOICE, OPUS_SIGNAL_MUSIC};
+  opus_encoder_ctl(encoder, OPUS_SET_SIGNAL(fdp.PickValueInArray(signals)));
+  opus_encoder_ctl(encoder, OPUS_SET_VBR(fdp.ConsumeBool()));
+
+  // Prepare parameters for opus_encode_float
+  const float frame_durations_ms[] = {2.5, 5, 10, 20, 40, 60};
+  float duration_ms = fdp.PickValueInArray(frame_durations_ms);
+  int frame_size = static_cast<int>(Fs * duration_ms / 1000.0f);
+
+  const size_t pcm_size_in_floats = frame_size * channels;
+  const size_t pcm_size_in_bytes = pcm_size_in_floats * sizeof(float);
+
+  std::vector<uint8_t> pcm_raw_data = fdp.ConsumeBytes<uint8_t>(pcm_size_in_bytes);
+  if (pcm_raw_data.size() != pcm_size_in_bytes) {
+    opus_encoder_destroy(encoder);
+    return 0;
+  }
+  const float *pcm = reinterpret_cast<const float *>(pcm_raw_data.data());
+
+  const opus_int32 max_output_bytes = 4000;
+  std::vector<unsigned char> output_buffer(max_output_bytes);
+
+  // Call the function under test
+  opus_encode_float(encoder, pcm, frame_size, output_buffer.data(), max_output_bytes);
+
+  // Cleanup
+  opus_encoder_destroy(encoder);
+
+  return 0;
+}
+	

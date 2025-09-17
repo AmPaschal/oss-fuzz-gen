@@ -1,0 +1,151 @@
+
+	
+<description>
+The `onReady` function is the central event handler for the `Pistache::Tcp::Transport` class. It is invoked by the `Reactor` when I/O events are detected on the file descriptors managed by the transport. The function processes an `Aio::FdSet` object, which contains a collection of events, and dispatches each event to the appropriate handler based on its associated tag and flags. This includes handling events from internal queues for writes, timers, and peers, as well as notifications, incoming data from peers, timer expirations, and writable sockets.
+</description>
+<requirements>
+
+<requirement>
+A `Transport` object must be fully initialized before calling `onReady`. This requires creating a `Tcp::Handler`, a `Reactor`, and then calling the `transport->init(reactor)` method to set up the internal state, including queues and reactor integration.
+</requirement>
+<requirement>
+To test the handling of internal queues, the `FdSet` must contain `Polling::Event` entries with tags corresponding to the `writesQueue`, `timersQueue`, `peersQueue`, and `notifier`. The event flags should indicate readability to ensure the respective `handle...Queue` or `handleNotify` functions are called.
+</requirement>
+<requirement>
+For testing peer-related logic, a `Peer` object should be added to the `Transport`'s peer list via `addPeer`. The `FdSet` must then include a `Polling::Event` with the peer's file descriptor as its tag and the readable flag set, which is necessary to trigger the `handleIncoming` function.
+</requirement>
+<requirement>
+To validate timer handling, a timer should be armed using `armTimer`, and the `FdSet` must contain a `Polling::Event` with the timer's file descriptor as its tag and the readable flag set. This ensures that the `handleTimer` logic is executed.
+</requirement>
+<requirement>
+To test the writable event logic, an entry must be present in the `toWrite` map of the `Transport` object. The `FdSet` should include a `Polling::Event` with the corresponding file descriptor as its tag and the writable flag set, which is required to test the `asyncWriteImpl` code path.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Tcp::Transport::onReady(const FdSet &)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <pistache/async.h>
+#include <pistache/net.h>
+#include <pistache/peer.h>
+#include <pistache/reactor.h>
+#include <pistache/stream.h>
+#include <pistache/tcp.h>
+#include <pistache/transport.h>
+
+// A concrete implementation of the abstract Tcp::Handler class.
+class FuzzHandler : public Pistache::Tcp::Handler {
+public:
+  // Implement the pure virtual onInput method.
+  void onInput(const char * /*buffer*/, size_t /*len*/,
+               const std::shared_ptr<Pistache::Tcp::Peer> & /*peer*/) override {}
+
+  // Implement the pure virtual clone method from the Prototype base class.
+  std::shared_ptr<Pistache::Tcp::Handler> clone() const override {
+    return std::make_shared<FuzzHandler>();
+  }
+};
+
+// A helper class to allow instantiation of the Peer class, which has a
+// protected constructor.
+class FuzzPeer : public Pistache::Tcp::Peer {
+public:
+  FuzzPeer(Pistache::Fd fd, const Pistache::Address &addr, void *ssl)
+      : Pistache::Tcp::Peer(fd, addr, ssl) {}
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Requirement 1: Initialize Transport, Handler, and Reactor.
+  auto tcp_handler = std::make_shared<FuzzHandler>();
+  auto transport = std::make_shared<Pistache::Tcp::Transport>(tcp_handler);
+  auto reactor = Pistache::Aio::Reactor::create();
+
+  try {
+    reactor->init();
+    reactor->addHandler(transport);
+  } catch (...) {
+    return 0;
+  }
+
+  std::vector<Pistache::Polling::Event> events;
+
+  // Requirement 3: Test peer-related logic.
+  if (provider.ConsumeBool()) {
+    try {
+      auto peer_fd = provider.ConsumeIntegral<Pistache::Fd>();
+      Pistache::Address addr(Pistache::Ipv4::any(),
+                             provider.ConsumeIntegral<uint16_t>());
+      auto peer = std::make_shared<FuzzPeer>(peer_fd, addr, nullptr);
+      transport->handleNewPeer(peer);
+      // Fix: Use curly braces to avoid the most vexing parse.
+      Pistache::Polling::Event ev{Pistache::Polling::Tag(peer->fd())};
+      // Fix: Use |= operator to set flags.
+      ev.flags |= Pistache::Polling::NotifyOn::Read;
+      events.emplace_back(std::move(ev));
+    } catch (...) {
+      // Peer creation might fail.
+    }
+  }
+
+  // Requirement 4: Test timer handling.
+  if (provider.ConsumeBool()) {
+    try {
+      auto timer_fd = provider.ConsumeIntegral<Pistache::Fd>();
+      auto deferred = Pistache::Async::Deferred<uint64_t>();
+      transport->armTimer(
+          timer_fd,
+          std::chrono::milliseconds(
+              provider.ConsumeIntegralInRange<uint32_t>(0, 1000)),
+          std::move(deferred));
+      // Fix: Use curly braces to avoid the most vexing parse.
+      Pistache::Polling::Event ev{Pistache::Polling::Tag(timer_fd)};
+      // Fix: Use |= operator to set flags.
+      ev.flags |= Pistache::Polling::NotifyOn::Read;
+      events.emplace_back(std::move(ev));
+    } catch (...) {
+      // Timer creation might fail.
+    }
+  }
+
+  // Requirement 5: Test writable event logic.
+  if (provider.ConsumeBool()) {
+    try {
+      auto write_fd = provider.ConsumeIntegral<Pistache::Fd>();
+      auto str_to_write = provider.ConsumeRandomLengthString();
+      Pistache::RawBuffer buf(str_to_write.data(), str_to_write.size());
+      transport->asyncWrite(write_fd, buf);
+      // Fix: Use curly braces to avoid the most vexing parse.
+      Pistache::Polling::Event ev{Pistache::Polling::Tag(write_fd)};
+      // Fix: Use |= operator to set flags.
+      ev.flags |= Pistache::Polling::NotifyOn::Write;
+      events.emplace_back(std::move(ev));
+    } catch (...) {
+      // Async write might fail.
+    }
+  }
+
+  if (!events.empty()) {
+    Pistache::Aio::FdSet fds(std::move(events));
+    try {
+      transport->onReady(fds);
+    } catch (...) {
+      // onReady can throw exceptions.
+    }
+  }
+
+  reactor->shutdown();
+
+  return 0;
+}
+	

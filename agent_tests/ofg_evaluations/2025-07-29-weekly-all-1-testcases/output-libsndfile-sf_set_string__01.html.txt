@@ -1,0 +1,168 @@
+
+	
+<description>
+The sf_set_string function sets a string in a sound file's metadata. The function takes three arguments: a pointer to a SNDFILE object, an integer representing the string type, and a constant character pointer to the string itself.
+
+The SNDFILE object must be obtained by calling `sf_open()` with the file mode set to `SFM_WRITE` or `SFM_RDWR`. The `VALIDATE_SNDFILE_AND_ASSIGN_PSF` macro ensures that the provided `SNDFILE` pointer is not NULL and is a valid `SNDFILE` handle. The `psf_set_string` function, which is called internally, checks if the file was opened in write mode.
+
+The `str_type` argument must be one of the `SF_STR_*` macros defined in `sndfile.h`. These macros correspond to different metadata fields like title, artist, etc. The `psf_store_string` function validates the `str_type` and returns an error for invalid types.
+
+The `str` argument should be a null-terminated string. It is checked for NULL, and its length is used in various checks and memory operations. For most string types, an empty string is not allowed.
+
+The function stores the provided string in the `psf->strings` data structure, which is part of the `SF_PRIVATE` struct. If a string of the same type already exists, it is overwritten. The function also manages the memory for storing these strings, reallocating as necessary.
+
+The overall workflow for using this function is:
+1. Open a sound file in write or read/write mode using `sf_open()`.
+2. Call `sf_set_string()` one or more times to set metadata strings.
+3. Close the file using `sf_close()`.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `sndfile`, must be a valid pointer to a `SNDFILE` object. This is because the function will crash if it tries to dereference a NULL pointer.
+</requirement>
+<requirement>
+The `SNDFILE` object should be opened in write or read/write mode (i.e., using `SFM_WRITE` or `SFM_RDWR` in the `sf_open` call). This is because the function needs to modify the file's metadata.
+</requirement>
+<requirement>
+The second argument, `str_type`, must be one of the following values: `SF_STR_TITLE`, `SF_STR_COPYRIGHT`, `SF_STR_SOFTWARE`, `SF_STR_ARTIST`, `SF_STR_COMMENT`, `SF_STR_DATE`, `SF_STR_ALBUM`, `SF_STR_LICENSE`, `SF_STR_TRACKNUMBER`, or `SF_STR_GENRE`. Using any other value will result in a `SFE_STR_BAD_TYPE` error.
+</requirement>
+<requirement>
+The third argument, `str`, must be a valid, null-terminated string. A NULL pointer will cause a crash, and a non-null-terminated string can lead to buffer overflows.
+</requirement>
+<requirement>
+The string pointed to by `str` cannot be empty, except when `str_type` is `SF_STR_SOFTWARE`. Providing an empty string for other types will result in a `SFE_STR_BAD_STRING` error.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int sf_set_string(SNDFILE *, int, const char *)
+</function_signature>
+<project_name>
+libsndfile
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <sndfile.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+extern "C" {
+#include "/src/libsndfile/include/sndfile.h"
+}
+
+// Redefine VIO_DATA to use a std::vector for a growable buffer.
+typedef struct {
+  std::vector<uint8_t> data;
+  sf_count_t pos;
+} VIO_DATA;
+
+static sf_count_t vio_get_filelen(void *user_data) {
+  VIO_DATA *p = (VIO_DATA *)user_data;
+  return p->data.size();
+}
+
+static sf_count_t vio_seek(sf_count_t offset, int whence, void *user_data) {
+  VIO_DATA *p = (VIO_DATA *)user_data;
+  sf_count_t new_pos;
+  switch (whence) {
+  case SEEK_SET:
+    new_pos = offset;
+    break;
+  case SEEK_CUR:
+    new_pos = p->pos + offset;
+    break;
+  case SEEK_END:
+    new_pos = p->data.size() + offset;
+    break;
+  default:
+    return p->pos;
+  }
+  if (new_pos < 0) {
+    new_pos = 0;
+  }
+  p->pos = new_pos;
+  return p->pos;
+}
+
+static sf_count_t vio_read(void *ptr, sf_count_t count, void *user_data) {
+  VIO_DATA *p = (VIO_DATA *)user_data;
+  if (p->pos >= (sf_count_t)p->data.size()) {
+    return 0;
+  }
+  if (p->pos + count > (sf_count_t)p->data.size()) {
+    count = p->data.size() - p->pos;
+  }
+  memcpy(ptr, p->data.data() + p->pos, count);
+  p->pos += count;
+  return count;
+}
+
+static sf_count_t vio_write(const void *ptr, sf_count_t count,
+                            void *user_data) {
+  VIO_DATA *p = (VIO_DATA *)user_data;
+  if (p->pos + count > (sf_count_t)p->data.capacity()) {
+    p->data.reserve((p->pos + count) * 2);
+  }
+  if (p->pos + count > (sf_count_t)p->data.size()) {
+    p->data.resize(p->pos + count);
+  }
+  memcpy(p->data.data() + p->pos, ptr, count);
+  p->pos += count;
+  return count;
+}
+
+static sf_count_t vio_tell(void *user_data) {
+  VIO_DATA *p = (VIO_DATA *)user_data;
+  return p->pos;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  SF_VIRTUAL_IO vio;
+  vio.get_filelen = vio_get_filelen;
+  vio.seek = vio_seek;
+  vio.read = vio_read;
+  vio.write = vio_write;
+  vio.tell = vio_tell;
+
+  VIO_DATA vio_data;
+  vio_data.pos = 0;
+
+  SF_INFO sfinfo;
+  memset(&sfinfo, 0, sizeof(sfinfo));
+
+  // Fuzz the SF_INFO struct
+  sfinfo.format = provider.ConsumeIntegral<int>();
+  sfinfo.samplerate = provider.ConsumeIntegralInRange<int>(1000, 192000);
+  sfinfo.channels = provider.ConsumeIntegralInRange<int>(1, 16);
+
+  SNDFILE *sndfile = sf_open_virtual(&vio, SFM_WRITE, &sfinfo, &vio_data);
+  if (sndfile == nullptr) {
+    return 0;
+  }
+
+  // Valid string types for sf_set_string
+  const int str_types[] = {SF_STR_TITLE,   SF_STR_COPYRIGHT, SF_STR_SOFTWARE,
+                           SF_STR_ARTIST,  SF_STR_COMMENT,   SF_STR_DATE,
+                           SF_STR_ALBUM,   SF_STR_LICENSE,   SF_STR_TRACKNUMBER,
+                           SF_STR_GENRE};
+
+  int str_type = provider.PickValueInArray(str_types);
+  std::string str = provider.ConsumeRemainingBytesAsString();
+
+  sf_set_string(sndfile, str_type, str.c_str());
+
+  sf_close(sndfile);
+
+  return 0;
+}
+	

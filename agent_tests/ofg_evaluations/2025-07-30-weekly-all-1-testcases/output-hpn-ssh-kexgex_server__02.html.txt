@@ -1,0 +1,135 @@
+
+	
+<description>
+The `kexgex_server` function is responsible for handling the server-side of the Diffie-Hellman Group Exchange key exchange method. It sets a dispatch handler, `input_kex_dh_gex_request`, to process the `SSH2_MSG_KEX_DH_GEX_REQUEST` message from the client. This is part of the initial key exchange process in an SSH connection.
+</description>
+<requirements>
+
+<requirement>
+The `ssh` struct passed as an argument should be initialized by calling `ssh_alloc_session_state`. This is because this function allocates and initializes the necessary members of the `ssh` struct, including the `dispatch` table.
+</requirement>
+<requirement>
+The `kex` member of the `ssh` struct, of type `struct kex`, must be initialized by calling `kex_new`. This is because `kexgex_server` accesses members of this struct.
+</requirement>
+<requirement>
+The `server` member of the `ssh->kex` struct must be set to 1. This is because `kexgex_server` is intended to be used on the server side of an SSH connection.
+</requirement>
+<requirement>
+The `kex` array within the `ssh->kex` struct should have the `kexgex_server` function pointer assigned to the `KEX_DH_GEX_SHA1` and `KEX_DH_GEX_SHA256` indices. This is because these are the key exchange methods that this function implements.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kexgex_server(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/types.h>
+
+extern "C" {
+#include "includes.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "packet.h"
+#include "myproposal.h"
+#include "xmalloc.h"
+#include "log.h"
+#include "fixed-keys.h"
+#include "/src/hpn-ssh/kex.h"
+#include "dispatch.h"
+#include "sshkey.h"
+}
+
+// Simplified key preparation from kex_fuzz.cc
+static struct sshkey *
+prepare_key(void)
+{
+    const char *privstr = PRIV_RSA;
+    struct sshkey *privkey = NULL;
+    struct sshbuf *b = NULL;
+    int r;
+
+    if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+        abort();
+    if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0) {
+        error_fr(r, "priv");
+        abort();
+    }
+    sshbuf_free(b);
+    return privkey;
+}
+
+// Function under test
+int kexgex_server(struct ssh *);
+
+extern "C" int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    static struct sshkey *privkey = NULL;
+    struct ssh *server = NULL;
+    struct kex_params kex_params;
+    const char *proposal[PROPOSAL_MAX] = { KEX_SERVER };
+    char *myproposal[PROPOSAL_MAX] = {0};
+    int r;
+
+    if (privkey == NULL) {
+        log_init("kexgex_fuzz", SYSLOG_LEVEL_ERROR, SYSLOG_FACILITY_AUTH, 1);
+        privkey = prepare_key();
+    }
+
+    // Set up a server instance
+    for (int i = 0; i < PROPOSAL_MAX; i++) {
+        if ((myproposal[i] = strdup(proposal[i])) == NULL)
+            abort();
+    }
+    // Use our prepared key type
+    free(myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS]);
+    if ((myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] =
+        strdup(sshkey_ssh_name(privkey))) == NULL)
+        abort();
+
+    memcpy(kex_params.proposal, myproposal, sizeof(myproposal));
+
+    if ((r = ssh_init(&server, 1, &kex_params)) != 0) {
+        error_fr(r, "ssh_init server");
+        goto out;
+    }
+    if ((r = ssh_add_hostkey(server, privkey)) != 0) {
+        error_fr(r, "ssh_add_hostkey");
+        goto out;
+    }
+
+    // Call the function to be fuzzed
+    if (kexgex_server(server) != 0) {
+        goto out;
+    }
+
+    // Feed the fuzzer input to the server
+    if (ssh_input_append(server, data, size) != 0) {
+        error_f("ssh_input_append failed");
+        goto out;
+    }
+
+    // Run the dispatch loop to process the input
+    ssh_dispatch_run(server, DISPATCH_NONBLOCK, NULL);
+
+out:
+    for (int i = 0; i < PROPOSAL_MAX; i++)
+        free(myproposal[i]);
+    if (server != NULL)
+        ssh_free(server);
+
+    return 0;
+}
+	

@@ -1,0 +1,186 @@
+
+	
+<description>
+The function `modbus_write_bits` writes multiple bits (coils) to a Modbus server. It takes a `modbus_t` context, a starting address, the number of bits to write, and a pointer to the data to be written. The `modbus_t` context must be initialized and connected to a server before calling this function. The number of bits to be written is limited by `MODBUS_MAX_WRITE_BITS`. The data to be written is an array of bytes, which is converted to an array of bits by `modbus_set_bits_from_bytes`.
+</description>
+<requirements>
+<requirement>
+The `modbus_t` context should be initialized using `modbus_new_tcp` or `modbus_new_rtu`. This is because these functions allocate and initialize the necessary internal structures for the Modbus context.
+</requirement>
+<requirement>
+The `modbus_connect` function should be called after creating the `modbus_t` context. This is because it establishes a connection to the Modbus server, which is necessary for any communication to occur.
+</requirement>
+<requirement>
+The `nb` argument, representing the number of bits to write, should be less than or equal to `MODBUS_MAX_WRITE_BITS` (1968). Writing more bits will result in an error.
+</requirement>
+<requirement>
+The `src` argument should be created using `modbus_set_bits_from_bytes`. This function correctly formats the data to be written from a byte array to a bit array as expected by the `modbus_write_bits` function.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_write_bits(modbus_t *, int, int, const uint8_t *)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+/* Copyright 2022 Google LLC
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+      http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/src/modbus.h"
+#include "unit-test.h"
+
+#define PORT 8080
+#define kMinInputLength 9
+#define kMaxInputLength MODBUS_MAX_ADU_LENGTH
+
+struct Fuzzer {
+  uint16_t port;
+  char *file;
+
+  FILE *inFile;
+  size_t size;
+  const uint8_t *buffer;
+
+  pthread_t thread;
+  int socket;
+};
+typedef struct Fuzzer Fuzzer;
+
+int client(Fuzzer *fuzzer);
+
+void fuzzinit(Fuzzer *fuzzer) {
+  struct sockaddr_in server_addr;
+  fuzzer->socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(fuzzer->port);
+  server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  setsockopt(fuzzer->socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+  bind(fuzzer->socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  listen(fuzzer->socket, 1);
+}
+
+void *Server(void *args) {
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  int client_sock;
+  char clientData[10240];
+  struct sockaddr_in clientAddr;
+  socklen_t clientSZ = sizeof(clientAddr);
+
+  client_sock = accept(fuzzer->socket, (struct sockaddr *)&clientAddr, &clientSZ);
+  if (client_sock < 0) {
+    pthread_exit(NULL);
+  }
+
+  /* Receive the request from the client */
+  if (recv(client_sock, clientData, sizeof(clientData), 0) <= 0) {
+    close(client_sock);
+    pthread_exit(NULL);
+  }
+
+  /* Send a response back. The raw fuzzer input is used as a mock response
+   * to test the client's handling of potentially malformed data. */
+  send(client_sock, fuzzer->buffer, fuzzer->size, 0);
+
+  shutdown(client_sock, SHUT_RDWR);
+  close(client_sock);
+  pthread_exit(NULL);
+}
+
+void clean(Fuzzer *fuzzer) {
+  shutdown(fuzzer->socket, SHUT_RDWR);
+  close(fuzzer->socket);
+  free(fuzzer);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  fuzzinit(fuzzer);
+
+  pthread_create(&fuzzer->thread, NULL, Server, fuzzer);
+  client(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* To Avoid UAF*/
+
+  clean(fuzzer);
+  return 0;
+}
+
+int client(Fuzzer *fuzzer) {
+  modbus_t *ctx = NULL;
+  int rc;
+  int addr;
+  int nb;
+  const uint8_t *src;
+  size_t header_size = sizeof(int) * 2;
+
+  if (fuzzer->size < header_size + 1) {
+    return 0;
+  }
+
+  memcpy(&addr, fuzzer->buffer, sizeof(int));
+  memcpy(&nb, fuzzer->buffer + sizeof(int), sizeof(int));
+
+  /* Constrain nb to be within the valid range [1, MODBUS_MAX_WRITE_BITS] */
+  nb = (nb % MODBUS_MAX_WRITE_BITS) + 1;
+
+  size_t required_src_size = (nb + 7) / 8;
+  if (fuzzer->size < header_size + required_src_size) {
+    return 0;
+  }
+  src = fuzzer->buffer + header_size;
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+  if (ctx == NULL) {
+    return -1;
+  }
+
+  if (modbus_connect(ctx) == -1) {
+    modbus_free(ctx);
+    return -1;
+  }
+
+  /* This is the code block that sets up and calls the function-under-test */
+  /* int modbus_write_bits(modbus_t *, int, int, const uint8_t *); */
+  rc = modbus_write_bits(ctx, addr, nb, src);
+
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return rc;
+}
+	

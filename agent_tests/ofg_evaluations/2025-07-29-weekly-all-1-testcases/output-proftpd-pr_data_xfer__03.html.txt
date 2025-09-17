@@ -1,0 +1,178 @@
+
+	
+<description>
+The pr_data_xfer function is used to transfer data. The direction of the transfer is determined by the global variable session.xfer.direction, which can be either PR_NETIO_IO_RD (read from the network) or PR_NETIO_IO_WR (write to the network). The function reads from or writes to the data connection session.d, which must be opened before calling this function. The data can be transferred in either ASCII or binary mode, depending on the session flags.
+</description>
+<requirements>
+
+<requirement>
+The global variable `session.xfer.direction` must be initialized to either `PR_NETIO_IO_RD` (1) or `PR_NETIO_IO_WR` (2). This is because the control flow of `pr_data_xfer` depends on this variable.
+</requirement>
+<requirement>
+The `pr_data_init` function must be called before `pr_data_xfer`. This is because `pr_data_init` initializes the `session.xfer` structure, which is used by `pr_data_xfer`.
+</requirement>
+<requirement>
+The `pr_data_open` function must be called before `pr_data_xfer`. This is because `pr_data_open` establishes the data connection `session.d`, which is used by `pr_data_xfer` for data transfer.
+</requirement>
+<requirement>
+The `cl_buf` argument must not be NULL. The function checks for this and returns an error if it is NULL.
+</requirement>
+<requirement>
+The `cl_size` argument must not be zero. The function checks for this and returns an error if it is zero.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int pr_data_xfer(char *, size_t)
+</function_signature>
+<project_name>
+proftpd
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+
+#include "conf.h"
+#include "/src/proftpd/include/data.h"
+
+/* Global state required by the proftpd library */
+session_rec session;
+pool *permanent_pool = NULL;
+
+/* Fuzzer-specific state for mock I/O */
+static const uint8_t *fuzz_data;
+static size_t fuzz_size;
+static size_t fuzz_pos;
+
+/* Mock I/O Callbacks */
+static int fuzz_close_cb(pr_netio_stream_t *nstrm) {
+  return 0;
+}
+
+static int fuzz_poll_cb(pr_netio_stream_t *nstrm) {
+  return 1;
+}
+
+static int fuzz_read_cb(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
+  if (fuzz_pos >= fuzz_size) {
+    return 0; /* EOF */
+  }
+
+  size_t bytes_to_read = fuzz_size - fuzz_pos;
+  if (bytes_to_read > buflen) {
+    bytes_to_read = buflen;
+  }
+
+  memcpy(buf, fuzz_data + fuzz_pos, bytes_to_read);
+  fuzz_pos += bytes_to_read;
+  return bytes_to_read;
+}
+
+static int fuzz_write_cb(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
+  /* Pretend we wrote everything */
+  return buflen;
+}
+
+static int fuzz_open_streams(conn_t *conn) {
+  pr_netio_t *netio;
+  pr_netio_stream_t *nstrm;
+
+  netio = pr_alloc_netio2(permanent_pool, NULL, "fuzzer");
+  netio->close = fuzz_close_cb;
+  netio->poll = fuzz_poll_cb;
+  netio->read = fuzz_read_cb;
+  netio->write = fuzz_write_cb;
+
+  if (pr_register_netio(netio, PR_NETIO_STRM_DATA) < 0) {
+    return -1;
+  }
+
+  nstrm = pr_netio_open(permanent_pool, PR_NETIO_STRM_DATA, STDIN_FILENO, PR_NETIO_IO_RD);
+  if (nstrm == NULL) {
+    return -1;
+  }
+  conn->instrm = nstrm;
+
+  nstrm = pr_netio_open(permanent_pool, PR_NETIO_STRM_DATA, STDOUT_FILENO, PR_NETIO_IO_WR);
+  if (nstrm == NULL) {
+    return -1;
+  }
+  conn->outstrm = nstrm;
+
+  return 0;
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+  pr_signals_init();
+  pr_log_init();
+  pr_pools_init();
+
+  permanent_pool = make_sub_pool(NULL);
+  if (permanent_pool == NULL) {
+    exit(1);
+  }
+  session.pool = permanent_pool;
+
+  init_fs();
+  init_netio();
+  init_config();
+  init_dirtree();
+  pr_parser_prepare(session.pool, NULL);
+  pr_response_set_pool(session.pool);
+
+  session.c = pr_inet_create_conn(session.pool, -1, NULL, INPORT_ANY, FALSE);
+  if (session.c == NULL) {
+    exit(1);
+  }
+
+  session.d = pr_inet_create_conn(session.pool, -1, NULL, INPORT_ANY, FALSE);
+  if (session.d == NULL) {
+    exit(1);
+  }
+
+  if (fuzz_open_streams(session.d) != 0) {
+    exit(1);
+  }
+
+  return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1) {
+    return 0;
+  }
+
+  /* Use the first byte to determine transfer direction */
+  int direction = (data[0] % 2 == 0) ? PR_NETIO_IO_RD : PR_NETIO_IO_WR;
+  
+  char *cl_buf = (char *)data + 1;
+  size_t cl_size = size - 1;
+
+  if (cl_size == 0) {
+    return 0;
+  }
+
+  /* Set up global state for mock I/O */
+  fuzz_data = data + 1;
+  fuzz_size = size - 1;
+  fuzz_pos = 0;
+
+  pr_data_init("fuzz_file", direction);
+  if (pr_data_open(NULL, "fuzz", direction, 0) == 0) {
+    pr_data_xfer(cl_buf, cl_size);
+  }
+  
+  pr_data_close(TRUE);
+  pr_data_clear_xfer_pool();
+  pr_data_reset();
+
+  return 0;
+}
+	

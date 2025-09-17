@@ -1,0 +1,142 @@
+
+	
+<description>
+The `JS_JSONStringify` function is used to convert a JavaScript value into a JSON string. It takes a `JSContext`, the `JSValue` to stringify, an optional `replacer` function or array, and an optional `space` value for formatting.
+</description>
+<requirements>
+
+<requirement>
+The `JS_NewRuntime` and `JS_NewContext` functions must be called before the target function. This is because the returned `JSRuntime` and `JSContext` are required as inputs to the target function.
+</requirement>
+<requirement>
+The `obj` argument should be initialized by creating a new `JSValue` using functions like `JS_NewObject`, `JS_NewArray`, `JS_NewString`, etc. This will allow the fuzzer to explore different paths in the function based on the type of `obj`.
+</requirement>
+<requirement>
+The `replacer` argument can be a `JSValue` that is either a function or an array. This is because the function has specific logic to handle these two types, and other types are ignored.
+</requirement>
+<requirement>
+The `space0` argument can be a `JSValue` that is either a number or a string. This is because the function has specific logic to handle these two types for formatting the output string.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+JSValue JS_JSONStringify(JSContext *, JSValue, JSValue, JSValue)
+</function_signature>
+<project_name>
+quickjs
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "/src/quickjs/quickjs.h"
+#include "/src/quickjs/quickjs-libc.h"
+
+static JSContext *qjs_context;
+static JSRuntime *qjs_runtime;
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+  qjs_runtime = JS_NewRuntime();
+  if (qjs_runtime == NULL) {
+    // Cannot proceed
+    return -1;
+  }
+  qjs_context = JS_NewContext(qjs_runtime);
+  if (qjs_context == NULL) {
+    JS_FreeRuntime(qjs_runtime);
+    // Cannot proceed
+    return -1;
+  }
+  /* loader for ES6 modules */
+  JS_SetModuleLoaderFunc(qjs_runtime, NULL, js_module_loader, NULL);
+  js_std_add_helpers(qjs_context, 0, NULL);
+  return 0;
+}
+
+// Helper to create a JSValue from a data segment by parsing it as JSON.
+static JSValue create_value_from_data(JSContext *ctx, const uint8_t *data, size_t size) {
+    if (size == 0) {
+        return JS_UNDEFINED;
+    }
+    // JS_ParseJSON expects a null-terminated string.
+    char *str = (char *)malloc(size + 1);
+    if (!str) {
+        return JS_EXCEPTION;
+    }
+    memcpy(str, data, size);
+    str[size] = '\0';
+    JSValue val = JS_ParseJSON(ctx, str, size, "<fuzz>");
+    free(str);
+    return val;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  // Require at least 3 bytes: 2 for splitting and 1 for data.
+  if (size < 3) {
+    return 0;
+  }
+
+  // Use the first two bytes to create two split points to divide the
+  // input data into three segments for obj, replacer, and space.
+  size_t split1 = data[0];
+  size_t split2 = data[1];
+  const uint8_t *payload = data + 2;
+  size_t payload_size = size - 2;
+
+  if (split1 > split2) {
+      size_t temp = split1;
+      split1 = split2;
+      split2 = temp;
+  }
+
+  size_t offset1 = split1 % (payload_size + 1);
+  size_t offset2 = split2 % (payload_size + 1);
+
+  if (offset1 > offset2) {
+      size_t temp = offset1;
+      offset1 = offset2;
+      offset2 = temp;
+  }
+
+  const uint8_t *obj_data = payload;
+  size_t obj_size = offset1;
+
+  const uint8_t *replacer_data = payload + offset1;
+  size_t replacer_size = offset2 - offset1;
+
+  const uint8_t *space_data = payload + offset2;
+  size_t space_size = payload_size - offset2;
+
+  JSValue obj = create_value_from_data(qjs_context, obj_data, obj_size);
+  JSValue replacer = create_value_from_data(qjs_context, replacer_data, replacer_size);
+  JSValue space = create_value_from_data(qjs_context, space_data, space_size);
+
+  // Proceed only if all values were parsed without throwing an exception.
+  if (!JS_IsException(obj) && !JS_IsException(replacer) && !JS_IsException(space)) {
+    JSValue result = JS_JSONStringify(qjs_context, obj, replacer, space);
+    // Free the stringified result if it's not an exception.
+    if (!JS_IsException(result)) {
+      JS_FreeValue(qjs_context, result);
+    }
+  }
+
+  // Free the parsed values.
+  JS_FreeValue(qjs_context, obj);
+  JS_FreeValue(qjs_context, replacer);
+  JS_FreeValue(qjs_context, space);
+
+  // Execute any pending jobs (e.g., promises).
+  JSContext *ctx1;
+  int err = JS_ExecutePendingJob(JS_GetRuntime(qjs_context), &ctx1);
+  if (err < 0) {
+      js_std_dump_error(ctx1);
+  }
+
+  return 0;
+}
+	

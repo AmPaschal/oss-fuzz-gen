@@ -1,0 +1,227 @@
+
+	
+<description>
+The `RouterHandler::onRequest` function is a key component of the Pistache routing mechanism. It receives an HTTP request and a response writer, and its primary responsibility is to delegate the request to the underlying `Router` object. The `Router` then matches the request against its configured routes and invokes the appropriate handler. The behavior of `onRequest` is therefore entirely dependent on the state and configuration of the `Router` object it holds.
+</description>
+<requirements>
+<requirement>
+The `router` member of the `RouterHandler` class must be initialized with a valid `std::shared_ptr<Pistache::Rest::Router>` object. This is because the `onRequest` method directly calls the `route` method on this object, and a null pointer would lead to a crash.
+</requirement>
+<requirement>
+The `Router` object should be configured with routes before `onRequest` is called. This is to ensure that the `route` method can find and execute a handler, allowing for meaningful testing and preventing the request from being trivially rejected by the not-found handler.
+</requirement>
+<requirement>
+The `req` argument, a `const Pistache::Http::Request&`, must be a valid HTTP request object. The `Router` uses the request's method and resource path to perform route matching, so these fields are particularly important for exercising the routing logic.
+</requirement>
+<requirement>
+The `response` argument, a `Pistache::Http::ResponseWriter`, must be a valid and properly initialized object. The matched route handler will use this object to send a response to the client, so it needs to be in a usable state.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Rest::Private::RouterHandler::onRequest(const Request &, ResponseWriter)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <pistache/http.h>
+#include <pistache/router.h>
+#include <pistache/transport.h>
+#include <pistache/peer.h>
+#include <pistache/tcp.h>
+#include <pistache/endpoint.h>
+#include <fuzzer/FuzzedDataProvider.h>
+
+using namespace Pistache;
+
+template <class F> void ignoreExceptions(const F &func) {
+  try {
+    func();
+  } catch (...) {
+  }
+}
+
+template <class T> void parseHttpHeader(const std::string &input) {
+  T header;
+  ignoreExceptions([&] { header.parse(input); });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+template <> void parseHttpHeader<Pistache::Http::Header::Authorization>(const std::string &input) {
+  Pistache::Http::Header::Authorization header;
+  ignoreExceptions([&] { header.parse(input); });
+  ignoreExceptions([&] { header.getMethod(); });
+  ignoreExceptions([&] {
+    const auto user = header.getBasicUser();
+    const auto password = header.getBasicPassword();
+    header.setBasicUserPassword(user, password);
+  });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+void fuzz_headers(const std::string &input) {
+  parseHttpHeader<Pistache::Http::Header::Accept>(input);
+  parseHttpHeader<Pistache::Http::Header::CacheControl>(input);
+  parseHttpHeader<Pistache::Http::Header::Connection>(input);
+  parseHttpHeader<Pistache::Http::Header::AcceptEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentLength>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentType>(input);
+  parseHttpHeader<Pistache::Http::Header::Authorization>(input);
+  parseHttpHeader<Pistache::Http::Header::Date>(input);
+  parseHttpHeader<Pistache::Http::Header::Expect>(input);
+  parseHttpHeader<Pistache::Http::Header::Host>(input);
+  parseHttpHeader<Pistache::Http::Header::Server>(input);
+}
+
+void fuzz_cookies(const std::string &input) {
+  Pistache::Http::CookieJar cookie_jar;
+  ignoreExceptions([&] { Pistache::Http::Cookie::fromString(input); });
+  ignoreExceptions([&] { cookie_jar.addFromRaw(input.data(), input.size()); });
+}
+
+void fuzz_request_parser(const std::string &input) {
+  constexpr size_t maxDataSize = 4096;
+  Pistache::Http::RequestParser rparser(maxDataSize);
+
+  if (rparser.feed(input.data(), input.size())) {
+    auto state = Pistache::Http::Private::State::Done;
+    ignoreExceptions([&] { state = rparser.parse(); });
+
+    if (state == Pistache::Http::Private::State::Again)
+      ignoreExceptions([&] { rparser.parse(); });
+  }
+}
+
+void fuzz_router(const std::string &input) {
+  std::string path_input;
+  std::stringstream input_stream(input);
+  Pistache::Rest::SegmentTreeNode tree;
+
+  while (std::getline(input_stream, path_input, '\n')) {
+    if (path_input.size() < 2)
+      continue;
+
+    const int test_case = path_input.back();
+    path_input.pop_back();
+
+    const auto sanitized = Pistache::Rest::SegmentTreeNode::sanitizeResource(path_input);
+    std::shared_ptr<char> ptr(new char[sanitized.length()], std::default_delete<char[]>());
+    memcpy(ptr.get(), sanitized.data(), sanitized.length());
+    const std::string_view path{ptr.get(), sanitized.length()};
+
+    switch (test_case) {
+    case 'A':
+      ignoreExceptions([&] {
+        Pistache::Rest::Route::Handler handler = [](auto...) { return Pistache::Rest::Route::Result::Ok; };
+        std::shared_ptr<char> ptr(new char[sanitized.length()], std::default_delete<char[]>());
+        memcpy(ptr.get(), sanitized.data(), sanitized.length());
+        const std::string_view path{ptr.get(), sanitized.length()};
+        tree.addRoute(path, handler, ptr);
+      });
+      break;
+    case 'R':
+      ignoreExceptions([&] { tree.removeRoute(path); });
+      break;
+    case 'F':
+      ignoreExceptions([&] { tree.findRoute(path); });
+      break;
+    }
+  }
+}
+
+void fuzz_other(const std::string &input) {
+  // URI parsing
+  Http::Uri::Query query1;
+  query1.add(input, input);
+}
+
+class MockTcpHandler : public Pistache::Tcp::Handler {
+public:
+    void onInput(const char*, size_t, const std::shared_ptr<Pistache::Tcp::Peer>&) override {}
+    std::shared_ptr<Pistache::Tcp::Handler> clone() const override {
+        return std::make_shared<MockTcpHandler>();
+    }
+};
+
+class MockTransport : public Pistache::Tcp::Transport {
+public:
+    MockTransport() : Pistache::Tcp::Transport(std::make_shared<MockTcpHandler>()) {}
+    void registerPoller(Pistache::Polling::Epoll&) override {}
+    void unregisterPoller(Pistache::Polling::Epoll&) override {}
+    void onReady(const Pistache::Aio::FdSet&) override {}
+    std::shared_ptr<Pistache::Aio::Handler> clone() const override {
+        return std::make_shared<MockTransport>();
+    }
+    template <typename Buf>
+    Pistache::Async::Promise<ssize_t> asyncWrite(Pistache::Fd, const Buf& buffer, int = 0, ...) {
+        return Pistache::Async::Promise<ssize_t>([=](Pistache::Async::Deferred<ssize_t> deferred) {
+            deferred.resolve(buffer.size());
+        });
+    }
+};
+
+void fuzz_router_handler(const std::string& input) {
+    FuzzedDataProvider provider(reinterpret_cast<const uint8_t*>(input.data()), input.size());
+    auto router = std::make_shared<Pistache::Rest::Router>();
+    auto path = provider.ConsumeRandomLengthString(100);
+    if (path.empty() || path[0] != '/') {
+        path.insert(0, 1, '/');
+    }
+    Pistache::Rest::Route::Handler handler_func = [](const Pistache::Rest::Request&, Pistache::Http::ResponseWriter response) {
+        response.send(Pistache::Http::Code::Ok);
+        return Pistache::Rest::Route::Result::Ok;
+    };
+    router->get(path, handler_func);
+    auto handler = router->handler();
+    Pistache::Http::Request request;
+    MockTransport transport;
+    Pistache::Address addr;
+    auto peer = Pistache::Tcp::Peer::Create(PS_FD_EMPTY, addr);
+    ignoreExceptions([&] {
+        Pistache::Http::ResponseWriter response_writer(
+            Pistache::Http::Version::Http11, &transport, handler.get(), peer
+        );
+        handler->onRequest(request, std::move(response_writer));
+    });
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1)
+    return -1;
+
+  const uint8_t type = data[0];
+  const std::string input(reinterpret_cast<const char *>(data + 1), size - 1);
+
+  switch (type) {
+  case 'H':
+    fuzz_headers(input);
+    break;
+  case 'C':
+    fuzz_cookies(input);
+    break;
+  case 'R':
+    fuzz_request_parser(input);
+    break;
+  case 'S':
+    fuzz_router(input);
+    break;
+  case 'O':
+    fuzz_other(input);
+    break;
+  case 'T':
+    fuzz_router_handler(input);
+    break;
+  }
+
+  return 0;
+}
+	

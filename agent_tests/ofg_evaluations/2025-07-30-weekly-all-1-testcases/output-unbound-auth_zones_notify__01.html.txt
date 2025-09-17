@@ -1,0 +1,171 @@
+
+	
+<description>
+The `auth_zones_notify` function handles incoming notify messages for authoritative zones. It checks if the notification is for a known zone and if the sender is allowed to send notifies. If both checks pass, it processes the notification, which may trigger a zone transfer.
+</description>
+<requirements>
+
+<requirement>
+The `az` argument, a pointer to a `auth_zones` struct, must be initialized by calling `auth_zones_create()`. This is because the function accesses member of the struct, and `auth_zones_create()` allocates and initializes it.
+</requirement>
+<requirement>
+The `auth_zones` struct pointed to by `az` must be populated with at least one zone. This can be done by calling `auth_zones_apply_cfg()`. Without any zones, `auth_xfer_find()` will always fail, and the core logic of the function will not be executed.
+</requirement>
+<requirement>
+The `nm` and `nmlen` arguments must represent a valid domain name that exists within the `auth_zones` struct. This is because `auth_xfer_find()` uses these arguments to look up the zone.
+</requirement>
+<requirement>
+The `refused` argument must be a valid pointer to an integer. The function writes to this pointer to indicate whether the notification was refused, so it cannot be a NULL pointer.
+</requirement>
+<requirement>
+The `addr` and `addrlen` arguments must be a valid pointer to a `sockaddr_storage` structure and its corresponding length. These are used by `az_xfr_allowed_notify` to perform access control checks, so they should be fuzzed to test this logic.
+</requirement>
+<requirement>
+The `env` argument must be a valid pointer to a `module_env` struct. The `module_env` can be created and initialized as part of the test harness setup, as it is passed to child functions like `xfr_process_notify`.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int auth_zones_notify(struct auth_zones* az, struct module_env* env, uint8_t* nm, size_t nmlen, uint16_t dclass, struct sockaddr_storage* addr, socklen_t addrlen, int has_serial, uint32_t serial, int* refused)
+</function_signature>
+<project_name>
+unbound
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#include "services/authzone.h"
+#include "util/module.h"
+#include "util/config_file.h"
+#include "util/locks.h"
+#include "util/random.h"
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    size_t offset = 0;
+
+    // Minimum size for has_serial, serial, af_choice, and one byte for name.
+    if (size < (sizeof(int) + sizeof(uint32_t) + 1 + 1)) {
+        return 0;
+    }
+
+    // --- Parameters from fuzzer data ---
+    int has_serial = *(const int*)(data + offset);
+    offset += sizeof(int);
+
+    uint32_t serial = *(const uint32_t*)(data + offset);
+    offset += sizeof(uint32_t);
+
+    uint16_t dclass = 1; // CLASS_IN
+
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    memset(&addr, 0, sizeof(addr));
+
+    uint8_t af_choice = *(data + offset);
+    offset += sizeof(uint8_t);
+
+    if (af_choice % 2 == 0 && (size - offset) >= sizeof(struct sockaddr_in)) {
+        addr.ss_family = AF_INET;
+        memcpy(&addr, data + offset, sizeof(struct sockaddr_in));
+        ((struct sockaddr_in*)&addr)->sin_family = AF_INET;
+        addrlen = sizeof(struct sockaddr_in);
+        offset += sizeof(struct sockaddr_in);
+    } else if ((size - offset) >= sizeof(struct sockaddr_in6)) {
+        addr.ss_family = AF_INET6;
+        memcpy(&addr, data + offset, sizeof(struct sockaddr_in6));
+        ((struct sockaddr_in6*)&addr)->sin6_family = AF_INET6;
+        addrlen = sizeof(struct sockaddr_in6);
+        offset += sizeof(struct sockaddr_in6);
+    } else {
+        return 0;
+    }
+
+    uint8_t* nm = (uint8_t*)(data + offset);
+    size_t nmlen = size - offset;
+    if (nmlen == 0) {
+        return 0;
+    }
+
+    int refused = 0;
+
+    // --- Setup environment ---
+    struct auth_zones* az = auth_zones_create();
+    if (!az) return 0;
+
+    struct module_env env;
+    memset(&env, 0, sizeof(env));
+    env.auth_zones = az;
+    env.cfg = (struct config_file*)calloc(1, sizeof(struct config_file));
+    if(!env.cfg) {
+        auth_zones_delete(az);
+        return 0;
+    }
+    // env.rnd can be NULL
+
+    // --- Create a zone and xfer to be notified ---
+    lock_rw_wrlock(&az->lock);
+    struct auth_zone* z = auth_zone_create(az, nm, nmlen, dclass);
+    lock_rw_unlock(&az->lock);
+    if (!z) {
+        free(env.cfg);
+        auth_zones_delete(az);
+        return 0;
+    }
+
+    lock_rw_wrlock(&az->lock);
+    struct auth_xfer* xfr = auth_xfer_create(az, z);
+    lock_rw_unlock(&az->lock);
+    
+    lock_rw_unlock(&z->lock);
+
+    if (!xfr) {
+        free(env.cfg);
+        auth_zones_delete(az);
+        return 0;
+    }
+    lock_basic_unlock(&xfr->lock);
+
+    // --- Setup allow_notify_list to pass the access check ---
+    struct auth_master* m = (struct auth_master*)calloc(1, sizeof(*m));
+    struct auth_addr* a = (struct auth_addr*)calloc(1, sizeof(*a));
+    if (!m || !a) {
+        free(m);
+        free(a);
+        free(env.cfg);
+        auth_zones_delete(az);
+        return 0;
+    }
+    
+    memcpy(&a->addr, &addr, addrlen);
+    a->addrlen = addrlen;
+    m->list = a;
+    
+    lock_basic_lock(&xfr->lock);
+    xfr->allow_notify_list = m;
+    lock_basic_unlock(&xfr->lock);
+
+    // --- Call the function under test ---
+    auth_zones_notify(az, &env, nm, nmlen, dclass, &addr, addrlen,
+                      has_serial, serial, &refused);
+
+    // --- Cleanup ---
+    lock_basic_lock(&xfr->lock);
+    xfr->allow_notify_list = NULL;
+    lock_basic_unlock(&xfr->lock);
+    free(a);
+    free(m);
+    free(env.cfg);
+    auth_zones_delete(az);
+
+    return 0;
+}
+	

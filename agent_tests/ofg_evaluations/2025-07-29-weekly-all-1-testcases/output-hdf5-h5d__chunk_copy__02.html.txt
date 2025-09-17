@@ -1,0 +1,163 @@
+
+	
+<description>
+This function, `H5D__chunk_copy`, is a part of the HDF5 library and is responsible for copying chunked dataset data from a source file to a destination file. It handles various aspects of the copy process, including datatype conversion, memory management, and iteration over data chunks. The function is called by `H5O__layout_copy_file` when the layout type is `H5D_CHUNKED`.
+
+The function begins by performing several checks on its input arguments to ensure they are not NULL. It then initializes temporary pipeline information and resets the chunked storage index in the destination file. It sets up source and destination chunked index information structures and calls an index-specific "copy setup" routine.
+
+A significant portion of the function is dedicated to handling datatype conversion. If the source datatype is a variable-length (VLEN) or reference type, the function sets up the necessary conversion paths and buffers. It allocates memory for copying and, if necessary, a background buffer for type conversion.
+
+The core of the function's work is performed by iterating over the chunks in the source dataset, reading each chunk into a buffer, performing datatype conversion if required, and writing the chunk to the destination file. This iteration is handled by a callback function, `H5D__chunk_copy_cb`.
+
+Finally, the function cleans up any allocated resources, such as temporary datatypes, dataspaces, and memory buffers, and shuts down any index-specific copying information. The function's return value indicates whether the copy operation was successful.
+</description>
+<requirements>
+<requirements>
+<requirement>
+The `f_src` and `f_dst` arguments must be valid and non-null pointers to `H5F_t` structs. This is because they are dereferenced throughout the function.
+</requirement>
+<requirement>
+The `storage_src` and `storage_dst` arguments must be valid and non-null pointers to `H5O_storage_chunk_t` structs. The `idx_type` and `ops` fields of these structs must be consistent with each other to pass the `H5D_CHUNK_STORAGE_INDEX_CHK` macro check. This is to ensure that the correct chunking functions are used.
+</requirement>
+<requirement>
+The `ops` field of the `storage_src` and `storage_dst` arguments must point to a valid `H5D_chunk_ops_t` struct with valid function pointers for `copy_setup`, `iterate`, and `copy_shutdown`. These function pointers are called within the target function, and null pointers would lead to crashes.
+</requirement>
+<requirement>
+The `layout_src` argument must be a valid and non-null pointer to an `H5O_layout_chunk_t` struct. This is because it is dereferenced to get chunk information.
+</requirement>
+<requirement>
+The `ds_extent_src` argument must be a valid and non-null pointer to an `H5S_extent_t` struct. It is used to get the dimensions of the dataspace.
+</requirement>
+<requirement>
+The `dt_src` argument must be a valid and non-null pointer to an `H5T_t` struct. It is used to get information about the datatype.
+</requirement>
+<requirement>
+The `cpy_info` argument must be a valid and non-null pointer to an `H5O_copy_t` struct. This is because it is dereferenced to get copy options.
+</requirement>
+<requirement>
+The `pline_src` argument can be NULL. If it is not NULL, it should point to a valid `H5O_pline_t` struct. This is because the function handles the case where `pline_src` is NULL by initializing a temporary struct.
+</requirement>
+</requirements>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+herr_t H5D__chunk_copy(H5F_t *, H5O_storage_chunk_t *, H5O_layout_chunk_t *, H5F_t *, H5O_storage_chunk_t *, const H5S_extent_t *, H5T_t *, const H5O_pline_t *, H5O_copy_t *)
+</function_signature>
+<project_name>
+hdf5
+</project_name>
+
+	Fuzz target source:
+#include "hdf5.h"
+#include "H5private.h"
+#include "H5Eprivate.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define FUZZ_MAX_OBJ_NAME_LEN 255
+
+/*
+ * This is a fuzz target for the internal function H5D__chunk_copy.
+ * It is not feasible to call this function directly due to the complexity
+ * of its parameters, which are internal HDF5 structures.
+ *
+ * The strategy is to use the public API H5Ocopy to trigger the code path
+ * that calls H5D__chunk_copy. This happens when copying a dataset with a
+ * chunked layout.
+ *
+ * The fuzzer input is treated as an HDF5 file. We create a source file from
+ * the input data and an empty destination file. Then we try to copy an object
+ * from the source to the destination. If the object is a chunked dataset,
+ * H5D__chunk_copy will be called internally by the library.
+ */
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  char filename[256];
+  hid_t src_file_id = H5I_INVALID_HID;
+  hid_t dst_file_id = H5I_INVALID_HID;
+  hid_t fcpl_id = H5I_INVALID_HID;
+  char *obj_name = NULL;
+  size_t obj_name_len;
+
+  if (size <= 1) {
+    return 0;
+  }
+
+  /* Use the last byte of the input to determine the object name length */
+  obj_name_len = data[size - 1];
+  if (obj_name_len > FUZZ_MAX_OBJ_NAME_LEN) {
+    obj_name_len = FUZZ_MAX_OBJ_NAME_LEN;
+  }
+
+  /* Ensure there's enough data for the object name */
+  if (size < obj_name_len + 1) {
+    return 0;
+  }
+
+  /* Extract the object name from the start of the data */
+  obj_name = (char *)malloc(obj_name_len + 1);
+  if (obj_name == NULL) {
+    return 0;
+  }
+  memcpy(obj_name, data, obj_name_len);
+  obj_name[obj_name_len] = '\0';
+
+  /* The rest of the data is the HDF5 file content */
+  const uint8_t *file_data = data + obj_name_len;
+  size_t file_size = size - obj_name_len - 1;
+
+  /* Create a temporary file for the source HDF5 data */
+  sprintf(filename, "/tmp/fuzz_src_h5d_chunk_copy.%d", getpid());
+  FILE *fp = fopen(filename, "wb");
+  if (!fp) {
+    free(obj_name);
+    return 0;
+  }
+  fwrite(file_data, 1, file_size, fp);
+  fclose(fp);
+
+  /* Disable error printing */
+  H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+
+  /* Open the fuzzer-generated file as the source */
+  src_file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
+  if (src_file_id < 0) {
+    goto cleanup;
+  }
+
+  /* Create a destination file in memory */
+  fcpl_id = H5Pcreate(H5P_FILE_CREATE);
+  if (fcpl_id < 0) {
+    goto cleanup;
+  }
+  H5Pset_libver_bounds(fcpl_id, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
+  dst_file_id = H5Fcreate("fuzz_dst.h5", H5F_ACC_TRUNC, fcpl_id, H5P_DEFAULT);
+  if (dst_file_id < 0) {
+    goto cleanup;
+  }
+
+  /*
+   * Attempt to copy the object. If the object exists and is a dataset with
+   * a chunked layout, this will call H5D__chunk_copy internally.
+   */
+  H5Ocopy(src_file_id, obj_name, dst_file_id, obj_name, H5P_DEFAULT, H5P_DEFAULT);
+
+cleanup:
+  if (fcpl_id >= 0) {
+    H5Pclose(fcpl_id);
+  }
+  if (dst_file_id >= 0) {
+    H5Fclose(dst_file_id);
+  }
+  if (src_file_id >= 0) {
+    H5Fclose(src_file_id);
+  }
+  unlink(filename);
+  free(obj_name);
+
+  return 0;
+}
+	

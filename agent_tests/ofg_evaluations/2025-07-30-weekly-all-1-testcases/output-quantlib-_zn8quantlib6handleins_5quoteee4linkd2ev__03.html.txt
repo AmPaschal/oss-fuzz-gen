@@ -1,0 +1,131 @@
+
+	
+<description>
+The `QuantLib::DateParser::parseISO` function is a static method designed to parse a date string formatted in the ISO 8601 standard (YYYY-MM-DD). It takes a constant reference to a `std::string` as its only argument. The function first validates the input string's format, requiring it to be exactly 10 characters long with hyphens at the 5th and 8th positions. It then extracts the year, month, and day components from the string, converts them to integers, and uses them to construct and return a `QuantLib::Date` object. The function enforces its input requirements using `QL_REQUIRE` macros, which will raise an exception if the conditions are not met. Additional exceptions can be thrown by the underlying `std::stoi` conversion if the date components are not valid numbers, or by the `QuantLib::Date` constructor if the combination of year, month, and day does not form a valid calendar date.
+</description>
+<requirements>
+<requirement>
+The input string must have a length of exactly 10 characters. This is because the function performs an explicit check and subsequent substring operations are based on this fixed length.
+</requirement>
+<requirement>
+The character at index 4 of the input string must be a hyphen '-'. This is a mandatory part of the ISO date format 'YYYY-MM-DD' that the function expects.
+</requirement>
+<requirement>
+The character at index 7 of the input string must be a hyphen '-'. This is the second separator required by the 'YYYY-MM-DD' format.
+</requirement>
+<requirement>
+The substrings representing the year (first 4 characters), month (characters 5 and 6), and day (characters 8 and 9) must be valid integer representations. The function uses `std::stoi` for conversion, which will fail if the substrings contain non-numeric characters.
+</requirement>
+<requirement>
+The parsed year, month, and day must constitute a valid calendar date. The `QuantLib::Date` constructor will throw an exception for invalid dates, such as a month greater than 12 or a day of 32.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+static Date QuantLib::DateParser::parseISO(const std::string& str)
+</function_signature>
+<project_name>
+quantlib
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <limits>
+#include <ql/settings.hpp>
+#include <ql/time/calendars/nullcalendar.hpp>
+#include <ql/time/daycounters/actual360.hpp>
+#include <ql/quotes/simplequote.hpp>
+#include <ql/termstructures/yield/flatforward.hpp>
+#include <ql/termstructures/volatility/equityfx/blackconstantvol.hpp>
+#include <ql/processes/blackscholesprocess.hpp>
+#include <ql/instruments/vanillaoption.hpp>
+#include <ql/pricingengines/vanilla/baroneadesiwhaleyengine.hpp>
+#include <ql/exercise.hpp>
+#include <ql/instruments/payoffs.hpp>
+
+using namespace QuantLib;
+
+namespace {
+
+struct AmericanOptionData {
+  Option::Type type;
+  Real strike;
+  Real s;       // spot
+  Rate q;       // dividend
+  Rate r;       // risk-free rate
+  Time t;       // time to maturity
+  Volatility v; // volatility
+};
+
+} // namespace
+
+AmericanOptionData fuzzedAmericanOptionData(FuzzedDataProvider &fdp) {
+  return AmericanOptionData{
+      .type = fdp.PickValueInArray({Option::Type::Put, Option::Type::Call}),
+      .strike = fdp.ConsumeFloatingPointInRange<Real>(0.0, std::numeric_limits<Real>::max()),
+      .s = fdp.ConsumeFloatingPointInRange<Real>(0.0, std::numeric_limits<Real>::max()),
+      .q = fdp.ConsumeProbability<Rate>(),
+      .r = fdp.ConsumeProbability<Rate>(),
+      .t = fdp.ConsumeFloatingPointInRange<Time>(0.01, 30.0), // Ensure time to maturity is positive
+      .v = fdp.ConsumeFloatingPointInRange<Volatility>(0.01, 4.0), // Ensure volatility is positive
+  };
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+  // Ensure that settings are reset between each fuzzing iteration.
+  SavedSettings saved_settings;
+
+  constexpr size_t kMaxValues = 100;
+  auto length = fdp.ConsumeIntegralInRange<size_t>(0, kMaxValues);
+  std::vector<AmericanOptionData> values;
+  values.reserve(length);
+  for (size_t i = 0; i < length; i++) {
+    values.push_back(fuzzedAmericanOptionData(fdp));
+  }
+
+  Date today(2, March, 2020);
+  Settings::instance().evaluationDate() = today;
+  DayCounter dc = Actual360();
+
+  ext::shared_ptr<SimpleQuote> spot(new SimpleQuote(0.0));
+  ext::shared_ptr<SimpleQuote> qRate(new SimpleQuote(0.0));
+  ext::shared_ptr<YieldTermStructure> qTS(new FlatForward(today, Handle<Quote>(qRate), dc));
+  ext::shared_ptr<SimpleQuote> rRate(new SimpleQuote(0.0));
+  ext::shared_ptr<YieldTermStructure> rTS(new FlatForward(today, Handle<Quote>(rRate), dc));
+  ext::shared_ptr<SimpleQuote> vol(new SimpleQuote(0.0));
+  ext::shared_ptr<BlackVolTermStructure> volTS(new BlackConstantVol(today, NullCalendar(), Handle<Quote>(vol), dc));
+
+  ext::shared_ptr<BlackScholesMertonProcess> stochProcess(
+      new BlackScholesMertonProcess(Handle<Quote>(spot),
+                                    Handle<YieldTermStructure>(qTS),
+                                    Handle<YieldTermStructure>(rTS),
+                                    Handle<BlackVolTermStructure>(volTS)));
+
+  ext::shared_ptr<PricingEngine> engine(new BaroneAdesiWhaleyApproximationEngine(stochProcess));
+
+  for (auto &value : values) {
+    try {
+        spot->setValue(value.s);
+        qRate->setValue(value.q);
+        rRate->setValue(value.r);
+        vol->setValue(value.v);
+
+        ext::shared_ptr<StrikedTypePayoff> payoff(new PlainVanillaPayoff(value.type, value.strike));
+        Date exDate = today + Integer(std::lround(365 * value.t));
+        ext::shared_ptr<Exercise> exercise(new AmericanExercise(today, exDate));
+
+        VanillaOption option(payoff, exercise);
+        option.setPricingEngine(engine);
+
+        (void)option.NPV();
+    } catch (const std::exception&) {
+        // Catch exceptions from QuantLib, e.g., due to invalid input parameters
+    }
+  }
+
+  return 0;
+}
+	

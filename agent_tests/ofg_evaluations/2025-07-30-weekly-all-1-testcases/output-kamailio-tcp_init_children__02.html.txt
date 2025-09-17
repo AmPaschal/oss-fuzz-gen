@@ -1,0 +1,164 @@
+
+	
+<description>
+The `tcp_init_children` function is responsible for initializing the TCP child processes in Kamailio. It allocates memory for the `tcp_children` array, which holds information about each child process. The size of this array is determined by the `tcp_children_no` global variable. The function then iterates through the `tcp_listen` and `tls_listen` lists to assign sockets to the TCP workers. Finally, it forks the child processes and calls the `tcp_receive_loop` function in each child.
+
+The `woneinit` parameter is a pointer to an integer that acts as a flag to ensure that the `run_child_one_init_route` function is called only once, in the first child process. The `main_loop` function initializes `woneinit` to 0 and passes its address to `tcp_init_children`. Inside `tcp_init_children`, the value of `*woneinit` is checked, and then set to 1 after the first child is forked. This prevents subsequent child processes from calling `run_child_one_init_route`.
+
+The `tcp_listen` and `tls_listen` global variables are pointers to linked lists of `socket_info` structs. These lists are populated in the `main_loop` function based on the configuration file. The `tcp_init_children` function iterates through these lists to determine the number of file descriptors to register and to assign sockets to the TCP workers. To fuzz this function, these lists should be populated with at least one `socket_info` struct.
+</description>
+<requirements>
+<requirement>
+The `woneinit` parameter must be a pointer to an integer initialized to 0. This is to ensure that the `run_child_one_init_route` function is called only once.
+</requirement>
+<requirement>
+The `tcp_children_no` global variable must be initialized to a non-negative integer. This is because it is used to allocate the `tcp_children` array, and a negative value will cause a crash.
+</requirement>
+<requirement>
+The `tcp_listen` global variable must be initialized to a linked list of `socket_info` structs. This is because the function iterates through this list to assign sockets to TCP workers.
+</requirement>
+<requirement>
+The `tls_listen` global variable must be initialized to a linked list of `socket_info` structs if TLS is enabled. This is because the function iterates through this list to assign sockets to TLS workers.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int tcp_init_children(int *woneinit)
+</function_signature>
+<project_name>
+kamailio
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// Kamailio includes
+#include "core/tcp_init.h"
+#include "core/globals.h"
+#include "core/pt.h"
+#include "core/socket_info.h"
+#include "core/mem/shm.h"
+#include "core/mem/pkg.h"
+#include "core/ut.h"
+#include "core/tcp_options.h"
+
+// Provide weak stubs for memory initialization functions to resolve linker errors.
+// These will be used if the linker cannot find the real implementations.
+int __attribute__((weak)) shm_mem_init(int force_alloc, int cfg_shm_pools, int f) { return 0; }
+int __attribute__((weak)) init_pkg_mallocs(int f) { return 0; }
+
+
+// Stubs for functions called by tcp_init_children and its callees
+// We use the --wrap linker option to replace the original functions.
+int __wrap_get_max_procs() {
+    return 4;
+}
+
+int __wrap_register_fds(int n) {
+    (void)n;
+    return 0;
+}
+
+pid_t __wrap_fork_tcp_process(int rank, char* desc, int r, int* reader_fd_1) {
+    if (reader_fd_1) {
+        *reader_fd_1 = -1;
+    }
+    // Return a fake PID > 0 to stay in the parent code path
+    return 1;
+}
+
+int __wrap_run_child_one_init_route() {
+    return 0;
+}
+
+void __wrap_tcp_receive_loop(int unix_sock) {
+    (void)unix_sock;
+}
+
+// Global initialization
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    shm_mem_init(0, 0, 0);
+    init_pkg_mallocs(0);
+
+    pt = pkg_malloc(sizeof(struct process_table) * 4);
+    if (!pt) return -1;
+    memset(pt, 0, sizeof(struct process_table) * 4);
+    
+    process_count = pkg_malloc(sizeof(int));
+    if(!process_count) return -1;
+    *process_count = 4;
+
+    bind_address = pkg_malloc(sizeof(struct socket_info));
+    if(!bind_address) return -1;
+    memset(bind_address, 0, sizeof(struct socket_info));
+
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < sizeof(int) * 2) {
+        return 0;
+    }
+
+    // Clean up from previous runs
+    if (tcp_children) {
+        pkg_free(tcp_children);
+        tcp_children = NULL;
+    }
+    struct socket_info* current_si = tcp_listen;
+    while(current_si) {
+        struct socket_info* next_si = current_si->next;
+        pkg_free(current_si);
+        current_si = next_si;
+    }
+    tcp_listen = NULL;
+    child_rank = 0;
+    ksr_wait_worker1_mode = 0;
+
+    // Use fuzzer data to set the number of children.
+    tcp_children_no = (*(int*)data) % 32;
+    if (tcp_children_no < 0) tcp_children_no = 0;
+    data += sizeof(int);
+    size -= sizeof(int);
+
+    // Create a simple tcp_listen list with one element.
+    if (tcp_children_no > 0) {
+        tcp_listen = (struct socket_info*)pkg_malloc(sizeof(struct socket_info));
+        if (!tcp_listen) {
+            return 0;
+        }
+        memset(tcp_listen, 0, sizeof(struct socket_info));
+        tcp_listen->workers = (*(int*)data) % (tcp_children_no + 1);
+        if (tcp_listen->workers < 0) tcp_listen->workers = 0;
+        
+        static char sock_str_buf[] = "fuzz_socket";
+        tcp_listen->sock_str.s = sock_str_buf;
+        tcp_listen->sock_str.len = sizeof(sock_str_buf) - 1;
+    }
+
+    int woneinit = 0;
+
+    // Call the target function
+    tcp_init_children(&woneinit);
+
+    // Cleanup
+    if (tcp_children) {
+        pkg_free(tcp_children);
+        tcp_children = NULL;
+    }
+    current_si = tcp_listen;
+    while(current_si) {
+        struct socket_info* next_si = current_si->next;
+        pkg_free(current_si);
+        current_si = next_si;
+    }
+    tcp_listen = NULL;
+
+    return 0;
+}
+	

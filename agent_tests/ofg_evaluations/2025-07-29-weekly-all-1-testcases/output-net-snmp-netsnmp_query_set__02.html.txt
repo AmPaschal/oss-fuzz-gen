@@ -1,0 +1,135 @@
+
+	
+<description>
+The function `netsnmp_query_set` is used to send an SNMP SET request to an agent. It takes a list of variable bindings (`netsnmp_variable_list`) and a session (`netsnmp_session`) as input. It is a wrapper around the internal function `_query`, passing `SNMP_MSG_SET` as the request type. The `_query` function constructs a PDU, adds the variables from the input list, and sends it using `snmp_synch_response`. The function can use a per-thread default session if the provided session is NULL.
+</description>
+<requirements>
+
+<requirement>
+The `netsnmp_variable_list` pointer must not be NULL. A NULL pointer will cause a `SNMP_ERR_GENERR` error.
+</requirement>
+<requirement>
+The `netsnmp_variable_list` should be a valid, null-terminated linked list. The `_query` function iterates through this list to build the PDU.
+</requirement>
+<requirement>
+Each `netsnmp_variable_list` element must have a valid OID set in the `name` and `name_length` fields. These are used by `snmp_add_null_var` to create the varbind in the PDU.
+</requirement>
+<requirement>
+Each `netsnmp_variable_list` element must have its value and type set, using fields like `type`, `val.string`, and `val_len`. These are used by `snmp_clone_varbind` to set the value in the PDU for the SET request.
+</requirement>
+<requirement>
+A valid `netsnmp_session` must be provided either as the second argument or as a default session. A missing session will result in an error.
+</requirement>
+<requirement>
+A `netsnmp_session` can be created and initialized using the `snmp_open()` function. This is necessary for the underlying `snmp_synch_response()` call to succeed.
+</requirement>
+<requirement>
+Helper functions like `snmp_set_var_objid()` and `snmp_set_var_typed_value()` can be used to correctly populate a `netsnmp_variable_list` structure. This is the pattern observed in the callers of `netsnmp_query_set`.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int netsnmp_query_set(netsnmp_variable_list *, netsnmp_session *)
+</function_signature>
+<project_name>
+net-snmp
+</project_name>
+
+	Fuzz target source:
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/library/snmp_api.h>
+#include <net-snmp/library/snmp_client.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int LLVMFuzzerInitialized = 0;
+
+/* A simple structure to make parsing the input buffer more predictable. */
+typedef struct {
+    uint8_t oid_length; /* Number of sub-OIDs. Max 128. */
+    uint8_t type;       /* The ASN.1 type of the value. */
+    uint16_t value_length; /* Length of the value data. */
+} FuzzDataPrefix;
+
+#define MAX_FUZZ_OID_LENGTH 128
+
+int netsnmp_query_set(netsnmp_variable_list *, netsnmp_session *);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    netsnmp_session session;
+    netsnmp_variable_list *vars = NULL;
+    const FuzzDataPrefix *prefix;
+    const oid *oid_data;
+    const u_char *value_data;
+    size_t oid_byte_length;
+
+    if (!LLVMFuzzerInitialized) {
+        /* We don't want to read MIBs or configs from disk. */
+        netsnmp_ds_set_boolean(NETSNMP_DS_LIBRARY_ID,
+                               NETSNMP_DS_LIB_DONT_READ_CONFIGS, 1);
+        /* Initialize the MIB parsing infrastructure. */
+        netsnmp_init_mib();
+        LLVMFuzzerInitialized = 1;
+    }
+
+    /* We need at least enough data for the prefix structure. */
+    if (size < sizeof(FuzzDataPrefix)) {
+        return 0;
+    }
+
+    prefix = (const FuzzDataPrefix *)data;
+    uint8_t oid_len = prefix->oid_length;
+    if (oid_len == 0 || oid_len > MAX_FUZZ_OID_LENGTH) {
+        return 0;
+    }
+
+    oid_byte_length = oid_len * sizeof(oid);
+
+    /* Check if the total size is consistent. */
+    if (size < sizeof(FuzzDataPrefix) + oid_byte_length + prefix->value_length) {
+        return 0;
+    }
+
+    /* Set up pointers to the OID and value data within the input buffer. */
+    oid_data = (const oid *)(data + sizeof(FuzzDataPrefix));
+    value_data = data + sizeof(FuzzDataPrefix) + oid_byte_length;
+
+    /* Create a session. We use snmp_sess_init to create a dummy session
+     * that is sufficient for the call to netsnmp_query_set without
+     * requiring actual network configuration or communication. */
+    snmp_sess_init(&session);
+    session.version = SNMP_VERSION_3; /* Use a common version. */
+
+    /* Allocate a single variable binding. */
+    vars = (netsnmp_variable_list *)calloc(1, sizeof(netsnmp_variable_list));
+    if (vars == NULL) {
+        return 0;
+    }
+
+    /*
+     * Populate the variable using the recommended API functions. This is safer
+     * than manipulating the struct fields directly.
+     */
+    snmp_set_var_objid(vars, oid_data, oid_len);
+    snmp_set_var_typed_value(vars, prefix->type, value_data, prefix->value_length);
+
+    /*
+     * Call the function under test.
+     * The underlying snmp_synch_response will likely fail because there's no
+     * real network transport, but the code path for PDU creation and variable
+     * binding cloning will be exercised, which is the goal.
+     */
+    netsnmp_query_set(vars, &session);
+
+    /* Clean up the allocated variable binding. */
+    snmp_free_varbind(vars);
+
+    return 0;
+}
+	

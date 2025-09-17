@@ -1,0 +1,162 @@
+
+	
+<description>
+The sf_set_string function sets various string metadata in a sound file. The `sndfile` argument is a handle to the sound file, obtained by calling `sf_open`. The `str_type` argument specifies the type of metadata to set, and must be one of the `SF_STR_*` enum values defined in `sndfile.h`. The `str` argument is the string to be written to the file. The function returns 0 on success and a non-zero value on error.
+</description>
+<requirements>
+
+<requirement>
+The `sndfile` argument must be a valid pointer to a `SNDFILE` struct initialized by `sf_open()`. This is because the function dereferences the pointer and expects a valid file descriptor within the struct.
+</requirement>
+<requirement>
+The `SNDFILE` must be opened in a mode that allows writing (e.g., `SFM_WRITE` or `SFM_RDWR`). This is because the function will return an error if the file is opened in read-only mode.
+</requirement>
+<requirement>
+The `str_type` argument must be one of the `SF_STR_*` enum values defined in `sndfile.h`. These are the only values for which the function has defined behavior.
+</requirement>
+<requirement>
+The `str` argument must be a valid, null-terminated string. A non-null-terminated string could lead to a buffer overflow when the function processes it.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int sf_set_string(SNDFILE *, int, const char *)
+</function_signature>
+<project_name>
+libsndfile
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <string.h>
+#include <string>
+#include <vector>
+
+extern "C" {
+#include "sndfile.h"
+}
+
+// Custom VIO data structure to handle a writeable in-memory buffer.
+typedef struct {
+  sf_count_t offset;
+  std::vector<uint8_t> *data;
+} VIO_DATA_WRITE;
+
+// --- Virtual I/O Callbacks for Writing ---
+
+static sf_count_t vio_get_filelen_w(void *user_data) {
+  VIO_DATA_WRITE *vf = (VIO_DATA_WRITE *)user_data;
+  return vf->data->size();
+}
+
+static sf_count_t vio_seek_w(sf_count_t offset, int whence, void *user_data) {
+  VIO_DATA_WRITE *vf = (VIO_DATA_WRITE *)user_data;
+  sf_count_t new_offset;
+
+  switch (whence) {
+  case SEEK_SET:
+    new_offset = offset;
+    break;
+  case SEEK_CUR:
+    new_offset = vf->offset + offset;
+    break;
+  case SEEK_END:
+    new_offset = vf->data->size() + offset;
+    break;
+  default:
+    return -1;
+  }
+  vf->offset = new_offset;
+  return vf->offset;
+}
+
+static sf_count_t vio_read_w(void *ptr, sf_count_t count, void *user_data) {
+  VIO_DATA_WRITE *vf = (VIO_DATA_WRITE *)user_data;
+  sf_count_t remaining = vf->data->size() - vf->offset;
+  if (remaining < 0) {
+    remaining = 0;
+  }
+  sf_count_t can_read = (count > remaining) ? remaining : count;
+
+  if (can_read > 0) {
+    memcpy(ptr, vf->data->data() + vf->offset, can_read);
+    vf->offset += can_read;
+  }
+  return can_read;
+}
+
+static sf_count_t vio_write_w(const void *ptr, sf_count_t count,
+                              void *user_data) {
+  VIO_DATA_WRITE *vf = (VIO_DATA_WRITE *)user_data;
+  if (vf->offset + count > vf->data->size()) {
+    vf->data->resize(vf->offset + count);
+  }
+  memcpy(vf->data->data() + vf->offset, ptr, count);
+  vf->offset += count;
+  return count;
+}
+
+static sf_count_t vio_tell_w(void *user_data) {
+  VIO_DATA_WRITE *vf = (VIO_DATA_WRITE *)user_data;
+  return vf->offset;
+}
+
+// --- Fuzz Target ---
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Set up SF_INFO for opening a file for writing.
+  SF_INFO sndfile_info;
+  memset(&sndfile_info, 0, sizeof(SF_INFO));
+
+  const int kMajorFormats[] = {SF_FORMAT_WAV,  SF_FORMAT_AIFF, SF_FORMAT_AU,
+                               SF_FORMAT_RAW,  SF_FORMAT_FLAC, SF_FORMAT_OGG,
+                               SF_FORMAT_WAVEX};
+  const int kSubFormats[] = {
+      SF_FORMAT_PCM_16, SF_FORMAT_PCM_24,  SF_FORMAT_PCM_32,
+      SF_FORMAT_FLOAT,  SF_FORMAT_DOUBLE, SF_FORMAT_VORBIS};
+  sndfile_info.format = provider.PickValueInArray(kMajorFormats) |
+                        provider.PickValueInArray(kSubFormats);
+  sndfile_info.samplerate = provider.ConsumeIntegralInRange<int>(8000, 96000);
+  sndfile_info.channels = provider.ConsumeIntegralInRange<int>(1, 16);
+
+  // Set up a writeable virtual file.
+  std::vector<uint8_t> file_buffer;
+  VIO_DATA_WRITE vio_data;
+  vio_data.offset = 0;
+  vio_data.data = &file_buffer;
+
+  SF_VIRTUAL_IO vio;
+  vio.get_filelen = vio_get_filelen_w;
+  vio.seek = vio_seek_w;
+  vio.read = vio_read_w;
+  vio.write = vio_write_w;
+  vio.tell = vio_tell_w;
+
+  SNDFILE *sndfile =
+      sf_open_virtual(&vio, SFM_WRITE, &sndfile_info, &vio_data);
+  if (sndfile == NULL) {
+    return 0;
+  }
+
+  // Fuzz the parameters for sf_set_string.
+  const int str_type = provider.PickValueInArray(
+      {SF_STR_TITLE, SF_STR_COPYRIGHT, SF_STR_SOFTWARE, SF_STR_ARTIST,
+       SF_STR_COMMENT, SF_STR_DATE, SF_STR_ALBUM, SF_STR_LICENSE,
+       SF_STR_TRACKNUMBER, SF_STR_GENRE});
+  std::string str_to_set = provider.ConsumeRemainingBytesAsString();
+
+  // Call the function under test.
+  sf_set_string(sndfile, str_type, str_to_set.c_str());
+
+  sf_close(sndfile);
+
+  return 0;
+}
+	

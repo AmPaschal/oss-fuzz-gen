@@ -1,0 +1,102 @@
+
+	
+<description>
+The sf_open_fd function opens a sound file using a file descriptor. It takes a file descriptor, a mode, a pointer to an SF_INFO struct, and a flag to indicate whether to close the file descriptor when sf_close is called. It returns a pointer to a SNDFILE struct on success, and NULL on failure. The function first checks if the format is SD2, which is not allowed with file descriptors. Then, it allocates a private struct, initializes it, and calls psf_open_file to handle the rest of the opening process.
+</description>
+<requirements>
+<requirement>
+The first argument, `fd`, must be a valid file descriptor. This can be obtained from sources like `pipe()` or `open()`, as shown in the callers. </requirement>
+<requirement>
+The `mode` argument should be one of `SFM_READ` (0x10), `SFM_WRITE` (0x20), or `SFM_RDWR` (0x30). The callers exclusively use these modes for file operations.</requirement>
+<requirement>
+The `sfinfo` pointer must not be NULL. The function dereferences this pointer to access the format information without a prior null check.</requirement>
+<requirement>
+The `format` member of the `SF_INFO` struct should not be `SF_FORMAT_SD2`. The function contains an explicit check that rejects this format when using file descriptors.</requirement>
+<requirement>
+The `close_desc` argument should be either `SF_TRUE` (1) or `SF_FALSE` (0). Callers use this argument to control whether the file descriptor is closed when `sf_close` is called.</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+SNDFILE * sf_open_fd(int, int, SF_INFO *, int)
+</function_signature>
+<project_name>
+libsndfile
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+extern "C" {
+#include "/src/libsndfile/include/sndfile.h"
+}
+
+extern "C" SNDFILE *sf_open_fd(int, int, SF_INFO *, int);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Define parameters for sf_open_fd.
+  const int mode = provider.PickValueInArray({SFM_READ, SFM_WRITE, SFM_RDWR});
+  const int close_desc = provider.ConsumeBool() ? SF_TRUE : SF_FALSE;
+
+  SF_INFO sfinfo;
+  memset(&sfinfo, 0, sizeof(sfinfo));
+
+  // Consume data for sfinfo, but ensure we don't use more than a reasonable
+  // amount, leaving the rest for the file content.
+  if (provider.remaining_bytes() < sizeof(sfinfo)) {
+    return 0;
+  }
+  size_t consumed = provider.ConsumeData(&sfinfo, sizeof(sfinfo));
+  if (consumed != sizeof(sfinfo)) {
+    return 0;
+  }
+
+  // Per the function's requirements, SF_FORMAT_SD2 is not allowed.
+  // If the fuzzer picked it, change it to a common valid format.
+  if ((sfinfo.format & SF_FORMAT_TYPEMASK) == SF_FORMAT_SD2) {
+    sfinfo.format = (sfinfo.format & ~SF_FORMAT_TYPEMASK) | SF_FORMAT_WAV;
+  }
+
+  // Create a temporary file to get a valid file descriptor.
+  char filename[] = "/tmp/sf_fuzz-XXXXXX";
+  int fd = mkstemp(filename);
+  if (fd < 0) {
+    return 0;
+  }
+
+  // Unlink the file immediately so it's cleaned up automatically on exit.
+  unlink(filename);
+
+  // Write the rest of the fuzzing data to the file.
+  std::vector<uint8_t> file_content = provider.ConsumeRemainingBytes<uint8_t>();
+  write(fd, file_content.data(), file_content.size());
+
+  // Rewind the file descriptor to the beginning for reading.
+  lseek(fd, 0, SEEK_SET);
+
+  // Call the function under test.
+  SNDFILE *sndfile = sf_open_fd(fd, mode, &sfinfo, close_desc);
+
+  // Clean up.
+  if (sndfile) {
+    sf_close(sndfile);
+  } else {
+    // sf_open_fd fails, it closes the fd if close_desc is true.
+    // If close_desc is false, we are responsible for closing it.
+    if (!close_desc) {
+      close(fd);
+    }
+  }
+
+  return 0;
+}
+	

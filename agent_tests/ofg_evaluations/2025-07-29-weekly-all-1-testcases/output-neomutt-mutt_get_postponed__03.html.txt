@@ -1,0 +1,139 @@
+
+	
+<description>
+The `mutt_get_postponed` function is responsible for retrieving a postponed email message. It takes the current mailbox `m_cur`, a header template `hdr`, and pointers to store the retrieved email `cur` and a file copy path `fcc`. The function locates the 'postponed' mailbox, opens it, and if there are messages, it either selects the single existing message or prompts the user to choose one. It then prepares the template `hdr` using the content of the postponed message, marking the original for deletion. A key part of its logic involves parsing special `X-Mutt-*` headers from the postponed message to set up state for the new composition, such as the Fcc path, reply context, and cryptographic settings.
+</description>
+<requirements>
+
+<requirement>
+The `hdr` argument must be a pointer to a valid `Email` struct, allocated using `email_new()`. The caller `mutt_send_message` initializes this argument this way, and it is modified extensively within the function.
+</requirement>
+<requirement>
+The `hdr->env` member must point to a valid `Envelope` struct, which can be allocated using `mutt_env_new()`. This is necessary to safely access the `userhdrs` list and other envelope fields.
+</requirement>
+<requirement>
+The `fcc` argument must be a valid pointer to a `Buffer` struct, allocated from the buffer pool using `buf_pool_get()`. The function writes to this buffer, so it must be properly initialized to avoid memory corruption.
+</requirement>
+<requirement>
+The global configuration `NeoMutt->sub` must be initialized, and a value for "postponed" must be set. The function relies on this configuration to find the path to the postponed messages mailbox.
+</requirement>
+<requirement>
+To achieve full code coverage, the postponed mailbox that the function opens should contain at least one message. The function has an early exit if the mailbox is empty.
+</requirement>
+<requirement>
+To test the header parsing logic, the `hdr->env->userhdrs` list should be populated with strings containing headers like "X-Mutt-Fcc:", "X-Mutt-References:", "Mutt-PGP:", and "Mutt-SMIME:". This is crucial for exercising the code paths that handle saved message state.
+</requirement>
+<requirement>
+The `m_cur` argument can be NULL. If it is not NULL, it should be a pointer to a valid `Mailbox` structure, as the function may access its members.
+</requirement>
+<requirement>
+The `cur` argument must be a valid pointer to a `struct Email *`. It is used as an out-parameter to return the selected postponed email.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mutt_get_postponed(struct Mailbox *, struct Email *, struct Email **, struct Buffer *)
+</function_signature>
+<project_name>
+neomutt
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include "config/lib.h"
+#include "core/lib.h"
+#include "email/lib.h"
+#include "globals.h"
+#include "mutt/lib.h"
+#include "mutt.h"
+#include "protos.h"
+#include "mutt/pool.h"
+#include "email/envelope.h"
+#include "/src/neomutt/send/send.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+
+bool StartupComplete = true;
+
+/**
+ * log_disp_null - Discard log lines - Implements ::log_dispatcher_t - @ingroup logging_api
+ */
+static int log_disp_null(time_t stamp, const char *file, int line, const char *function, enum LogLevel level, const char *format, ...)
+{
+  return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+  MuttLogger = log_disp_null;
+  struct ConfigSet *cs = cs_new(16);
+  NeoMutt = neomutt_new(cs);
+  init_config(cs);
+  OptNoCurses = true;
+
+  char postponed_file[] = "/tmp/neomutt-postponed-fuzz-XXXXXX";
+  int fd = mkstemp(postponed_file);
+  if (fd < 0)
+  {
+    neomutt_free(&NeoMutt);
+    cs_free(&cs);
+    return 0;
+  }
+
+  FILE *fp = fdopen(fd, "wb");
+  if (!fp)
+  {
+    close(fd);
+    unlink(postponed_file);
+    neomutt_free(&NeoMutt);
+    cs_free(&cs);
+    return 0;
+  }
+
+  // A 'From ' line is needed for a valid mbox file
+  fprintf(fp, "From fuzz@example.com Sat Jan 1 00:00:00 2000\n");
+  fwrite(data, 1, size, fp);
+  fclose(fp);
+
+  cs_subset_str_string_set(NeoMutt->sub, "postponed", postponed_file, NULL);
+  cs_subset_str_string_set(NeoMutt->sub, "mbox_type", "mbox", NULL);
+  cs_subset_str_string_set(NeoMutt->sub, "delete", "yes", NULL);
+
+  struct Mailbox *m_cur = NULL;
+  struct Email *hdr = email_new();
+  struct Email *cur = NULL;
+  struct Buffer *fcc = buf_pool_get();
+
+  if (!hdr || !fcc)
+  {
+    goto cleanup;
+  }
+  hdr->env = mutt_env_new();
+  if (!hdr->env)
+  {
+    goto cleanup;
+  }
+
+  mutt_get_postponed(m_cur, hdr, &cur, fcc);
+
+cleanup:
+  if (hdr)
+    email_free(&hdr);
+  if (fcc)
+    buf_pool_release(&fcc);
+
+  neomutt_free(&NeoMutt);
+  cs_free(&cs);
+  unlink(postponed_file);
+
+  return 0;
+}
+	

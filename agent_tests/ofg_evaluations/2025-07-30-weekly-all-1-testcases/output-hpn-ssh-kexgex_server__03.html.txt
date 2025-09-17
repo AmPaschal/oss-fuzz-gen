@@ -1,0 +1,213 @@
+
+	
+<description>
+`kexgex_server` is part of the server-side SSH key exchange mechanism. It is not called directly but is assigned as a function pointer to the `kex` struct's `kex` array (e.g., `ssh->kex->kex[KEX_DH_GEX_SHA1] = kexgex_server`). Its primary role is to prepare for the next step in the Diffie-Hellman Group Exchange protocol. It does this by registering the `input_kex_dh_gex_request` function as the handler for the `SSH2_MSG_KEX_DH_GEX_REQUEST` message. When the client sends this message, the dispatcher will invoke `input_kex_dh_gex_request` to process it, which involves parsing the client's requested DH parameters and generating a suitable DH group. Therefore, for `kexgex_server` to function correctly, the `ssh` and `kex` structures must be fully initialized for a server-side key exchange.
+</description>
+<requirements>
+<requirement>
+The `ssh` argument must be a valid pointer to a `struct ssh` initialized by `ssh_alloc_session_state`. This function correctly allocates and initializes the `ssh` struct, including the `dispatch` table that `kexgex_server` modifies.
+</requirement>
+<requirement>
+The `ssh->kex` member must be a valid pointer to a `struct kex`, initialized by a call to `kex_new`. `kexgex_server` is invoked via this `kex` struct, and the handler it registers, `input_kex_dh_gex_request`, relies heavily on this struct's members.
+</requirement>
+<requirement>
+The `ssh->kex->server` flag must be set to 1. This is because `kexgex_server` and the subsequent message handlers are part of the server-side implementation of the SSH protocol.
+</requirement>
+<requirement>
+`ssh->kex->kex_type` must be set to an appropriate value like `KEX_DH_GEX_SHA1` or `KEX_DH_GEX_SHA256`. The target function is not called directly but through a function pointer array `kex->kex` which is indexed by `kex->kex_type`.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kexgex_server(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+
+extern "C" {
+
+#include "includes.h"
+#include "log.h"
+#include "myproposal.h"
+#include "packet.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "ssherr.h"
+#include "xmalloc.h"
+#include "sshkey.h"
+#include "authfile.h"
+#include "/src/hpn-ssh/kex.h"
+
+#include "fixed-keys.h"
+
+int kexgex_server(struct ssh *);
+
+struct shared_state {
+	size_t nkeys;
+	struct sshkey **privkeys, **pubkeys;
+};
+
+static void store_key(struct shared_state *st, struct sshkey *pubkey,
+    struct sshkey *privkey) {
+	if (st == NULL || pubkey->type < 0 || pubkey->type > INT_MAX ||
+	    privkey->type != pubkey->type ||
+	    ((size_t)pubkey->type < st->nkeys &&
+	    st->pubkeys[pubkey->type] != NULL))
+		abort();
+	if ((size_t)pubkey->type >= st->nkeys) {
+		st->pubkeys = (struct sshkey **)xrecallocarray(st->pubkeys,
+		    st->nkeys, pubkey->type + 1, sizeof(*st->pubkeys));
+		st->privkeys = (struct sshkey **)xrecallocarray(st->privkeys,
+		    st->nkeys, privkey->type + 1, sizeof(*st->privkeys));
+		st->nkeys = privkey->type + 1;
+	}
+	st->pubkeys[pubkey->type] = pubkey;
+	st->privkeys[privkey->type] = privkey;
+}
+
+static int prepare_key(struct shared_state *st, int kt, int bits) {
+	const char *pubstr = NULL;
+	const char *privstr = NULL;
+	char *tmp, *cp;
+	struct sshkey *privkey = NULL, *pubkey = NULL;
+	struct sshbuf *b = NULL;
+	int r;
+
+	switch (kt) {
+	case KEY_RSA:
+		pubstr = PUB_RSA;
+		privstr = PRIV_RSA;
+		break;
+	case KEY_DSA:
+		pubstr = PUB_DSA;
+		privstr = PRIV_DSA;
+		break;
+	case KEY_ECDSA:
+		pubstr = PUB_ECDSA;
+		privstr = PRIV_ECDSA;
+		break;
+	case KEY_ED25519:
+		pubstr = PUB_ED25519;
+		privstr = PRIV_ED25519;
+		break;
+	default:
+		abort();
+	}
+	if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+		abort();
+	if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0) {
+		error_fr(r, "priv %d", kt);
+		abort();
+	}
+	sshbuf_free(b);
+	tmp = cp = xstrdup(pubstr);
+	if ((pubkey = sshkey_new(KEY_UNSPEC)) == NULL)
+		abort();
+	if ((r = sshkey_read(pubkey, &cp)) != 0) {
+		error_fr(r, "pub %d", kt);
+		abort();
+	}
+	free(tmp);
+
+	store_key(st, pubkey, privkey);
+	return 0;
+}
+
+static int prepare_keys(struct shared_state *st) {
+	if (prepare_key(st, KEY_RSA, 2048) != 0 ||
+	    prepare_key(st, KEY_DSA, 1024) != 0 ||
+	    prepare_key(st, KEY_ECDSA, 256) != 0 ||
+	    prepare_key(st, KEY_ED25519, 256) != 0) {
+		error_f("key prepare failed");
+		return -1;
+	}
+	return 0;
+}
+
+static struct sshkey *get_pubkey(struct shared_state *st, int keytype) {
+	if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys ||
+	    st->pubkeys == NULL || st->pubkeys[keytype] == NULL)
+		return NULL;
+	return st->pubkeys[keytype];
+}
+
+static struct sshkey *get_privkey(struct shared_state *st, int keytype) {
+	if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys ||
+	    st->privkeys == NULL || st->privkeys[keytype] == NULL)
+		return NULL;
+	return st->privkeys[keytype];
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+	static struct shared_state *st;
+	struct ssh *server = NULL;
+	struct kex_params kex_params;
+	char *myproposal[PROPOSAL_MAX] = { 0 };
+	const char *proposal_template[PROPOSAL_MAX] = { KEX_SERVER };
+	struct sshkey *pubkey, *privkey;
+	u_char type;
+	int r, i;
+
+	if (st == NULL) {
+		log_init("kexgex_fuzz", SYSLOG_LEVEL_ERROR, SYSLOG_FACILITY_AUTH, 1);
+		st = (struct shared_state *)xcalloc(1, sizeof(*st));
+		if (prepare_keys(st) != 0)
+			abort();
+	}
+
+	if (size == 0)
+		return 0;
+
+	for (i = 0; i < PROPOSAL_MAX; i++) {
+		if ((myproposal[i] = strdup(proposal_template[i])) == NULL)
+			abort();
+	}
+
+	free(myproposal[PROPOSAL_KEX_ALGS]);
+	myproposal[PROPOSAL_KEX_ALGS] = xstrdup(KEX_DHGEX_SHA256);
+
+	pubkey = get_pubkey(st, KEY_RSA);
+	privkey = get_privkey(st, KEY_RSA);
+	if (pubkey == NULL || privkey == NULL) {
+		goto out;
+	}
+	free(myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS]);
+	myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = xstrdup(sshkey_ssh_name(pubkey));
+	memcpy(kex_params.proposal, myproposal, sizeof(myproposal));
+
+	if (ssh_init(&server, 1, &kex_params) != 0)
+		goto out;
+
+	if (ssh_add_hostkey(server, privkey) != 0)
+		goto out;
+
+	if (ssh_input_append(server, data, size) != 0)
+		goto out;
+
+	while (server->kex != NULL && !server->kex->done) {
+		r = ssh_packet_read_seqnr(server, &type, NULL);
+		if (r != 0)
+			break;
+		if (type != 0)
+			break;
+	}
+
+out:
+	ssh_free(server);
+	for (i = 0; i < PROPOSAL_MAX; i++)
+		free(myproposal[i]);
+	return 0;
+}
+
+} // extern "C"
+	

@@ -1,0 +1,139 @@
+
+	
+<description>
+The target function `process_and_close_socket` is responsible for handling an accepted client connection. It extracts remote and local address information, processes the request using `process_server_socket`, and then shuts down and closes the socket. The function is invoked from a task queue within the server's listening loop (`listen_internal`). The `sock` argument passed to it is a file descriptor for a connected client socket, which is the result of an `accept` system call. Therefore, for the function to be tested correctly, the `sock` argument must represent a valid and connected socket. This requires setting up a listening server socket beforehand and accepting a new connection. Simply providing a random integer will lead to undefined behavior and crashes within the various socket utility functions called by the target. The server's internal state, such as timeouts and the server socket `svr_sock_`, also influences the behavior of the function. Therefore, a `httplib::Server` object must be properly initialized before calling this function.
+</description>
+<requirements>
+<requirement>
+The `sock` argument must be a valid, connected socket descriptor. This is because it is passed to socket-level functions like `getpeername`, `getsockname`, `shutdown`, and `close` which expect a valid descriptor.
+</requirement>
+<requirement>
+A `httplib::Server` object must be instantiated and its `svr_sock_` member must be initialized to a valid listening socket. This is because `process_server_socket`, which is called by the target function, reads server configuration like timeouts and the server socket from the `Server` object.
+</requirement>
+<requirement>
+To obtain a valid `sock` for the target function, a client must connect to the server's listening socket `svr_sock_`, and the connection must be `accept()`-ed. The `sock` returned by `accept()` is the correct input for the target function, ensuring it represents an active connection ready for processing.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool httplib::Server::process_and_close_socket(socket_t)
+</function_signature>
+<project_name>
+cpp-httplib
+</project_name>
+
+	Fuzz target source:
+#include <cstdint>
+#include "/src/cpp-httplib/httplib.h"
+
+// A stream that reads from the fuzzer's input buffer.
+class FuzzedStream : public httplib::Stream {
+public:
+  FuzzedStream(const uint8_t *data, size_t size)
+      : data_(data), size_(size), read_pos_(0) {}
+
+  ~FuzzedStream() override = default;
+
+  bool is_readable() const override { return read_pos_ < size_; }
+
+  bool wait_readable() const override { return true; }
+
+  bool wait_writable() const override { return true; }
+
+  ssize_t read(char *ptr, size_t size) override {
+    if (read_pos_ >= size_) {
+      return -1; // No more data
+    }
+    size_t remaining = size_ - read_pos_;
+    size_t bytes_to_read = size > remaining ? remaining : size;
+    memcpy(ptr, data_ + read_pos_, bytes_to_read);
+    read_pos_ += bytes_to_read;
+    return static_cast<ssize_t>(bytes_to_read);
+  }
+
+  ssize_t write(const char *ptr, size_t size) override {
+    // For fuzzing, we can just discard the written data.
+    return static_cast<ssize_t>(size);
+  }
+
+  void get_remote_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 12345;
+  }
+
+  void get_local_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 8080;
+  }
+
+  socket_t socket() const override {
+    // Return a dummy socket descriptor.
+    return 0;
+  }
+
+  time_t duration() const override { return 0; }
+
+private:
+  const uint8_t *data_;
+  size_t size_;
+  size_t read_pos_;
+};
+
+// A server class with a public method to fuzz the socket processing logic.
+class FuzzableServer : public httplib::Server {
+public:
+  // This method simulates the core logic of `process_and_close_socket`
+  // but uses our `FuzzedStream` instead of a real socket.
+  bool ProcessAndCloseFuzzedSocket(httplib::Stream &strm) {
+    std::string remote_addr;
+    int remote_port = 0;
+    strm.get_remote_ip_and_port(remote_addr, remote_port);
+
+    std::string local_addr;
+    int local_port = 0;
+    strm.get_local_ip_and_port(local_addr, local_port);
+
+    bool close_connection = false;
+    bool connection_closed = false;
+
+    // This is the core logic from `process_and_close_socket` that we want to fuzz.
+    // It processes one request from the stream.
+    auto ret = process_request(strm, remote_addr, remote_port, local_addr,
+                               local_port, false, close_connection,
+                               nullptr);
+
+    return ret;
+  }
+};
+
+static FuzzableServer g_server;
+
+// Initialize the server with some routes.
+extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
+  g_server.Get(R"(.*)",
+               [&](const httplib::Request &, httplib::Response &res) {
+                 res.set_content("response", "text/plain");
+               });
+  g_server.Post(R"(.*)",
+                [&](const httplib::Request &, httplib::Response &res) {
+                  res.set_content("response", "text/plain");
+                });
+  g_server.Put(R"(.*)",
+               [&](const httplib::Request &, httplib::Response &res) {
+                 res.set_content("response", "text/plain");
+               });
+  return 0;
+}
+
+// The main fuzzing entry point.
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+  FuzzedStream stream(data, size);
+  g_server.ProcessAndCloseFuzzedSocket(stream);
+  return 0;
+}
+	

@@ -1,0 +1,110 @@
+
+	
+<description>
+The function `process_and_close_socket` is a member function of the `httplib::Server` class. It is responsible for processing an incoming connection on a socket, handling the HTTP request, and then closing the socket. It reads various timeout and keep-alive settings from the `Server` object to properly manage the connection. The socket is expected to be a valid, connected socket, typically obtained from an `accept` call on the server's listening socket.
+</description>
+<requirements>
+
+<requirement>
+The `sock` argument must be a valid, connected socket descriptor. This is because the function will perform read and write operations on this socket, and an invalid descriptor will lead to system call errors.
+</requirement>
+<requirement>
+An `httplib::Server` instance must be created and its `listen` method must be called before calling this function. This is to ensure that the server is listening for connections, which is a prerequisite for obtaining a valid socket descriptor to pass to this function.
+</requirement>
+<requirement>
+The `Server` object's timeout settings (`read_timeout_sec_`, `read_timeout_usec_`, `write_timeout_sec_`, `write_timeout_usec_`) and keep-alive settings (`keep_alive_max_count_`, `keep_alive_timeout_sec_`) should be configured before calling this function. The function uses these settings to control the behavior of the connection.
+</requirement>
+<requirement>
+The call to `process_and_close_socket` should be dispatched to a separate thread. This is because it is a blocking operation, and running it in a separate thread will prevent the main server loop from stalling.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool httplib::Server::process_and_close_socket(socket_t)
+</function_signature>
+<project_name>
+cpp-httplib
+</project_name>
+
+	Fuzz target source:
+#include <cstdint>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// This is a common technique to allow testing of private methods.
+// By defining 'private' as 'public' before including the header,
+// we make all private members of the class public for this compilation unit.
+#define private public
+#include "/src/cpp-httplib/httplib.h"
+// It's good practice to undefine the macro immediately after use
+// to avoid side effects in other included files.
+#undef private
+
+// A derived class to expose the (originally) private method for fuzzing.
+class FuzzableServer : public httplib::Server {
+public:
+  // This public method is a wrapper to call the now-public
+  // 'process_and_close_socket' method from the base class.
+  bool FuzzProcessAndCloseSocket(socket_t sock) {
+    return process_and_close_socket(sock);
+  }
+};
+
+// Global server instance of our new fuzzable class.
+static FuzzableServer g_server;
+
+// Initialize the server with handlers for all HTTP methods.
+// This is necessary because process_and_close_socket will eventually
+// try to dispatch the request to a handler.
+extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
+  g_server.Get(R"(.*)", [&](const httplib::Request & /*req*/, httplib::Response &res) { res.set_content("response content", "text/plain"); });
+  g_server.Post(R"(.*)", [&](const httplib::Request & /*req*/, httplib::Response &res) { res.set_content("response content", "text/plain"); });
+  g_server.Put(R"(.*)", [&](const httplib::Request & /*req*/, httplib::Response &res) { res.set_content("response content", "text/plain"); });
+  g_server.Patch(R"(.*)", [&](const httplib::Request & /*req*/, httplib::Response &res) { res.set_content("response content", "text/plain"); });
+  g_server.Delete(R"(.*)", [&](const httplib::Request & /*req*/, httplib::Response &res) { res.set_content("response content", "text/plain"); });
+  g_server.Options(R"(.*)", [&](const httplib::Request & /*req*/, httplib::Response &res) { res.set_content("response content", "text/plain"); });
+  return 0;
+}
+
+// Fuzz the process_and_close_socket function
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+
+  // Create a connected pair of sockets.
+  // sp[0] will be used by the server to read the request.
+  // sp[1] will be used by the fuzzer to write the request.
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == -1) {
+    return 0;
+  }
+
+  // Write the entire fuzzer input to the socket.
+  // This simulates a client sending an HTTP request.
+  size_t total_written = 0;
+  while (total_written < size) {
+    ssize_t written = write(sp[1], data + total_written, size - total_written);
+    if (written <= 0) {
+      // If write fails, we can't proceed. Clean up and exit.
+      close(sp[0]);
+      close(sp[1]);
+      return 0;
+    }
+    total_written += written;
+  }
+
+  // Close the writer's end of the socket pair. This will send an EOF
+  // to the reader's end, signaling the end of the request.
+  close(sp[1]);
+
+  // Call the target function through our public wrapper.
+  // The function itself will close sp[0].
+  g_server.FuzzProcessAndCloseSocket(sp[0]);
+
+  return 0;
+}
+	

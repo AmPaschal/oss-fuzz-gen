@@ -1,0 +1,115 @@
+
+	
+<description>
+The `X509_verify_cert` function verifies a certificate by attempting to build a certificate chain from the provided certificate to a trusted, self-signed certificate. The core input is the `X509_STORE_CTX` structure, which must be initialized before calling this function. The verification process involves checking the certificate chain's validity, including signatures, expiration times, key usage extensions, and revocation status against CRLs if configured. The function's behavior can be extensively customized through the flags and parameters set in the `X509_VERIFY_PARAM` structure within the context.
+</description>
+<requirements>
+
+<requirement>
+The `X509_STORE_CTX` object should be initialized by calling `X509_STORE_CTX_init` before use. This function correctly sets up the context, including the certificate to be verified and the store containing trusted certificates.
+</requirement>
+<requirement>
+The `ctx->cert` field of the `X509_STORE_CTX` must not be NULL. This is a mandatory field representing the certificate to be verified, and the function will fail with `X509_V_ERR_INVALID_CALL` if it is not set.
+</requirement>
+<requirement>
+The `ctx->chain` field of the `X509_STORE_CTX` must be NULL before calling `X509_verify_cert`. The function allocates and builds the chain itself, and a pre-existing chain indicates that the context has already been used.
+</requirement>
+<requirement>
+The `ctx->param->flags` should not contain `X509_V_FLAG_EXTENDED_CRL_SUPPORT` or `X509_V_FLAG_USE_DELTAS`. These flags correspond to unsupported features, and the function will return an error if they are present.
+</requirement>
+<requirement>
+If CRL checking is enabled via the `X509_V_FLAG_CRL_CHECK` flag, the `ctx->crls` field should be populated with a stack of `X509_CRL` objects. This allows the function to check the revocation status of the certificates in the chain.
+</requirement>
+<requirement>
+The `ctx->verify_cb` field can be set to a custom callback function for fine-grained control over the verification process. If not set, a default null callback is used, which approves all verification steps that the main function considers successful.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int X509_verify_cert(X509_STORE_CTX *ctx)
+</function_signature>
+<project_name>
+boringssl
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <openssl/base.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+
+#include <vector>
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // The input is split into a leaf certificate and a chain of intermediates
+  // and roots.
+  size_t cert_len = provider.ConsumeIntegralInRange<size_t>(0, provider.remaining_bytes());
+  std::vector<uint8_t> cert_data = provider.ConsumeBytes<uint8_t>(cert_len);
+  std::vector<uint8_t> chain_data = provider.ConsumeRemainingBytes<uint8_t>();
+
+  const uint8_t *p = cert_data.data();
+  bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &p, cert_data.size()));
+  if (!cert) {
+    return 0;
+  }
+
+  bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+  if (!store) {
+    return 0;
+  }
+
+  // The remainder of the input is treated as a series of DER-encoded
+  // certificates to populate the trust store.
+  p = chain_data.data();
+  const uint8_t *end = p + chain_data.size();
+  while (p < end) {
+    bssl::UniquePtr<X509> ca(d2i_X509(nullptr, &p, end - p));
+    if (!ca) {
+      // If parsing fails, we may have hit invalid data. Stop.
+      break;
+    }
+    // X509_STORE_add_cert takes ownership on success.
+    if (!X509_STORE_add_cert(store.get(), ca.get())) {
+      // Error adding cert (e.g., duplicate). |ca| is freed by UniquePtr.
+    } else {
+      // Success. |ca| is now owned by the store.
+      ca.release();
+    }
+  }
+
+  bssl::UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  if (!ctx) {
+    return 0;
+  }
+
+  if (!X509_STORE_CTX_init(ctx.get(), store.get(), cert.get(), nullptr)) {
+    return 0;
+  }
+
+  // Fuzz some verification flags, avoiding unsupported ones.
+  uint32_t flags = provider.ConsumeIntegral<uint32_t>();
+  flags &= ~X509_V_FLAG_EXTENDED_CRL_SUPPORT;
+  flags &= ~X509_V_FLAG_USE_DELTAS;
+  X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx.get());
+  X509_VERIFY_PARAM_set_flags(param, flags);
+
+  // Fuzz the verification time.
+  if (provider.ConsumeBool()) {
+    time_t check_time = provider.ConsumeIntegral<time_t>();
+    X509_STORE_CTX_set_time(ctx.get(), 0, check_time);
+  }
+
+  X509_verify_cert(ctx.get());
+
+  // Clear error queue to avoid leaking state between iterations.
+  ERR_clear_error();
+
+  return 0;
+}
+	

@@ -1,0 +1,166 @@
+
+	
+<description>
+The H5D__chunk_copy function is an internal function in the HDF5 library responsible for copying chunked dataset data from a source file to a destination file. It handles the complexities of chunked storage, including iterating over chunks, performing data type conversions if necessary, and managing I/O pipelines. The caller, H5O__layout_copy_file, invokes this function specifically when it detects a dataset with a chunked layout (H5D_CHUNKED) that has allocated space for its chunks.
+</description>
+<requirements>
+
+<requirement>
+The f_src and f_dst arguments, representing the source and destination files, must be valid and open H5F_t file objects. This is because the function directly uses these file objects for read and write operations, and a NULL or invalid object will lead to a crash.
+</requirement>
+<requirement>
+The storage_src and storage_dst arguments must point to valid H5O_storage_chunk_t structures. The 'idx_type' and 'ops' fields of these structures must be one of the following valid combinations: (H5D_CHUNK_IDX_EARRAY, H5D_COPS_EARRAY), (H5D_CHUNK_IDX_FARRAY, H5D_COPS_FARRAY), (H5D_CHUNK_IDX_BT2, H5D_COPS_BT2), or (H5D_CHUNK_IDX_BTREE, H5D_COPS_BTREE), as enforced by the H5D_CHUNK_STORAGE_INDEX_CHK macro.
+</requirement>
+<requirement>
+The `storage_src->ops` field must point to a valid `H5D_chunk_ops_t` structure with the `copy_setup` and `iterate` members initialized to valid function pointers. The function calls these function pointers to perform the chunk copying, and a null pointer would cause a crash.
+</requirement>
+<requirement>
+The layout_src argument must point to a valid H5O_layout_chunk_t structure. Its 'ndims' and 'dim' fields are used to determine the chunk dimensions for the copy operation.
+</requirement>
+<requirement>
+The ds_extent_src argument must be a valid pointer to an H5S_extent_t object. The function uses this to get the dataspace dimensions via H5S_extent_get_dims.
+</requirement>
+<requirement>
+The dt_src argument must be a valid pointer to an H5T_t object. This is crucial as the function performs various operations on it, including type detection and conversion.
+</requirement>
+<requirement>
+The cpy_info argument must be a valid pointer to an H5O_copy_t object. The function accesses its 'expand_ref' and 'shared_fo' members, so a NULL pointer would lead to a crash.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+herr_t H5D__chunk_copy(H5F_t *, H5O_storage_chunk_t *, H5O_layout_chunk_t *, H5F_t *, H5O_storage_chunk_t *, const H5S_extent_t *, H5T_t *, const H5O_pline_t *, H5O_copy_t *)
+</function_signature>
+<project_name>
+hdf5
+</project_name>
+
+	Fuzz target source:
+#define H5D_FRIEND
+#define H5F_FRIEND
+#define H5S_FRIEND
+#define H5T_FRIEND
+
+#include "hdf5.h"
+#include "H5private.h"
+#include "H5Dpkg.h"
+#include "H5Fprivate.h"
+#include "H5Iprivate.h"
+#include "H5Pprivate.h"
+#include "H5Spkg.h"
+#include "H5Tpkg.h"
+
+#include <string.h>
+#include <stdlib.h>
+
+// Forward declaration of the function-under-test
+herr_t H5D__chunk_copy(H5F_t *, H5O_storage_chunk_t *, H5O_layout_chunk_t *, H5F_t *, H5O_storage_chunk_t *, const H5S_extent_t *, H5T_t *, const H5O_pline_t *, H5O_copy_t *);
+
+// Helper to consume one byte from the fuzzer input
+static int consume_u8(const uint8_t **data, size_t *size, uint8_t *val) {
+    if (*size < 1) return 0;
+    *val = **data;
+    (*data)++;
+    (*size)--;
+    return 1;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    hid_t fapl_id = -1, f_src_id = -1, f_dst_id = -1;
+    hid_t sid = -1, dcpl = -1, did = -1;
+
+    // Use core VFD to avoid writing to disk, which is faster for fuzzing.
+    fapl_id = H5Pcreate(H5P_FILE_ACCESS);
+    if (fapl_id < 0) goto error;
+    H5Pset_fapl_core(fapl_id, 4096, 0);
+
+    // Use the latest file format to have access to all chunk indexing schemes.
+    H5Pset_libver_bounds(fapl_id, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
+
+    // Create in-memory source and destination files.
+    f_src_id = H5Fcreate("f_src.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id);
+    f_dst_id = H5Fcreate("f_dst.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id);
+    if (f_src_id < 0 || f_dst_id < 0) goto error;
+
+    // Get internal file object pointers from their IDs.
+    H5F_t *f_src = (H5F_t *)H5I_object(f_src_id);
+    H5F_t *f_dst = (H5F_t *)H5I_object(f_dst_id);
+    if (!f_src || !f_dst) goto error;
+
+    // --- Create a source dataset to build the required state ---
+    uint8_t rank_u8;
+    if (!consume_u8(&data, &size, &rank_u8)) goto error;
+    int rank = (rank_u8 % H5S_MAX_RANK) + 1;
+
+    hsize_t dims[H5S_MAX_RANK];
+    hsize_t max_dims[H5S_MAX_RANK];
+    hsize_t chunk_dims[H5S_MAX_RANK];
+    for (int i = 0; i < rank; ++i) {
+        uint8_t dim_u8, chunk_dim_u8;
+        if (!consume_u8(&data, &size, &dim_u8) || !consume_u8(&data, &size, &chunk_dim_u8))
+            goto error;
+        dims[i] = (dim_u8 % 10) + 1;
+        max_dims[i] = H5S_UNLIMITED;
+        chunk_dims[i] = (chunk_dim_u8 % dims[i]) + 1;
+    }
+
+    sid = H5Screate_simple(rank, dims, max_dims);
+    if (sid < 0) goto error;
+
+    dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    if (dcpl < 0) goto error;
+    H5Pset_chunk(dcpl, rank, chunk_dims);
+
+    did = H5Dcreate2(f_src_id, "dset", H5T_NATIVE_INT, sid, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    if (did < 0) goto error;
+
+    // Write some data to ensure chunks and their indices are created.
+    hsize_t num_elements = 1;
+    for (int i = 0; i < rank; i++) num_elements *= dims[i];
+    int *wdata = (int*)calloc((size_t)num_elements, sizeof(int));
+    if (wdata) {
+        H5Dwrite(did, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, wdata);
+        free(wdata);
+    }
+    H5Fflush(f_src_id, H5F_SCOPE_GLOBAL);
+
+    // Get the internal dataset object.
+    H5D_t *dset_src = (H5D_t *)H5I_object(did);
+    if (!dset_src || dset_src->shared->layout.type != H5D_CHUNKED) goto error;
+
+    // --- Extract parameters for H5D__chunk_copy from the live dataset object ---
+    H5O_storage_chunk_t *storage_src = &dset_src->shared->layout.storage.u.chunk;
+    H5O_layout_chunk_t  *layout_src  = &dset_src->shared->layout.u.chunk;
+    const H5S_extent_t  *ds_extent_src = &dset_src->shared->space->extent;
+    H5T_t               *dt_src      = dset_src->shared->type;
+    const H5O_pline_t   *pline_src   = &dset_src->shared->dcpl_cache.pline;
+
+    // --- Prepare destination storage and copy info ---
+    H5O_storage_chunk_t storage_dst;
+    memcpy(&storage_dst, storage_src, sizeof(H5O_storage_chunk_t));
+
+    H5O_copy_t cpy_info;
+    memset(&cpy_info, 0, sizeof(H5O_copy_t));
+    cpy_info.file_dst = f_dst;
+    uint8_t expand_ref_u8;
+    if (consume_u8(&data, &size, &expand_ref_u8))
+        cpy_info.expand_ref = expand_ref_u8 % 2;
+
+    // --- Call the function under test ---
+    H5D__chunk_copy(f_src, storage_src, layout_src, f_dst, &storage_dst,
+                    ds_extent_src, dt_src, pline_src, &cpy_info);
+
+error:
+    if (did >= 0) H5Dclose(did);
+    if (dcpl >= 0) H5Pclose(dcpl);
+    if (sid >= 0) H5Sclose(sid);
+    if (f_src_id >= 0) H5Fclose(f_src_id);
+    if (f_dst_id >= 0) H5Fclose(f_dst_id);
+    if (fapl_id >= 0) H5Pclose(fapl_id);
+
+    return 0;
+}
+	

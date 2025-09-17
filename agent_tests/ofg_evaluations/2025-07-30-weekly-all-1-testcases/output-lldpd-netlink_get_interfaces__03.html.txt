@@ -1,0 +1,115 @@
+
+	
+<description>
+The `netlink_get_interfaces` function retrieves a list of network interfaces from the system using netlink sockets. It first calls `netlink_initialize` to set up the netlink communication channel and populate the interface and address lists within the `cfg->g_netlink` structure. If `netlink_initialize` has already been successfully called, it will not re-initialize the netlink subsystem. After a successful initialization, the function iterates through the retrieved list of interfaces and resets the `ignore` flag for each interface. Finally, it returns the list of interfaces stored in `cfg->g_netlink->devices`.
+</description>
+<requirements>
+<requirement>
+The `cfg` argument must be a valid pointer to a `struct lldpd` structure. This is because the function accesses members of this structure, and a NULL pointer would lead to a crash.
+</requirement>
+<requirement>
+The `cfg->g_netlink` member should ideally be NULL before the first call to `netlink_get_interfaces`. This is because `netlink_initialize` will allocate and initialize this structure, and subsequent calls will use the initialized structure.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+struct interfaces_device_list * netlink_get_interfaces(struct lldpd *)
+</function_signature>
+<project_name>
+lldpd
+</project_name>
+
+	Fuzz target source:
+#include "../src/daemon/lldpd.h"
+#include <string.h>
+#include <stdlib.h>
+
+/* Use this callback to avoid some logs */
+void donothing(int pri, const char *msg) {};
+
+/*
+ * The function under test is declared in lldpd.h, but the prompt
+ * explicitly asks for this declaration to be present.
+ */
+struct interfaces_device_list * netlink_get_interfaces(struct lldpd *);
+
+/*
+ * The definition of struct lldpd_netlink is not available in a public
+ * header, so we define it here to allow access to its members.
+ */
+struct lldpd_netlink {
+	int nl_socket_queries;
+	int nl_socket_changes;
+	int nl_socket_recv_size;
+	/* Cache */
+	struct interfaces_device_list *devices;
+	struct interfaces_address_list *addresses;
+};
+
+extern int
+LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+	if (Size == 0) {
+		return 0;
+	}
+
+	log_register(donothing);
+
+	struct lldpd cfg;
+	memset(&cfg, 0, sizeof(struct lldpd));
+
+	/*
+	 * Manually set up the g_netlink structure to bypass the real network
+	 * initialization in netlink_initialize(), which would fail in a
+	 * sandboxed environment.
+	 */
+	cfg.g_netlink = calloc(1, sizeof(struct lldpd_netlink));
+	if (!cfg.g_netlink) {
+		return 0;
+	}
+	cfg.g_netlink->nl_socket_queries = -1;
+	cfg.g_netlink->nl_socket_changes = -1;
+
+	cfg.g_netlink->devices = malloc(sizeof(struct interfaces_device_list));
+	if (!cfg.g_netlink->devices) {
+		free(cfg.g_netlink);
+		return 0;
+	}
+	TAILQ_INIT(cfg.g_netlink->devices);
+
+	/*
+	 * Create a dummy device from fuzzer input. This allows us to test the
+	 * TAILQ_FOREACH loop inside netlink_get_interfaces().
+	 */
+	struct interfaces_device *dev = calloc(1, sizeof(struct interfaces_device));
+	if (!dev) {
+		free(cfg.g_netlink->devices);
+		free(cfg.g_netlink);
+		return 0;
+	}
+
+	dev->name = strndup((const char*)Data, Size);
+	if (!dev->name) {
+		free(dev);
+		free(cfg.g_netlink->devices);
+		free(cfg.g_netlink);
+		return 0;
+	}
+	dev->ignore = 1; /* The function should set this to 0. */
+
+	TAILQ_INSERT_TAIL(cfg.g_netlink->devices, dev, next);
+
+	/* Call the function under test. */
+	netlink_get_interfaces(&cfg);
+
+	/*
+	 * Use the project's cleanup function. It will free dev->name, dev,
+	 * the devices list, and g_netlink.
+	 */
+	netlink_cleanup(&cfg);
+
+	return 0;
+}
+	

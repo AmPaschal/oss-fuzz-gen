@@ -1,0 +1,156 @@
+
+	
+<description>
+The function `gf_sc_scene_update` updates the scene of a compositor. The `compositor` argument is a pointer to a `GF_Compositor` struct, which holds the state of the compositor. The `type` argument is a string that specifies the type of the update, and can be NULL. The `com` argument is a string that contains the update command. The function's behavior depends on the values of `type` and `com`. If `type` is "application/ecmascript" or "js", the function will attempt to execute the `com` string as a JavaScript script. This requires the QJS engine to be enabled. If `type` is NULL and `com` starts with "gpac ", the function will parse and execute a GPAC-specific command. Otherwise, the function will attempt to load the `com` string as a scene update, with the format determined by the `type` string or by sniffing the content of `com`. The function uses a `GF_SceneLoader` struct to load the scene update. The loaded commands are then applied to the scene graph.
+</description>
+<requirements>
+<requirement>
+The `compositor` argument must be a valid pointer to a `GF_Compositor` struct. This is because the function dereferences this pointer to access the compositor's state.
+</requirement>
+<requirement>
+The `com` argument must be a non-NULL, null-terminated string. This is because the function uses this string as input to other functions that expect a valid string.
+</requirement>
+<requirement>
+The `compositor->root_scene` field must be a valid pointer to a `GF_Scene` struct. This is because the function uses this field to access the scene to be updated.
+</requirement>
+<requirement>
+The `compositor->root_scene->graph` field must be a valid pointer to a `GF_SceneGraph` struct. This is because the function uses this field to access the scene graph to be updated.
+</requirement>
+<requirement>
+If the `type` argument is "application/ecmascript" or "js", the QJS engine must be enabled. This is because the function will attempt to execute the `com` string as a JavaScript script, which requires the QJS engine.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+GF_Err gf_sc_scene_update(GF_Compositor *, char *, char *)
+</function_signature>
+<project_name>
+gpac
+</project_name>
+
+	Fuzz target source:
+// HACK: The build environment may disable the scene manager and filters.
+// We undefine the guards to ensure the necessary functions are declared.
+// This must be done BEFORE any gpac headers are included.
+#ifdef GPAC_DISABLE_SCENE_MANAGER
+#undef GPAC_DISABLE_SCENE_MANAGER
+#endif
+#ifdef GPAC_DISABLE_FILTERS
+#undef GPAC_DISABLE_FILTERS
+#endif
+
+#include <gpac/tools.h>
+#include <gpac/filters.h>
+#include <gpac/compositor.h>
+#include <gpac/scenegraph.h>
+#include <gpac/scene_manager.h>
+#include <gpac/internal/compositor_dev.h> // Needed for GF_Scene, gf_scene_new, etc.
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// Global session to avoid creating/destroying it for each input.
+static GF_FilterSession *fs = NULL;
+static GF_Filter *compose_filter = NULL;
+static GF_Compositor *compositor = NULL;
+
+// This function is called once by the fuzzer engine to initialize any global state.
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    // Initialize the GPAC system. This is crucial and must be called first.
+    // Using 0 for the mem_tracker_type is equivalent to disabling it.
+    gf_sys_init(0, NULL);
+    // Suppress logs to keep fuzzing output clean.
+    gf_log_set_tool_level(GF_LOG_ALL, GF_LOG_QUIET);
+    gf_log_set_tool_level(GF_LOG_COMPOSE, GF_LOG_QUIET);
+
+    // Create a filter session, which is the main context for GPAC filters.
+    fs = gf_fs_new_defaults(0);
+    if (!fs) return -1;
+
+    // Load the compositor filter. This will also allocate and initialize the GF_Compositor structure.
+    compose_filter = gf_fs_load_filter(fs, "compositor", NULL);
+    if (!compose_filter) {
+        gf_fs_del(fs);
+        fs = NULL;
+        return -1;
+    }
+
+    // Get the compositor object from the filter's user data.
+    compositor = gf_filter_get_udta(compose_filter);
+    if (!compositor) {
+        // The call to gf_filter_delete is removed to avoid a linker error,
+        // as the function may not be included in the static library.
+        // A minor leak here in initialization is acceptable for the fuzzer.
+        compose_filter = NULL;
+        gf_fs_del(fs);
+        fs = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // Ensure the global compositor was initialized and we have some data.
+    if (!compositor || size < 1) {
+        return 0;
+    }
+
+    // Create a new scene for each fuzzing input to ensure a clean state.
+    // The compositor object is required to create a scene.
+    GF_Scene *scene = gf_scene_new(compositor, NULL);
+    if (!scene) {
+        return 0;
+    }
+
+    // Attach the scene to the compositor. This sets compositor->root_scene
+    // and its associated graph, which are required by gf_sc_scene_update.
+    gf_sc_set_scene(compositor, scene->graph);
+
+    // The 'com' argument must be a null-terminated string.
+    // We make a mutable copy of the input data.
+    char *com = (char *)malloc(size + 1);
+    if (!com) {
+        gf_sc_set_scene(compositor, NULL);
+        gf_scene_del(scene);
+        return 0;
+    }
+    memcpy(com, data, size);
+    com[size] = '\0';
+
+    // The 'type' argument can be NULL or a specific string.
+    // We'll use the first byte of the input to select a type,
+    // which allows the fuzzer to explore different parsing paths.
+    char *type = NULL;
+    char *payload = com;
+    if (size > 1) {
+        uint8_t type_selector = data[0];
+        payload = com + 1;
+        switch (type_selector % 6) {
+            case 0: type = "application/ecmascript"; break;
+            case 1: type = "js"; break;
+            case 2: type = "application/x-bt"; break;
+            case 3: type = "application/x-xmt"; break;
+            case 4: type = "image/svg+xml"; break;
+            case 5:
+            default:
+                type = NULL;
+                payload = com; // Use full string if type is NULL
+                break;
+        }
+    }
+
+    // Call the function-under-test with the fuzzed parameters.
+    gf_sc_scene_update(compositor, type, payload);
+
+    // Clean up resources allocated for this input.
+    free(com);
+    
+    // Detach the scene from the compositor and delete it.
+    gf_sc_set_scene(compositor, NULL);
+    gf_scene_del(scene);
+
+    return 0;
+}
+	

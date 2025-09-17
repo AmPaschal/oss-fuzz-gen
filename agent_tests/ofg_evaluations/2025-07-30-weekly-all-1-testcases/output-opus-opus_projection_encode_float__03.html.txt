@@ -1,0 +1,116 @@
+
+	
+<description>
+The `opus_projection_encode_float` function encodes a frame of floating-point PCM audio data using the Opus codec. It's specifically designed for encoding ambisonic audio, which is a full-sphere surround sound format. The function takes a projection encoder state, the PCM data, frame size, and an output buffer. It's a wrapper around the `opus_multistream_encode_native` function, providing specific callbacks and parameters for projection encoding. The core of the work is done within the multistream encoder, which handles the actual encoding process.
+</description>
+<requirements>
+
+<requirement>
+The `st` pointer must be a valid pointer to an `OpusProjectionEncoder` struct initialized by `opus_projection_ambisonics_encoder_create`. This is because the function internally uses `get_multistream_encoder(st)` and `get_mixing_matrix(st)` which rely on a correctly initialized `OpusProjectionEncoder` structure.
+</requirement>
+<requirement>
+The `channels` argument to `opus_projection_ambisonics_encoder_create` should be a value `(1 + n)^2 + 2j` for n=0..14 and j=0 or 1. This is because other values are considered invalid and will cause the initialization to fail.
+</requirement>
+<requirement>
+The `mapping_family` argument to `opus_projection_ambisonics_encoder_create` must be 3. Other values for `mapping_family` will cause the initialization to return an error.
+</requirement>
+<requirement>
+`pcm` must be a valid pointer to a buffer of float values, and the size of the buffer should be at least `frame_size * channels`. This is to prevent out-of-bounds memory access inside `mapping_matrix_multiply_channel_in_float`.
+</requirement>
+<requirement>
+`frame_size` should be a valid Opus frame size, such as 120, 240, 480, 960, 1920, or 2880. The underlying multistream encoder likely has constraints on this value, and using an invalid size can lead to errors.
+</requirement>
+<requirement>
+`data` must be a valid pointer to a buffer of size `max_data_bytes` to prevent crashes when writing the encoded output.
+</requirement>
+<requirement>
+`max_data_bytes` should be large enough to hold the compressed frame, with a recommended value of at least 4000. A small value may lead to a buffer overflow or an error from the encoder.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int opus_projection_encode_float(OpusProjectionEncoder *, const float *, int, unsigned char *, opus_int32)
+</function_signature>
+<project_name>
+opus
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include <cstdint>
+#include <cstdlib>
+
+#include "opus.h"
+#include "opus_defines.h"
+#include "opus_types.h"
+#include "/src/opus/include/opus_projection.h"
+
+#define MAX_PACKET (1500)
+static unsigned char out[MAX_PACKET];
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+
+  opus_int32 nb_channels = fdp.ConsumeIntegralInRange<opus_int32>(1, 255);
+  const opus_int32 frequency = fdp.PickValueInArray<opus_int32>({8000, 12000, 16000, 24000, 48000});
+  int streams;
+  int coupled_streams;
+  int application = fdp.PickValueInArray({OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_APPLICATION_RESTRICTED_LOWDELAY});
+  int mapping_family = fdp.PickValueInArray({0, 1, 2, 3, 255});
+
+  int err = OPUS_OK;
+  OpusProjectionEncoder *enc = opus_projection_ambisonics_encoder_create(
+      frequency, nb_channels, mapping_family, &streams, &coupled_streams,
+      application, &err);
+
+  if (err != OPUS_OK || enc == nullptr) {
+    opus_projection_encoder_destroy(enc);
+    return 0;
+  }
+
+  opus_projection_encoder_ctl(enc, OPUS_SET_COMPLEXITY(fdp.ConsumeIntegralInRange(0, 10)));
+  opus_projection_encoder_ctl(enc, OPUS_SET_VBR(fdp.ConsumeBool()));
+  opus_projection_encoder_ctl(enc, OPUS_SET_VBR_CONSTRAINT(fdp.ConsumeBool()));
+  opus_projection_encoder_ctl(enc, OPUS_SET_FORCE_CHANNELS(fdp.PickValueInArray({OPUS_AUTO, 1, 2})));
+  opus_projection_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(fdp.PickValueInArray(
+               {OPUS_BANDWIDTH_NARROWBAND, OPUS_BANDWIDTH_MEDIUMBAND,
+                OPUS_BANDWIDTH_WIDEBAND, OPUS_BANDWIDTH_SUPERWIDEBAND,
+                OPUS_BANDWIDTH_FULLBAND})));
+  opus_projection_encoder_ctl(enc, OPUS_SET_INBAND_FEC(fdp.ConsumeBool()));
+  opus_projection_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(fdp.ConsumeIntegralInRange(0, 100)));
+  opus_projection_encoder_ctl(enc, OPUS_SET_DTX(fdp.ConsumeBool()));
+  opus_projection_encoder_ctl(enc, OPUS_SET_LSB_DEPTH(fdp.ConsumeIntegralInRange(8, 24)));
+  opus_projection_encoder_ctl(enc, OPUS_SET_PREDICTION_DISABLED((fdp.ConsumeBool())));
+  opus_projection_encoder_ctl(enc, OPUS_SET_SIGNAL(fdp.PickValueInArray(
+               {OPUS_AUTO, OPUS_SIGNAL_VOICE, OPUS_SIGNAL_MUSIC})));
+  opus_projection_encoder_ctl(enc, OPUS_SET_PHASE_INVERSION_DISABLED(((fdp.ConsumeBool()))));
+
+  int frame_size_ms_x2 = fdp.PickValueInArray({5, 10, 20, 40, 80, 120});
+  int frame_size = frame_size_ms_x2 * frequency / 2000;
+
+  const size_t pcm_elements = static_cast<size_t>(frame_size) * nb_channels;
+  if (pcm_elements == 0) {
+    opus_projection_encoder_destroy(enc);
+    return 0;
+  }
+
+  const size_t pcm_bytes = pcm_elements * sizeof(float);
+  if (fdp.remaining_bytes() < pcm_bytes) {
+    opus_projection_encoder_destroy(enc);
+    return 0;
+  }
+  
+  std::vector<float> pcm(pcm_elements);
+  fdp.ConsumeData(pcm.data(), pcm_bytes);
+
+  opus_projection_encode_float(enc, pcm.data(), frame_size, out, MAX_PACKET);
+
+  opus_projection_encoder_destroy(enc);
+
+  return 0;
+}
+	

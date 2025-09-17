@@ -1,0 +1,115 @@
+
+	
+<description>
+The sf_open_fd function opens a sound file from a file descriptor. It takes a file descriptor `fd`, an I/O mode `mode`, a pointer to an SF_INFO struct `sfinfo`, and a flag `close_desc` indicating whether the file descriptor should be closed when sf_close() is called. The function first checks if the format is SD2, which is not allowed with file descriptors. It then allocates a private structure, initializes it, and calls psf_open_file to handle the format-specific opening logic. The function is used in tests to read from stdin, pipes, and regular files.
+</description>
+<requirements>
+<requirement>
+The `fd` argument must be a valid file descriptor. The callers of the function use file descriptors from stdin, pipes or regular files.
+</requirement>
+<requirement>
+The `mode` argument must be one of `SFM_READ` (0x10), `SFM_WRITE` (0x20), or `SFM_RDWR` (0x30). These are the only modes supported by the underlying implementation.
+</requirement>
+<requirement>
+The `sfinfo` pointer must not be NULL. The function dereferences this pointer to access the format field.
+</requirement>
+<requirement>
+If the `mode` is `SFM_READ`, the `sfinfo` struct should be initialized with zeros. The function will populate the struct based on the file header.
+</requirement>
+<requirement>
+If the `mode` is `SFM_WRITE`, the `sfinfo` struct must be fully populated with valid `format`, `samplerate`, `channels` and `frames`. This is because this information is needed to create the file header.
+</requirement>
+<requirement>
+The format in the `sfinfo` struct should not be `SF_FORMAT_SD2` (0x00110000). The function contains a check that explicitly disallows this format when opening from a file descriptor.
+</requirement>
+<requirement>
+The `close_desc` argument can be either `SF_TRUE` (1) or `SF_FALSE` (0). It determines if the file descriptor is closed when `sf_close` is called.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+SNDFILE * sf_open_fd(int fd, int mode, SF_INFO *sfinfo, int close_desc)
+</function_signature>
+<project_name>
+libsndfile
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <sndfile.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <vector>
+
+extern "C" {
+#include "/src/libsndfile/include/sndfile.h"
+}
+
+extern "C" SNDFILE *sf_open_fd(int, int, SF_INFO *, int);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Prepare parameters for sf_open_fd.
+  const int mode = provider.PickValueInArray({SFM_READ, SFM_WRITE, SFM_RDWR});
+  const int close_desc = SF_TRUE; // Let sf_close handle the fd.
+
+  SF_INFO sfinfo;
+  memset(&sfinfo, 0, sizeof(sfinfo));
+
+  if (mode == SFM_WRITE || mode == SFM_RDWR) {
+    sfinfo.samplerate = provider.ConsumeIntegralInRange<int>(8000, 48000);
+    sfinfo.channels = provider.ConsumeIntegralInRange<int>(1, 8);
+    sfinfo.format = provider.ConsumeIntegral<int>();
+    // SD2 format is not allowed with file descriptors.
+    if ((sfinfo.format & SF_FORMAT_TYPEMASK) == SF_FORMAT_SD2) {
+      return 0;
+    }
+  }
+
+  // Use the rest of the data for the file content.
+  const std::vector<uint8_t> file_data =
+      provider.ConsumeRemainingBytes<uint8_t>();
+  if (file_data.empty()) {
+    return 0;
+  }
+
+  // Create a temporary file to hold the fuzzed data.
+  char filename[] = "/tmp/sf_fuzz-XXXXXX";
+  int fd = mkstemp(filename);
+  if (fd < 0) {
+    return 0;
+  }
+  // Unlink the file immediately so it's cleaned up automatically.
+  unlink(filename);
+
+  // Write the fuzzer data to the file.
+  if (write(fd, file_data.data(), file_data.size()) !=
+      (ssize_t)file_data.size()) {
+    close(fd);
+    return 0;
+  }
+
+  // Rewind the file descriptor to the beginning.
+  if (lseek(fd, 0, SEEK_SET) != 0) {
+    close(fd);
+    return 0;
+  }
+
+  // Call the function under test.
+  SNDFILE *sndfile = sf_open_fd(fd, mode, &sfinfo, close_desc);
+
+  if (sndfile) {
+    // If successful, close the SNDFILE handle. This will also close the fd
+    // because we passed SF_TRUE.
+    sf_close(sndfile);
+  }
+  // If sf_open_fd fails, it is responsible for closing the fd when
+  // close_desc is SF_TRUE.
+
+  return 0;
+}
+	

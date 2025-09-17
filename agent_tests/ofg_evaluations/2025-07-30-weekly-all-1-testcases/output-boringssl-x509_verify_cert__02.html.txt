@@ -1,0 +1,123 @@
+
+	
+<description>
+The `X509_verify_cert` function verifies a certificate chain. It takes a pointer to an `X509_STORE_CTX` object, which contains the certificate to be verified, a set of trusted certificates, and other verification parameters. The function builds a certificate chain from the provided certificate and the untrusted and trusted certificates. It then performs a series of checks on the chain, including checking for self-signed certificates, certificate purposes, name constraints, and revocation status. The function returns 1 on success and 0 on failure.
+</description>
+<requirements>
+
+<requirement>
+The `X509_STORE_CTX` object must be initialized using `X509_STORE_CTX_new` and `X509_STORE_CTX_init`. `X509_STORE_CTX_new` allocates the context, and `X509_STORE_CTX_init` initializes it with the certificate to be verified, the trusted store, and untrusted certificates.
+</requirement>
+<requirement>
+The `cert` member of the `X509_STORE_CTX` must not be NULL. This is the certificate to be verified and is a mandatory input for the function.
+</requirement>
+<requirement>
+The `chain` member of the `X509_STORE_CTX` must be NULL when `X509_verify_cert` is called. The function uses this member to build the certificate chain, and it must be clear at the start.
+</requirement>
+<requirement>
+The verification parameter flags in the `X509_STORE_CTX`'s `param` member must not include `X509_V_FLAG_EXTENDED_CRL_SUPPORT` or `X509_V_FLAG_USE_DELTAS`. These flags correspond to unsupported CRL features, and the function will fail if they are set.
+</requirement>
+<requirement>
+The `verify_cb` member of `X509_STORE_CTX` should be set to a callback function for handling verification errors. If it is not set, a default, permissive callback is used. For robust verification, a custom callback should be provided to handle errors appropriately.
+</requirement>
+<requirement>
+The `untrusted` member of the `X509_STORE_CTX` can be a stack of untrusted intermediate certificates. These certificates are used to build the chain between the leaf certificate and a trusted root.
+</requirement>
+<requirement>
+The `param` member of the `X509_STORE_CTX` must be configured with the desired verification parameters. This can be done using functions like `X509_STORE_CTX_set_purpose`, `X509_STORE_CTX_set_trust` and `X509_VERIFY_PARAM_set_flags`. These parameters control aspects like the expected certificate purpose and trust settings.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int X509_verify_cert(X509_STORE_CTX *)
+</function_signature>
+<project_name>
+boringssl
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <openssl/base.h>
+#include <openssl/err.h>
+#include <openssl/stack.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+
+#include <vector>
+
+// Helper to parse a chain of DER-encoded certificates.
+static bssl::UniquePtr<STACK_OF(X509)> ParseChain(const uint8_t *data,
+                                                  size_t size) {
+  bssl::UniquePtr<STACK_OF(X509)> chain(sk_X509_new_null());
+  if (!chain) {
+    return nullptr;
+  }
+  while (size > 0) {
+    const uint8_t *p = data;
+    X509 *cert = d2i_X509(nullptr, &p, size);
+    if (!cert) {
+      break;
+    }
+    // The stack takes ownership of the certificate.
+    if (!sk_X509_push(chain.get(), cert)) {
+      X509_free(cert);
+      return nullptr;
+    }
+    size_t cert_len = p - data;
+    data += cert_len;
+    size -= cert_len;
+  }
+  return chain;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  auto leaf_data = provider.ConsumeBytes<uint8_t>(
+      provider.ConsumeIntegralInRange<size_t>(0, 4096));
+  auto untrusted_data = provider.ConsumeBytes<uint8_t>(
+      provider.ConsumeIntegralInRange<size_t>(0, 8192));
+  auto trusted_data = provider.ConsumeRemainingBytes<uint8_t>();
+
+  const uint8_t *p = leaf_data.data();
+  bssl::UniquePtr<X509> leaf(d2i_X509(nullptr, &p, leaf_data.size()));
+  if (!leaf) {
+    return 0;
+  }
+
+  bssl::UniquePtr<STACK_OF(X509)> untrusted(
+      ParseChain(untrusted_data.data(), untrusted_data.size()));
+  bssl::UniquePtr<STACK_OF(X509)> trusted(
+      ParseChain(trusted_data.data(), trusted_data.size()));
+  if (!untrusted || !trusted) {
+    return 0;
+  }
+
+  bssl::UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+  if (!ctx || !store) {
+    return 0;
+  }
+
+  if (!X509_STORE_CTX_init(ctx.get(), store.get(), leaf.get(),
+                           untrusted.get())) {
+    sk_X509_pop_free(untrusted.release(), X509_free);
+    sk_X509_pop_free(trusted.release(), X509_free);
+    return 0;
+  }
+
+  // X509_STORE_CTX_set0_trusted_stack takes ownership of the stack.
+  X509_STORE_CTX_set0_trusted_stack(ctx.get(), trusted.release());
+
+  X509_verify_cert(ctx.get());
+
+  // The |untrusted| stack is not owned by the context, so we must free it.
+  sk_X509_pop_free(untrusted.release(), X509_free);
+
+  return 0;
+}
+	

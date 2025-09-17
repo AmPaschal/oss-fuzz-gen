@@ -1,0 +1,235 @@
+
+	
+<description>
+The function `sepol_policydb_to_image` converts a policy database (`sepol_policydb_t`) into a binary image. It is a wrapper around the `policydb_to_image` function, passing the policydb struct contained within the `sepol_policydb_t` structure. The function allocates memory for the new image and returns a pointer to it and its size in `newdata` and `newlen`.
+</description>
+<requirements>
+<requirement>
+The first argument, `handle`, should be a valid pointer to a `sepol_handle_t` struct, initialized by `sepol_handle_create`. This is necessary for proper error handling and logging within the function and its callees.</requirement>
+<requirement>
+The second argument, `p`, must be a valid pointer to a `sepol_policydb_t` struct. This is because the function dereferences this pointer to access the inner `policydb` struct.</requirement>
+<requirement>
+The `sepol_policydb_t` struct pointed to by `p` should be initialized, for example by calling `sepol_policydb_from_file` or `sepol_policydb_from_image` to load a policy. An uninitialized policydb will lead to crashes inside `policydb_write`, which is called by `policydb_to_image`.</requirement>
+<requirement>
+The third and fourth arguments, `newdata` and `newlen`, must be valid pointers to a `void *` and `size_t` respectively. This is because the function will write the address and size of the newly created policy image to these locations.</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int sepol_policydb_to_image(sepol_handle_t *, sepol_policydb_t *, void **, size_t *)
+</function_signature>
+<project_name>
+selinux
+</project_name>
+
+	Fuzz target source:
+#include <assert.h>
+#include <setjmp.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdlib.h>
+
+#include <sepol/debug.h>
+#include <sepol/handle.h>
+#include <sepol/policydb.h>
+#include <sepol/policydb/policydb.h>
+#include <sepol/policydb/hierarchy.h>
+#include <sepol/policydb/expand.h>
+#include <sepol/policydb/link.h>
+
+#include "module_compiler.h"
+#include "queue.h"
+
+extern int policydb_validate(sepol_handle_t *handle, const policydb_t *p);
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+
+extern int mlspol;
+extern policydb_t *policydbp;
+extern queue_t id_queue;
+extern unsigned int policydb_errors;
+
+extern int yynerrs;
+extern FILE *yyin;
+extern void init_parser(int pass, const char *input_name);
+extern int yyparse(void);
+extern void yyrestart(FILE *);
+extern int yylex_destroy(void);
+
+jmp_buf fuzzing_pre_parse_stack_state;
+
+// Set to 1 for verbose libsepol logging
+#define VERBOSE 0
+
+static ssize_t full_write(int fd, const void *buf, size_t count)
+{
+	ssize_t written = 0;
+
+	while (count > 0) {
+		ssize_t ret = write(fd, buf, count);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+
+			return ret;
+		}
+
+		if (ret == 0)
+			break;
+
+		written += ret;
+		buf = (const unsigned char *)buf + (size_t)ret;
+		count -= (size_t)ret;
+	}
+
+	return written;
+}
+
+static int read_source_policy(policydb_t *p, const uint8_t *data, size_t size)
+{
+	int fd, rc;
+	ssize_t wr;
+
+	fd = memfd_create("fuzz-input", MFD_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	wr = full_write(fd, data, size);
+	if (wr < 0 || (size_t)wr != size) {
+		close(fd);
+		return -1;
+	}
+
+	fsync(fd);
+
+	yynerrs = 0;
+
+	yyin = fdopen(fd, "r");
+	if (!yyin) {
+		close(fd);
+		return -1;
+	}
+
+	rewind(yyin);
+
+	id_queue = queue_create();
+	if (id_queue == NULL) {
+		fclose(yyin);
+		yylex_destroy();
+		return -1;
+	}
+
+	policydbp = p;
+	mlspol = p->mls;
+
+	init_parser(1, "fuzz-input-1");
+
+	if (setjmp(fuzzing_pre_parse_stack_state) != 0) {
+		queue_destroy(id_queue);
+		fclose(yyin);
+		yylex_destroy();
+		return -1;
+	}
+
+	rc = yyparse();
+	// TODO: drop global variable policydb_errors if proven to be redundant
+	assert(rc || !policydb_errors);
+	if (rc || policydb_errors) {
+		queue_destroy(id_queue);
+		fclose(yyin);
+		yylex_destroy();
+		return -1;
+	}
+
+	rewind(yyin);
+	init_parser(2, "fuzz-input-2");
+	yyrestart(yyin);
+
+	rc = yyparse();
+	assert(rc || !policydb_errors);
+	if (rc || policydb_errors) {
+		queue_destroy(id_queue);
+		fclose(yyin);
+		yylex_destroy();
+		return -1;
+	}
+
+	queue_destroy(id_queue);
+	fclose(yyin);
+	yylex_destroy();
+
+	return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	sepol_handle_t *handle = NULL;
+	sepol_policydb_t *sepol_pdp = NULL;
+	int mls, platform, policyvers;
+
+	sepol_debug(VERBOSE);
+
+	if (size < 3)
+		return 0;
+	switch (data[0]) {
+	case 'S':
+		platform = SEPOL_TARGET_SELINUX;
+		break;
+	case 'X':
+		platform = SEPOL_TARGET_XEN;
+		break;
+	default:
+		return 0;
+	}
+	switch (data[1]) {
+	case '0':
+		mls = 0;
+		break;
+	case '1':
+		mls = 1;
+		break;
+	default:
+		return 0;
+	}
+	static_assert(0x7F - 'A' >= POLICYDB_VERSION_MAX, "Max policy version should be representable");
+	policyvers = data[2] - 'A';
+	if (policyvers < POLICYDB_VERSION_MIN || policyvers > POLICYDB_VERSION_MAX)
+		return 0;
+	data += 3;
+	size -= 3;
+
+	handle = sepol_handle_create();
+	if (!handle)
+		goto exit;
+
+	if (sepol_policydb_create(&sepol_pdp))
+		goto exit;
+
+	sepol_pdp->p.policy_type = POLICY_BASE;
+	sepol_pdp->p.mls = mls;
+	sepol_pdp->p.handle_unknown = DENY_UNKNOWN;
+	sepol_pdp->p.policyvers = policyvers;
+	policydb_set_target_platform(&sepol_pdp->p, platform);
+
+	if (read_source_policy(&sepol_pdp->p, data, size))
+		goto exit;
+
+	void *newdata = NULL;
+	size_t newlen;
+	sepol_policydb_to_image(handle, sepol_pdp, &newdata, &newlen);
+	free(newdata);
+
+exit:
+	if (sepol_pdp)
+		sepol_policydb_free(sepol_pdp);
+	if (handle)
+		sepol_handle_destroy(handle);
+
+	id_queue = NULL;
+	policydbp = NULL;
+	module_compiler_reset();
+
+	/* Non-zero return values are reserved for future use. */
+	return 0;
+}
+	

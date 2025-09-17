@@ -1,0 +1,152 @@
+
+	
+<description>
+The function `LLVMFuzzerInitialize` is the initialization routine for the rtpproxy fuzzer. It is responsible for setting up the entire environment required for the `LLVMFuzzerTestOneInput` function to operate. It does not use its input arguments. The function performs the following key initialization steps:
+1. It calls `RTPPInitialize()` to perform the basic initialization of the rtpproxy. A `ttl` value of "60" is set in `RTPPInitializeParams` before this call.
+2. It initializes a semaphore `fuzz_ctx.wi_proc_done` which is used for synchronization within the fuzzer.
+3. It calls `ExecuteScript()` which in turn executes a series of pre-defined commands from the `setup_script` array. These commands set up various RTP proxy sessions, which are the primary targets for fuzzing.
+4. It executes an `X` command using `ExecuteRTPPCommand`. This appears to be a command to clear or reset existing sessions.
+5. It registers `fuzz_ctx_dtor` as an exit handler to ensure proper cleanup of resources, including destroying the semaphore and executing the 'X' command again.
+</description>
+<requirements>
+<requirement>
+The `RTPPInitialize` function must be called and succeed. This is because it initializes the core components and configuration of rtpproxy, which is essential for any subsequent operations.
+</requirement>
+<requirement>
+The `ExecuteScript` function must be called and succeed. This function sets up the initial state of the system by creating and configuring several RTP proxy sessions as defined in `fuzz_rtp_session.setup`, which are necessary for the fuzzer to have targets to test.
+</requirement>
+<requirement>
+A semaphore must be initialized. The semaphore `fuzz_ctx.wi_proc_done` is used to synchronize the main fuzzing loop with the packet processing, and must be initialized for the fuzzer to work correctly.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int LLVMFuzzerInitialize(int *, char ***)
+</function_signature>
+<project_name>
+rtpproxy
+</project_name>
+
+	Fuzz target source:
+#include <sys/socket.h>
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#include <threads.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <semaphore.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "fuzz_standalone.h"
+
+#define HAVE_CONFIG_H 1
+#include "config_pp.h"
+
+#include "rtpp_types.h"
+#include "rtpp_cfg.h"
+#include "rtp.h"
+#include "rtpp_time.h"
+#include "rtpp_codeptr.h"
+#include "rtp_packet.h"
+#include "rtpp_refcnt.h"
+#include "rtpp_log_stand.h"
+#include "rtpp_log_obj.h"
+#include "rtpp_endian.h"
+#include "rtpp_ssrc.h"
+#include "rtp_info.h"
+#include "rtp_analyze.h"
+#include "rtpp_analyzer.h"
+#include "rtpp_command.h"
+
+#include "rfz_command.h"
+#include "rfz_utils.h"
+
+static struct {
+    sem_t wi_proc_done;
+} fuzz_ctx;
+
+static void
+fuzz_ctx_dtor(void)
+{
+    ExecuteRTPPCommand(&gconf, "X", 1, 0);
+    sem_destroy(&fuzz_ctx.wi_proc_done);
+}
+
+static const char * const setup_script[] = {
+    #include "fuzz_rtp_session.setup"
+    NULL
+};
+
+static int
+ExecuteScript(void)
+{
+    char line[RTPP_CMD_BUFLEN];
+
+    for (int i = 0; setup_script[i] != NULL; i++) {
+        const char *cp = setup_script[i];
+        int size = strlen(cp);
+        memcpy(line, cp, size + 1);
+        int r = ExecuteRTPPCommand(&gconf, line, size, 0);
+        if (r != 0)
+            return (-1);
+    }
+    return (0);
+}
+
+int LLVMFuzzerInitialize(int *, char ***);
+
+int
+LLVMFuzzerInitialize(int *_argc, char ***_argv)
+{
+    RTPPInitializeParams.ttl = "60";
+    int r = RTPPInitialize();
+
+    if (r != 0)
+        goto e0;
+    if (sem_init(&fuzz_ctx.wi_proc_done, 0, 0) != 0)
+        goto e0;
+    if (ExecuteScript() != 0)
+        goto e1;
+    if (ExecuteRTPPCommand(&gconf, "X", 1, 0) != 0)
+        goto e1;
+    atexit(fuzz_ctx_dtor);
+    return (0);
+e1:
+    sem_destroy(&fuzz_ctx.wi_proc_done);
+e0:
+    return (-1);
+}
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    static thread_local struct rtpp_log *log;
+    static thread_local struct rtpp_analyzer *rap;
+    struct rtp_packet *pktp;
+
+    if (size > MAX_RPKT_LEN)
+        return (0);
+
+    if (log == NULL) {
+        log = rtpp_log_ctor("rtpproxy", NULL, LF_REOPEN);
+        assert(log != NULL);
+        rap = rtpp_analyzer_ctor(log);
+        assert(rap != NULL);
+    }
+
+    pktp = rtp_packet_alloc();
+    assert(pktp != NULL);
+    pktp->size = size;
+    memcpy(pktp->data.buf, data, size);
+
+    CALL_SMETHOD(rap, update, pktp);
+    RTPP_OBJ_DECREF(pktp);
+    return (0);
+}
+	

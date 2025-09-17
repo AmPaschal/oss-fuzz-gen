@@ -1,0 +1,137 @@
+
+	
+<description>
+The `g_obex_get_req_pkt` function is used to send an OBEX GET request. It takes a `GObex` object representing the OBEX session, a `GObexPacket` object for the request, a `GObexDataConsumer` callback to handle incoming data, a `GObexFunc` callback for when the transfer is complete, and a `gpointer` for user data. The function checks that the request packet's operation is a GET operation. It then creates a transfer context, and sends the request using `g_obex_send_req`. The function is asynchronous, the callbacks are used to handle the response and data.
+</description>
+<requirements>
+
+<requirement>
+The `obex` argument must be a valid `GObex` object. This is because it is dereferenced and used in multiple function calls, and a NULL value will cause a crash.
+</requirement>
+<requirement>
+The `req` argument must be a valid `GObexPacket` object. It must be created with `g_obex_packet_new`, and its operation code must be `G_OBEX_OP_GET` (0x03), otherwise the function will return 0 and do nothing.
+</requirement>
+<requirement>
+The `data_func` argument, a `GObexDataConsumer` callback, must be a valid function pointer. It is called to process the body of the response, and a NULL pointer will lead to a crash when it's called.
+</requirement>
+<requirement>
+The `complete_func` argument, a `GObexFunc` callback, must be a valid function pointer. It is called when the transfer is finished or an error occurs, and a NULL value will cause a crash.
+</requirement>
+<requirement>
+The `user_data` argument should point to a valid memory region that the callbacks can access. The caller of `g_obex_get_req_pkt` passes a `struct obc_transfer *` which contains the file descriptor to write to, so this should also be a valid, writeable file descriptor.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+guint g_obex_get_req_pkt(GObex *, GObexPacket *, GObexDataConsumer, GObexFunc, gpointer, GError **)
+</function_signature>
+<project_name>
+bluez
+</project_name>
+
+	Fuzz target source:
+#include <config.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+#include <glib.h>
+#include "gobex/gobex.h"
+#include "gobex/gobex-packet.h"
+#include "gobex/gobex-header.h"
+
+/*
+ * Callback to consume data from the response. For fuzzing, we can
+ * just accept the data and do nothing with it.
+ */
+static gboolean data_consumer_cb(const void *buf, gsize len, gpointer user_data)
+{
+	return TRUE;
+}
+
+/*
+ * Callback for when the transfer is complete. For fuzzing, we can
+ * just clean up the error object if one exists.
+ */
+static void complete_cb(GObex *obex, GError *err, gpointer user_data)
+{
+	if (err)
+		g_error_free(err);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+	if (size == 0)
+		return 0;
+
+	/* Create a pipe to act as a transport for the GObex session */
+	int fds[2];
+	if (pipe(fds) != 0)
+		return 0;
+
+	GIOChannel *io = g_io_channel_unix_new(fds[1]);
+	if (!io) {
+		close(fds[0]);
+		close(fds[1]);
+		return 0;
+	}
+
+	/* GObex requires a binary encoding for the channel */
+	g_io_channel_set_encoding(io, NULL, NULL);
+
+	/* Create a new GObex session object */
+	GObex *obex = g_obex_new(io, G_OBEX_TRANSPORT_STREAM, 1024, 1024);
+	if (!obex) {
+		g_io_channel_unref(io);
+		close(fds[0]);
+		close(fds[1]);
+		return 0;
+	}
+
+	/* Create a null-terminated string from fuzzer data for the NAME header */
+	char *name = malloc(size + 1);
+	memcpy(name, data, size);
+	name[size] = '\0';
+
+	/* Create a new GET request packet with the NAME header */
+	GObexPacket *req = g_obex_packet_new(G_OBEX_OP_GET, TRUE,
+					     G_OBEX_HDR_NAME, name, 0);
+	free(name);
+
+	if (!req) {
+		g_obex_unref(obex);
+		g_io_channel_unref(io);
+		close(fds[0]);
+		close(fds[1]);
+		return 0;
+	}
+
+	GError *err = NULL;
+
+	/* Call the function under test */
+	g_obex_get_req_pkt(obex, req, data_consumer_cb, complete_cb, NULL, &err);
+
+	/*
+	 * The function is asynchronous. In a real application, a GMainLoop would
+	 * be needed to process the response. For fuzzing the request path,
+	 * this is sufficient.
+	 */
+
+	/* Cleanup */
+	if (err)
+		g_error_free(err);
+
+	g_obex_packet_free(req);
+	g_obex_unref(obex);
+	g_io_channel_unref(io);
+	close(fds[0]);
+	close(fds[1]);
+
+	return 0;
+}
+	

@@ -1,0 +1,129 @@
+
+	
+<description>
+The `QuantLib::DateParser::parseISO` function parses a date string in ISO format (YYYY-MM-DD) and returns a `QuantLib::Date` object. It performs checks to ensure the input string is in the correct format.
+</description>
+<requirements>
+<requirement>
+The input string must be exactly 10 characters long. This is to prevent an assertion failure in the `QL_REQUIRE` macro.
+</requirement>
+<requirement>
+The input string must have hyphens at the 5th and 8th positions (indices 4 and 7). This is to ensure the date components are correctly separated, as expected by the parser.
+</requirement>
+<requirement>
+The substrings representing the year (0-3), month (5-6), and day (8-9) must contain only numeric characters. The `std::stoi` function will throw an exception if non-numeric characters are encountered.
+</requirement>
+<requirement>
+The month substring (indices 5-6) must represent a valid month between 1 and 12. This is to avoid undefined behavior when casting to the `Month` enum.
+</requirement>
+<requirement>
+The day substring (indices 8-9) must represent a valid day for the given month and year. An invalid day, such as 32, will cause an error in the `Date` constructor.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+Date QuantLib::DateParser::parseISO(const std::string& str)
+</function_signature>
+<project_name>
+quantlib
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <limits>
+#include <ql/settings.hpp>
+#include <ql/exercise.hpp>
+#include <ql/instruments/vanillaoption.hpp>
+#include <ql/instruments/payoffs.hpp>
+#include <ql/pricingengines/vanilla/baroneadesiwhaleyengine.hpp>
+#include <ql/processes/blackscholesprocess.hpp>
+#include <ql/quotes/simplequote.hpp>
+#include <ql/termstructures/yield/flatforward.hpp>
+#include <ql/termstructures/volatility/equityfx/blackconstantvol.hpp>
+#include <ql/time/calendars/nullcalendar.hpp>
+#include <ql/time/daycounters/actual360.hpp>
+#include <vector>
+#include <cmath>
+
+using namespace QuantLib;
+
+namespace {
+
+struct AmericanOptionData {
+  Option::Type type;
+  Real strike;
+  Real s;       // spot
+  Rate q;       // dividend
+  Rate r;       // risk-free rate
+  Time t;       // time to maturity
+  Volatility v; // volatility
+};
+
+} // namespace
+
+AmericanOptionData fuzzedAmericanOptionData(FuzzedDataProvider &fdp) {
+  return AmericanOptionData{
+      .type = fdp.PickValueInArray({Option::Type::Put, Option::Type::Call}),
+      .strike = fdp.ConsumeFloatingPoint<Real>(),
+      .s = fdp.ConsumeFloatingPointInRange<Real>(0.0, std::numeric_limits<Real>::max()),
+      .q = fdp.ConsumeProbability<Rate>(),
+      .r = fdp.ConsumeProbability<Rate>(),
+      .t = fdp.ConsumeFloatingPointInRange<Time>(0.0, 40.0), // 40 years max
+      .v = fdp.ConsumeFloatingPointInRange<Volatility>(0.0, 10.0),
+  };
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+  SavedSettings saved_settings;
+
+  constexpr size_t kMaxValues = 256;
+  auto length = fdp.ConsumeIntegralInRange<size_t>(0, kMaxValues);
+  if (length == 0) {
+      return 0;
+  }
+  std::vector<AmericanOptionData> values;
+  values.reserve(length);
+  for (size_t i = 0; i < length; i++) {
+    values.push_back(fuzzedAmericanOptionData(fdp));
+  }
+
+  Date today(2, March, 2020);
+  DayCounter dc = Actual360();
+  ext::shared_ptr<SimpleQuote> spot(new SimpleQuote(0.0));
+  ext::shared_ptr<SimpleQuote> qRate(new SimpleQuote(0.0));
+  ext::shared_ptr<YieldTermStructure> qTS = ext::shared_ptr<YieldTermStructure>(new FlatForward(today, Handle<Quote>(qRate), dc));
+  ext::shared_ptr<SimpleQuote> rRate(new SimpleQuote(0.0));
+  ext::shared_ptr<YieldTermStructure> rTS = ext::shared_ptr<YieldTermStructure>(new FlatForward(today, Handle<Quote>(rRate), dc));
+  ext::shared_ptr<SimpleQuote> vol(new SimpleQuote(0.0));
+  ext::shared_ptr<BlackVolTermStructure> volTS = ext::shared_ptr<BlackVolTermStructure>(new BlackConstantVol(today, NullCalendar(), Handle<Quote>(vol), dc));
+
+  ext::shared_ptr<BlackScholesMertonProcess> stochProcess(new BlackScholesMertonProcess(Handle<Quote>(spot), Handle<YieldTermStructure>(qTS), Handle<YieldTermStructure>(rTS), Handle<BlackVolTermStructure>(volTS)));
+
+  ext::shared_ptr<PricingEngine> engine(new BaroneAdesiWhaleyApproximationEngine(stochProcess));
+
+  for (auto &value : values) {
+    try {
+        ext::shared_ptr<StrikedTypePayoff> payoff(new PlainVanillaPayoff(value.type, value.strike));
+        Date exDate = today + Integer(std::lround(365 * value.t));
+        ext::shared_ptr<Exercise> exercise(new AmericanExercise(today, exDate));
+
+        spot->setValue(value.s);
+        qRate->setValue(value.q);
+        rRate->setValue(value.r);
+        vol->setValue(value.v);
+
+        VanillaOption option(payoff, exercise);
+        option.setPricingEngine(engine);
+
+        (void)option.NPV();
+    } catch (const std::exception&) {
+        // Catch exceptions from QuantLib, e.g. invalid inputs
+    }
+  }
+
+  return 0;
+}
+	

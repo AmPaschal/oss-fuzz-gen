@@ -1,0 +1,133 @@
+
+	
+<description>
+The `pr_data_xfer` function is responsible for transferring data between the client and the server. It handles both uploads (reads) and downloads (writes), and can perform ASCII translation on the data if required. The direction of the transfer and other parameters are controlled by the global `session` variable.
+</description>
+<requirements>
+
+<requirement>
+The `pr_data_init` function must be called before `pr_data_xfer`. This function initializes the `session.xfer` structure, which is used extensively by `pr_data_xfer` to manage the data transfer.
+</requirement>
+<requirement>
+The `pr_data_open` function must be called before `pr_data_xfer`. This function establishes the data connection and sets `session.d` which is used for the data transfer.
+</requirement>
+<requirement>
+The `session.xfer.direction` field must be set to either `PR_NETIO_IO_RD` or `PR_NETIO_IO_WR`. This determines whether the function will read from or write to the data connection.
+</requirement>
+<requirement>
+The `cl_buf` argument must not be a null pointer. The function checks for a null `cl_buf` and returns an error if it is null.
+</requirement>
+<requirement>
+The `cl_size` argument must be greater than zero. The function checks for a zero `cl_size` and returns an error. It is also used to control the amount of data transferred.
+</requirement>
+<requirement>
+If ASCII mode is desired, the `session.sf_flags` should be set to include `SF_ASCII`. This flag enables ASCII to/from CRLF translation during the transfer.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int pr_data_xfer(char *, size_t)
+</function_signature>
+<project_name>
+proftpd
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#include "config.h"
+#include "pool.h"
+#include "session.h"
+#include "netio.h"
+#include "/src/proftpd/include/data.h"
+
+/* Fuzzer-specific global state */
+session_rec session;
+unsigned int data_opts = 0;
+
+/* Dummy function required by the linker */
+void pr_signals_handle(void) {
+  return;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 2) {
+    return 0;
+  }
+
+  pool *p = NULL;
+  char *cl_buf = NULL;
+  size_t cl_size = size - 1;
+
+  p = make_sub_pool(NULL);
+  if (p == NULL) {
+    return 0;
+  }
+
+  memset(&session, 0, sizeof(session));
+  session.pool = p;
+  session.user = "fuzzer";
+  session.loggedin = 1;
+
+  session.xfer.p = make_sub_pool(session.pool);
+  session.xfer.bufsize = 4096;
+  session.xfer.buf = palloc(session.xfer.p, session.xfer.bufsize);
+
+  /* Create a fake data connection using /dev/null */
+  session.d = pcalloc(session.pool, sizeof(netio_t));
+  if (session.d == NULL) {
+    destroy_pool(p);
+    return 0;
+  }
+
+  int dev_null_in = open("/dev/null", O_RDONLY);
+  int dev_null_out = open("/dev/null", O_WRONLY);
+
+  if (dev_null_in < 0 || dev_null_out < 0) {
+    if (dev_null_in >= 0) close(dev_null_in);
+    if (dev_null_out >= 0) close(dev_null_out);
+    destroy_pool(p);
+    return 0;
+  }
+
+  session.d->instrm = pcalloc(session.pool, sizeof(netio_stream_t));
+  session.d->outstrm = pcalloc(session.pool, sizeof(netio_stream_t));
+  session.d->instrm->fd = dev_null_in;
+  session.d->outstrm->fd = dev_null_out;
+
+  /* Use the first byte of fuzzer data to control session state */
+  uint8_t control_byte = data[0];
+  session.xfer.direction = (control_byte & 0x01) ? PR_NETIO_IO_RD : PR_NETIO_IO_WR;
+  if (control_byte & 0x02) {
+    session.sf_flags |= SF_ASCII;
+  } else {
+    session.sf_flags &= ~SF_ASCII;
+  }
+
+  cl_buf = (char *) malloc(cl_size);
+  if (cl_buf == NULL) {
+    close(dev_null_in);
+    close(dev_null_out);
+    destroy_pool(p);
+    return 0;
+  }
+  memcpy(cl_buf, data + 1, cl_size);
+
+  pr_data_xfer(cl_buf, cl_size);
+
+  free(cl_buf);
+  close(dev_null_in);
+  close(dev_null_out);
+  destroy_pool(p);
+
+  return 0;
+}
+	

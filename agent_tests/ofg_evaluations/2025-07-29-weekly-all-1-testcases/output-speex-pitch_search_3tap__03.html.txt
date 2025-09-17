@@ -1,0 +1,141 @@
+
+	
+<description>
+The function `pitch_search_3tap` is a part of the Speex audio codec and is responsible for finding the optimal pitch and gain for the long-term prediction (LTP) part of the encoding process. It is not called directly but is used as a function pointer within the Speex encoder's mode-specific settings. The function iterates through a number of candidate pitch values, and for each one, it searches for the best gain from a codebook. The goal is to find the pitch-gain combination that minimizes the error between the original and the synthesized signal.
+</description>
+<requirements>
+<requirement>
+The `par` argument must be a valid pointer to an `ltp_params` struct. This struct contains parameters for the long-term prediction, including the gain codebook and the number of bits for pitch and gain, which are essential for the function's execution.
+</requirement>
+<requirement>
+The `nsf` argument, representing the number of samples in a subframe, should be a positive value. This is because it is used as the size for memory allocation and loop bounds, and a non-positive value would lead to incorrect behavior or crashes.
+</requirement>
+<requirement>
+The `exc2` array must have a size of at least `end` elements before the pointer. The function accesses `exc2` with negative indices up to `-end`, so the buffer must be allocated accordingly to prevent out-of-bounds memory access.
+</requirement>
+<requirement>
+The `target` and `exc` arrays must have a size of at least `nsf`. These arrays are used to store the target signal and the excitation signal, and their size is determined by the subframe size `nsf`.
+</requirement>
+<requirement>
+The `start` and `end` arguments, which define the range of pitch values to search, should be set to valid pitch values. The function's logic, including the call to `open_loop_nbest_pitch`, depends on a valid `start` and `end` range.
+</requirement>
+<requirement>
+The `bits` argument must be a valid pointer to a `SpeexBits` struct. This struct is used to pack the resulting pitch and gain information into the bitstream, so it must be properly initialized and maintained.
+</requirement>
+<requirement>
+The `stack` argument must be a pointer to a sufficiently large character array. The function uses this memory for its internal allocations, so an inadequate size can lead to a stack overflow.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int pitch_search_3tap(spx_word16_t *, spx_word16_t *, spx_coef_t *, spx_coef_t *, spx_coef_t *, spx_sig_t *, const void *, int, int, spx_word16_t, int, int, SpeexBits *, char *, spx_word16_t *, spx_word16_t *, int, int, int, spx_word32_t *)
+</function_signature>
+<project_name>
+speex
+</project_name>
+
+	Fuzz target source:
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+extern "C" {
+#include "speex/speex.h"
+#include "speex/speex_callbacks.h"
+#include "libspeex/nb_celp.h"
+#include "libspeex/ltp.h"
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  const SpeexMode *mode = speex_lib_get_mode(SPEEX_MODEID_NB);
+  if (!mode) {
+    return 0;
+  }
+  const SpeexNBMode *nb_mode = (const SpeexNBMode *)mode->mode;
+
+  /* Select a submode. There are 9 defined submodes for narrowband. */
+  const int submode_id = provider.ConsumeIntegralInRange<int>(0, 8);
+  const SpeexSubmode *submode = nb_mode->submodes[submode_id];
+  if (!submode || !submode->ltp_params) {
+    return 0;
+  }
+  const void *par = submode->ltp_params;
+
+  // Get parameters from the fuzzer
+  const int p = provider.ConsumeIntegralInRange<int>(4, 12);
+  const int nsf = provider.ConsumeIntegralInRange<int>(20, 160);
+  if (nsf <= 0) {
+    return 0;
+  }
+  const int start = provider.ConsumeIntegralInRange<int>(17, 50);
+  const int end = provider.ConsumeIntegralInRange<int>(start, 144);
+  const int complexity = provider.ConsumeIntegralInRange<int>(1, 10);
+  const int cdbk_offset = provider.ConsumeIntegralInRange<int>(0, 1);
+  const int plc_tuning = provider.ConsumeIntegralInRange<int>(0, 100);
+  spx_word16_t pitch_coef = provider.ConsumeIntegral<spx_word16_t>();
+  spx_word32_t cumul_gain = provider.ConsumeIntegral<spx_word32_t>();
+
+  // Check if there is enough data to fill the buffers
+  const size_t exc2_size = nsf + end;
+  const size_t required_size =
+      (nsf * 4 + (p + 1) * 3) * sizeof(spx_word16_t) +
+      nsf * sizeof(spx_sig_t) + exc2_size * sizeof(spx_word16_t);
+  if (provider.remaining_bytes() < required_size) {
+    return 0;
+  }
+
+  // Allocate and fill buffers
+  std::vector<spx_word16_t> target(nsf);
+  provider.ConsumeData(target.data(), target.size() * sizeof(spx_word16_t));
+
+  std::vector<spx_word16_t> sw(nsf);
+  provider.ConsumeData(sw.data(), sw.size() * sizeof(spx_word16_t));
+
+  std::vector<spx_coef_t> ak(p + 1);
+  provider.ConsumeData(ak.data(), ak.size() * sizeof(spx_coef_t));
+
+  std::vector<spx_coef_t> awk1(p + 1);
+  provider.ConsumeData(awk1.data(), awk1.size() * sizeof(spx_coef_t));
+
+  std::vector<spx_coef_t> awk2(p + 1);
+  provider.ConsumeData(awk2.data(), awk2.size() * sizeof(spx_coef_t));
+
+  std::vector<spx_sig_t> exc(nsf);
+  provider.ConsumeData(exc.data(), exc.size() * sizeof(spx_sig_t));
+
+  // Special handling for exc2, which is accessed with negative indices
+  std::vector<spx_word16_t> exc2_buf(exc2_size);
+  provider.ConsumeData(exc2_buf.data(), exc2_buf.size() * sizeof(spx_word16_t));
+  spx_word16_t *exc2 = exc2_buf.data() + end;
+
+  std::vector<spx_word16_t> r(nsf);
+  provider.ConsumeData(r.data(), r.size() * sizeof(spx_word16_t));
+
+  // Allocate a large stack buffer
+  std::vector<char> stack(16384);
+
+  // Initialize SpeexBits
+  SpeexBits bits;
+  speex_bits_init(&bits);
+
+  // Call the function
+  pitch_search_3tap(target.data(), sw.data(), ak.data(), awk1.data(),
+                    awk2.data(), exc.data(), par, start, end, pitch_coef, p,
+                    nsf, &bits, stack.data(), exc2, r.data(),
+                    complexity, cdbk_offset, plc_tuning, &cumul_gain);
+
+  // Cleanup
+  speex_bits_destroy(&bits);
+
+  return 0;
+}
+	

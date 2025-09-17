@@ -1,0 +1,131 @@
+
+	
+<description>
+The function `_cmsDefaultICCintents` is the default handler for creating a color transformation pipeline based on a series of ICC profiles and rendering intents. It is a core part of the color transform creation process in lcms. The function takes an array of profile handles, corresponding rendering intents, black point compensation flags, and adaptation states. It iterates through the profiles, determines the color spaces and connection space, and reads the appropriate lookup tables (LUTs) from each profile. It then concatenates these LUTs into a single pipeline. The function handles different profile classes like device links and abstract profiles. It also performs color space compatibility checks between adjacent profiles in the chain. Finally, it can add a clipping stage to the pipeline if the `cmsFLAGS_NONEGATIVES` flag is set. The resulting pipeline can be used for color transformations. The function is not intended to be called directly by users, but rather through the `cmsCreateTransform` API, which sets up the arguments correctly. It can be used as a building block for custom intent plugins, as seen in the `testplugin.c` example, where it's called to handle the standard parts of a custom intent.
+</description>
+<requirements>
+<requirement>
+The `nProfiles` argument must be greater than zero. The function returns NULL if `nProfiles` is zero, and a non-zero value is required to access `hProfiles[0]`.</requirement>
+<requirement>
+The `hProfiles` array must contain `nProfiles` valid `cmsHPROFILE` handles. These handles are created using functions like `cmsCreateLab2ProfileTHR`, `cmsOpenProfileFromFileTHR`, etc. and represent the ICC profiles in the transform chain.</requirement>
+<requirement>
+The `TheIntents` array must contain `nProfiles` unsigned integers representing the rendering intent for each profile. These can be standard intents (0-3) or custom intents.</requirement>
+<requirement>
+The `BPC` and `AdaptationStates` arrays must each contain `nProfiles` elements. These are used to configure black point compensation and adaptation state for each profile connection.</requirement>
+<requirement>
+The color spaces of adjacent profiles in the `hProfiles` array must be compatible. The function performs a check using `ColorSpaceIsCompatible` and will fail if the spaces don't match.</requirement>
+<requirement>
+The `ContextID` argument can be NULL, in which case the global context is used. If non-NULL, it must be a valid `cmsContext` created by `cmsCreateContext`.</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+cmsPipeline * _cmsDefaultICCintents(cmsContext, cmsUInt32Number, cmsUInt32Number *, cmsHPROFILE *, cmsBool *, cmsFloat64Number *, cmsUInt32Number)
+</function_signature>
+<project_name>
+lcms
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "lcms2.h"
+#include "/src/lcms/include/lcms2_plugin.h"
+
+// Forward declaration as required by the task.
+cmsPipeline * _cmsDefaultICCintents(cmsContext, cmsUInt32Number, cmsUInt32Number *, cmsHPROFILE *, cmsBool *, cmsFloat64Number *, cmsUInt32Number);
+
+#define MAX_PROFILES 4
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+
+    // Use the first byte for nProfiles, but cap it to a reasonable value.
+    // The function requires at least one profile.
+    cmsUInt32Number nProfiles = (data[0] % MAX_PROFILES) + 1;
+    data++;
+    size--;
+
+    // We need data for dwFlags, and for each profile: an intent, a BPC flag,
+    // and an adaptation state. Plus at least one byte for each profile's data.
+    size_t header_size = sizeof(cmsUInt32Number) + 
+                         nProfiles * (sizeof(cmsUInt32Number) + sizeof(cmsBool) + sizeof(cmsFloat64Number));
+    if (size < header_size + nProfiles) {
+        return 0;
+    }
+
+    const uint8_t* profile_data_start = data + header_size;
+    size_t profile_data_size = size - header_size;
+
+    // Allocate parameter arrays
+    cmsUInt32Number* TheIntents = (cmsUInt32Number*)malloc(nProfiles * sizeof(cmsUInt32Number));
+    cmsHPROFILE* hProfiles = (cmsHPROFILE*)malloc(nProfiles * sizeof(cmsHPROFILE));
+    cmsBool* BPC = (cmsBool*)malloc(nProfiles * sizeof(cmsBool));
+    cmsFloat64Number* AdaptationStates = (cmsFloat64Number*)malloc(nProfiles * sizeof(cmsFloat64Number));
+
+    // Initialize hProfiles to NULL for easier cleanup
+    if (hProfiles) {
+        memset(hProfiles, 0, nProfiles * sizeof(cmsHPROFILE));
+    }
+
+    if (!TheIntents || !hProfiles || !BPC || !AdaptationStates) {
+        goto cleanup;
+    }
+
+    // Populate parameters from the "header" part of the data
+    cmsUInt32Number dwFlags;
+    memcpy(&dwFlags, data, sizeof(cmsUInt32Number));
+    data += sizeof(cmsUInt32Number);
+
+    for (cmsUInt32Number i = 0; i < nProfiles; ++i) {
+        memcpy(&TheIntents[i], data, sizeof(cmsUInt32Number));
+        data += sizeof(cmsUInt32Number);
+
+        // Use a single byte for the boolean flag
+        BPC[i] = *data % 2;
+        data += sizeof(cmsBool);
+
+        memcpy(&AdaptationStates[i], data, sizeof(cmsFloat64Number));
+        data += sizeof(cmsFloat64Number);
+    }
+
+    // Create profiles from the remaining data
+    size_t profile_chunk_size = profile_data_size / nProfiles;
+    cmsUInt32Number profiles_created = 0;
+    for (cmsUInt32Number i = 0; i < nProfiles; ++i) {
+        hProfiles[i] = cmsOpenProfileFromMem(profile_data_start + i * profile_chunk_size, profile_chunk_size);
+        if (hProfiles[i] == NULL) {
+            // If one profile fails to open, we stop. The fuzzer will eventually
+            // provide valid data for all profiles.
+            goto cleanup;
+        }
+        profiles_created++;
+    }
+
+    // Call the target function
+    cmsPipeline* pipeline = _cmsDefaultICCintents(NULL, nProfiles, TheIntents, hProfiles, BPC, AdaptationStates, dwFlags);
+    if (pipeline) {
+        cmsPipelineFree(pipeline);
+    }
+
+cleanup:
+    // Free all resources
+    if (hProfiles) {
+        for (cmsUInt32Number i = 0; i < nProfiles; ++i) {
+            if (hProfiles[i]) {
+                cmsCloseProfile(hProfiles[i]);
+            }
+        }
+    }
+    free(TheIntents);
+    free(hProfiles);
+    free(BPC);
+    free(AdaptationStates);
+
+    return 0;
+}
+	

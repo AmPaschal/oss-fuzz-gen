@@ -1,0 +1,122 @@
+
+	
+<description>
+The target is a lambda function defined inside `httplib::Server::routing`. This lambda is passed to the constructor of a `httplib::ContentReader` object. The `ContentReader` is then passed to a registered handler for POST requests. The handler invokes the `ContentReader::operator()`, which in turn executes the target lambda. The lambda's purpose is to read the body of an HTTP request from a stream. It does this by calling `read_content_with_content_receiver`. The behavior of the content reading depends on the request headers, specifically `Content-Length` and `Transfer-Encoding`. The actual content is passed chunk by chunk to a `ContentReceiver` function provided by the caller of the `ContentReader`.
+</description>
+<requirements>
+
+<requirement>
+A `httplib::Server` instance must be created and a POST handler must be registered. This is necessary because the target lambda is invoked through a `ContentReader` that is passed to this handler.
+</requirement>
+<requirement>
+The `strm` object, which is a `httplib::Stream`, must be a valid and readable stream. The data in the stream should be consistent with the request's `Content-Length` or chunked encoding to prevent hangs or read errors.
+</requirement>
+<requirement>
+The `req` object, a `httplib::Request`, must be properly initialized. Its `method` must be "POST", and its `path` must match the registered handler's path. The `headers` must contain either a valid `Content-Length` header (a string convertible to a number) or a `Transfer-Encoding: chunked` header to guide the content reading process.
+</requirement>
+<requirement>
+The `receiver` argument to the lambda, a `httplib::ContentReceiver`, must be a valid function. This function is called with the body of the request, and it should return `true` to ensure the entire request body is processed.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool httplib::Server::operator()(const void *, ContentReceiver)
+</function_signature>
+<project_name>
+cpp-httplib
+</project_name>
+
+	Fuzz target source:
+#include <cstdint>
+#include <string>
+#include <functional>
+#include <algorithm>
+
+#include "httplib.h"
+
+class FuzzedStream : public httplib::Stream {
+public:
+  FuzzedStream(const uint8_t *data, size_t size)
+      : data_(data), size_(size), read_pos_(0) {}
+
+  bool is_readable() const override { return true; }
+  bool wait_readable() const override { return true; }
+  bool wait_writable() const override { return true; }
+
+  ssize_t read(char *ptr, size_t size) override {
+    if (read_pos_ >= size_) {
+      return 0;
+    }
+    size_t available = size_ - read_pos_;
+    size_t to_read = std::min(size, available);
+    memcpy(ptr, data_ + read_pos_, to_read);
+    read_pos_ += to_read;
+    return static_cast<ssize_t>(to_read);
+  }
+
+  ssize_t write(const char * /*ptr*/, size_t size) override {
+    return static_cast<ssize_t>(size);
+  }
+
+  void get_remote_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 8080;
+  }
+
+  void get_local_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 80;
+  }
+
+  socket_t socket() const override { return 0; }
+
+  time_t duration() const override { return 0; }
+
+private:
+  const uint8_t *data_;
+  size_t size_;
+  size_t read_pos_;
+};
+
+class FuzzableServer : public httplib::Server {
+public:
+  void ProcessFuzzedRequest(FuzzedStream &stream) {
+    std::string remote_addr;
+    int remote_port = -1;
+    stream.get_remote_ip_and_port(remote_addr, remote_port);
+
+    std::string local_addr;
+    int local_port = -1;
+    stream.get_local_ip_and_port(local_addr, local_port);
+
+    bool connection_close = false;
+    process_request(stream, remote_addr, remote_port, local_addr, local_port,
+                    /*close_connection=*/false, connection_close, nullptr);
+  }
+};
+
+static FuzzableServer g_server;
+
+extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
+  g_server.Post(R"(.*)",
+      [](const httplib::Request & /*req*/, httplib::Response & /*res*/, const httplib::ContentReader &reader) {
+        httplib::ContentReceiver receiver = [](const char * /*data*/, size_t /*data_length*/) {
+          return true;
+        };
+        reader(receiver);
+      });
+  return 0;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+  FuzzedStream stream{data, size};
+  g_server.ProcessFuzzedRequest(stream);
+  return 0;
+}
+	

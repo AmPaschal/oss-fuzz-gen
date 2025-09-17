@@ -1,0 +1,197 @@
+
+	
+<description>
+The pr_data_xfer function handles the transfer of data over the data connection for a proftpd session. It can either read data from the network and store it in the provided buffer (cl_buf) or write data from the buffer to the network. The direction of the transfer is determined by the global session.xfer.direction variable. The function also handles ASCII mode transfers, performing CRLF conversions as needed. It relies on a properly initialized session structure, including an active data connection (session.d).
+</description>
+<requirements>
+
+<requirement>
+The global session variable must be properly initialized before calling this function. This is because the function heavily relies on session state, such as session.d for the data connection and session.xfer for transfer parameters.
+</requirement>
+<requirement>
+The function pr_data_init() must be called to set up the session.xfer structure. This function initializes crucial transfer parameters like the direction (read/write) and buffering.
+</requirement>
+<requirement>
+The function pr_data_open() must be called to establish an active data connection. This is necessary because pr_data_xfer will fail if the session data connection object, session.d, is NULL.
+</requirement>
+<requirement>
+The session.xfer.direction variable must be set to either PR_NETIO_IO_RD (0) for reading or PR_NETIO_IO_WR (1) for writing. This determines the fundamental operation of the function, and its value is typically set by pr_data_init().
+</requirement>
+<requirement>
+The input buffer `cl_buf` must not be a NULL pointer. The function contains a check for a NULL buffer and will return an error, so a valid memory buffer must be provided.
+</requirement>
+<requirement>
+The input size `cl_size` must be greater than 0. The function will return an error if the size is 0, so a non-zero size is required for any data to be transferred.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int pr_data_xfer(char *, size_t)
+</function_signature>
+<project_name>
+proftpd
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include "config.h"
+#include "proftpd.h"
+#include "pool.h"
+#include "pr_lib.h"
+#include "data.h"
+#include "inet.h"
+#include "netio.h"
+
+/* Global state for the fuzzer */
+static const uint8_t *fuzz_data;
+static size_t fuzz_size;
+static size_t fuzz_offset;
+
+/*
+ * Custom I/O Callbacks
+ * These functions mock the network layer, using the fuzzer's input
+ * as the source of data for reads.
+ */
+
+static int fuzz_close_cb(pr_netio_stream_t *nstrm) {
+  return 0;
+}
+
+static int fuzz_poll_cb(pr_netio_stream_t *nstrm) {
+  /* Always indicate that the fd is ready for I/O and not timed out. */
+  return 1;
+}
+
+static int fuzz_read_cb(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
+  if (fuzz_offset >= fuzz_size) {
+    return 0; /* EOF */
+  }
+
+  size_t bytes_to_read = fuzz_size - fuzz_offset;
+  if (bytes_to_read > buflen) {
+    bytes_to_read = buflen;
+  }
+
+  memcpy(buf, fuzz_data + fuzz_offset, bytes_to_read);
+  fuzz_offset += bytes_to_read;
+
+  return (int)bytes_to_read;
+}
+
+static int fuzz_write_cb(pr_netio_stream_t *nstrm, char *buf, size_t buflen) {
+  /* Pretend we wrote everything successfully. */
+  return (int)buflen;
+}
+
+/*
+ * This function sets up the necessary global state (the `session` object)
+ * and registers our custom I/O handlers to mock the network.
+ */
+static int setup_session_for_fuzzing(pool *p) {
+  memset(&session, 0, sizeof(session));
+  session.pool = p;
+  session.xfer.p = make_sub_pool(p);
+  if (session.xfer.p == NULL) {
+    return -1;
+  }
+
+  session.d = pr_inet_create_conn(p, -1, NULL, 0, 0);
+  if (session.d == NULL) {
+    return -1;
+  }
+
+  pr_netio_t *netio = pr_alloc_netio2(p, NULL, "fuzzer");
+  if (netio == NULL) {
+    return -1;
+  }
+
+  netio->close = fuzz_close_cb;
+  netio->poll = fuzz_poll_cb;
+  netio->read = fuzz_read_cb;
+  netio->write = fuzz_write_cb;
+
+  if (pr_register_netio(netio, PR_NETIO_STRM_DATA) < 0) {
+    return -1;
+  }
+
+  session.d->instrm = pr_netio_open(p, PR_NETIO_STRM_DATA, -1, PR_NETIO_IO_RD);
+  if (session.d->instrm == NULL) {
+    return -1;
+  }
+
+  session.d->outstrm = pr_netio_open(p, PR_NETIO_STRM_DATA, -1, PR_NETIO_IO_WR);
+  if (session.d->outstrm == NULL) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  pool *p = NULL;
+
+  /* Initialize fuzzer globals */
+  fuzz_data = data;
+  fuzz_size = size;
+  fuzz_offset = 0;
+
+  p = make_sub_pool(NULL);
+  if (p == NULL) {
+    return 0;
+  }
+
+  /* Initialize ProFTPD subsystems */
+  init_netio();
+  init_config();
+
+  if (setup_session_for_fuzzing(p) != 0) {
+    destroy_pool(p);
+    return 0;
+  }
+
+  char xfer_buf[4096];
+
+  /* Test 1: Read data from the fuzzer input (binary mode) */
+  fuzz_offset = 0;
+  session.xfer.direction = PR_NETIO_IO_RD;
+  session.sf_flags = 0;
+  pr_data_xfer(xfer_buf, sizeof(xfer_buf));
+
+  /* Test 2: Read data from the fuzzer input (ASCII mode) */
+  fuzz_offset = 0;
+  session.xfer.direction = PR_NETIO_IO_RD;
+  session.sf_flags = SF_ASCII;
+  session.xfer.buf = pcalloc(session.xfer.p, 4096);
+  session.xfer.bufsize = 4096;
+  session.xfer.buflen = 0;
+  pr_data_xfer(xfer_buf, sizeof(xfer_buf));
+
+  /* Test 3: Write data from the fuzzer input (binary mode) */
+  session.xfer.direction = PR_NETIO_IO_WR;
+  session.sf_flags = 0;
+  if (size > 0) {
+    pr_data_xfer((char *)data, size);
+  }
+
+  /* Test 4: Write data from the fuzzer input (ASCII mode) */
+  session.xfer.direction = PR_NETIO_IO_WR;
+  session.sf_flags = SF_ASCII;
+  if (size > 0) {
+    pr_data_xfer((char *)data, size);
+  }
+
+  /* Cleanup */
+  pr_unregister_netio(PR_NETIO_STRM_DATA);
+  destroy_pool(p);
+
+  return 0;
+}
+	

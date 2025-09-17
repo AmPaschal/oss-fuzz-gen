@@ -1,0 +1,243 @@
+
+	
+<description>
+The `sf_command` function serves as a versatile command dispatcher for the libsndfile library, enabling retrieval and modification of information related to sound files and the library itself. Its behavior is primarily controlled by the `command` integer, which determines how the `data` and `datasize` parameters are interpreted. Many commands require a valid `SNDFILE` handle, which must be in a specific state (e.g., opened in write mode), while others can be called with a NULL `SNDFILE` handle to get library-level information. The function's logic involves extensive checking of the `command` value and the corresponding state of the `SNDFILE` object to perform the requested action, which can range from returning simple values to modifying complex data structures within the sound file's header.
+</description>
+<requirements>
+<requirement>
+For most commands, the `sndfile` argument must be a valid pointer returned by `sf_open()` or a related function. This is because the function dereferences this pointer to access internal state, and a `NULL` or invalid pointer will lead to a crash.
+</requirement>
+<requirement>
+The `command` argument should be one of the `SFC_` values defined in the `sndfile.h` header. Using an undefined command value will trigger the default case, which returns an error without performing any action.
+</requirement>
+<requirement>
+The `data` pointer and `datasize` integer must be consistent with the `command` being executed. Many commands check `datasize` against the size of a specific data structure, and a mismatch will result in an error.
+</requirement>
+<requirement>
+When calling with `command` as `SFC_SET_RAW_START_OFFSET`, the `sndfile`'s format must be `SF_FORMAT_RAW`. This is a precondition to prevent changing the data offset for file formats that do not support it.
+</requirement>
+<requirement>
+For commands that modify file headers, such as `SFC_SET_ADD_PEAK_CHUNK`, `SFC_SET_BROADCAST_INFO`, or `SFC_SET_INSTRUMENT`, the `sndfile` must be opened in `SFM_WRITE` or `SFM_RDWR` mode and no frames should have been written to it yet. This ensures that header metadata can be correctly written before the audio data.
+</requirement>
+<requirement>
+When using the `SFC_SET_CHANNEL_MAP_INFO` command, the `data` buffer must contain an array of integers whose size is determined by the number of channels in the `sndfile`. Each integer in this array must be within the valid range defined by `SF_CHANNEL_MAP_INVALID` and `SF_CHANNEL_MAP_MAX` to prevent memory corruption and logic errors.
+</requirement>
+<requirement>
+When `command` is `SFC_FILE_TRUNCATE`, `data` must point to a valid `sf_count_t` value representing the new file size in frames, and `datasize` must be `sizeof(sf_count_t)`. This ensures the file is truncated at the correct, intended position.
+</requirement>
+<requirement>
+For commands like `SFC_CALC_MAX_ALL_CHANNELS` and `SFC_GET_MAX_ALL_CHANNELS`, the `datasize` must be equal to `sizeof(double) * psf->sf.channels`. This is to ensure the output buffer `data` is large enough to hold the peak value for every channel.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int sf_command(SNDFILE *, int, void *, int)
+</function_signature>
+<project_name>
+libsndfile
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <inttypes.h>
+#include <sndfile.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <vector>
+
+#include "sndfile_fuzz_header.h"
+
+// Static union to hold data for sf_command, inspired by the library's internal code.
+static union {
+  short s[1 << 16];
+  int i[1 << 15];
+  float f[1 << 15];
+  double d[1 << 14];
+  char c[1 << 16];
+  SF_INFO info;
+  SF_FORMAT_INFO format_info;
+  SF_DITHER_INFO dither_info;
+  SF_EMBED_FILE_INFO embed_info;
+  SF_CUES cues;
+  SF_INSTRUMENT instrument;
+  SF_LOOP_INFO loop_info;
+  SF_BROADCAST_INFO broadcast_info;
+  SF_CART_INFO cart_info;
+  sf_count_t count;
+} static_data;
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 10) {
+    return 0;
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  // Consume some data for the virtual sound file.
+  size_t file_size = provider.ConsumeIntegralInRange<size_t>(0, provider.remaining_bytes());
+  std::vector<uint8_t> file_data = provider.ConsumeBytes<uint8_t>(file_size);
+
+  SF_INFO sndfile_info;
+  VIO_DATA vio_data;
+  SF_VIRTUAL_IO vio;
+  SNDFILE *sndfile = NULL;
+
+  // Initialize VIO to open the file in read-write mode, as many commands require it.
+  vio.get_filelen = vfget_filelen;
+  vio.seek = vfseek;
+  vio.read = vfread;
+  vio.write = vfwrite;
+  vio.tell = vftell;
+
+  vio_data.data = file_data.data();
+  vio_data.length = file_data.size();
+  vio_data.offset = 0;
+
+  memset(&sndfile_info, 0, sizeof(SF_INFO));
+  sndfile = sf_open_virtual(&vio, SFM_RDWR, &sndfile_info, &vio_data);
+
+  // Randomly decide whether to use the created handle or NULL, as some
+  // commands work with a NULL handle.
+  SNDFILE *target_sndfile = provider.ConsumeBool() ? sndfile : NULL;
+
+  // Only proceed if we have a valid handle or if we are testing a NULL handle path.
+  if (target_sndfile != NULL || provider.ConsumeBool()) {
+    int command = provider.ConsumeIntegral<int>();
+    void *cmd_data = NULL;
+    int cmd_datasize = 0;
+
+    switch (command) {
+    case SFC_SET_NORM_DOUBLE:
+    case SFC_SET_NORM_FLOAT:
+    case SFC_SET_SCALE_FLOAT_INT_READ:
+    case SFC_SET_SCALE_INT_FLOAT_WRITE:
+    case SFC_SET_ADD_PEAK_CHUNK:
+    case SFC_SET_UPDATE_HEADER_AUTO:
+    case SFC_SET_CLIPPING:
+    case SFC_TEST_IEEE_FLOAT_REPLACE:
+      cmd_datasize = provider.ConsumeBool();
+      break;
+
+    case SFC_GET_LIB_VERSION:
+    case SFC_GET_LOG_INFO:
+      cmd_data = &static_data.c[0];
+      cmd_datasize = provider.ConsumeIntegralInRange<int>(0, sizeof(static_data.c));
+      break;
+
+    case SFC_GET_SIMPLE_FORMAT_COUNT:
+    case SFC_GET_FORMAT_MAJOR_COUNT:
+    case SFC_GET_FORMAT_SUBTYPE_COUNT:
+      cmd_data = &static_data.i[0];
+      cmd_datasize = sizeof(int);
+      break;
+
+    case SFC_CALC_SIGNAL_MAX:
+    case SFC_CALC_NORM_SIGNAL_MAX:
+    case SFC_GET_SIGNAL_MAX:
+    case SFC_SET_VBR_ENCODING_QUALITY:
+    case SFC_SET_COMPRESSION_LEVEL:
+    case SFC_SET_OGG_PAGE_LATENCY_MS:
+    case SFC_SET_OGG_PAGE_LATENCY:
+      cmd_data = &static_data.d[0];
+      cmd_datasize = sizeof(double);
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+
+    case SFC_FILE_TRUNCATE:
+    case SFC_SET_RAW_START_OFFSET:
+      cmd_data = &static_data.count;
+      cmd_datasize = sizeof(sf_count_t);
+      static_data.count = provider.ConsumeIntegral<sf_count_t>();
+      break;
+
+    case SFC_GET_CURRENT_SF_INFO:
+      cmd_data = &static_data.info;
+      cmd_datasize = sizeof(SF_INFO);
+      break;
+    case SFC_GET_SIMPLE_FORMAT:
+    case SFC_GET_FORMAT_INFO:
+    case SFC_GET_FORMAT_MAJOR:
+    case SFC_GET_FORMAT_SUBTYPE:
+      cmd_data = &static_data.format_info;
+      cmd_datasize = sizeof(SF_FORMAT_INFO);
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+    case SFC_SET_DITHER_ON_WRITE:
+    case SFC_SET_DITHER_ON_READ:
+      cmd_data = &static_data.dither_info;
+      cmd_datasize = sizeof(SF_DITHER_INFO);
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+    case SFC_GET_EMBED_FILE_INFO:
+      cmd_data = &static_data.embed_info;
+      cmd_datasize = sizeof(SF_EMBED_FILE_INFO);
+      break;
+    case SFC_SET_CUE:
+    case SFC_GET_CUE:
+      cmd_data = &static_data.cues;
+      cmd_datasize = provider.ConsumeIntegralInRange<int>(0, sizeof(SF_CUES));
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+    case SFC_GET_INSTRUMENT:
+    case SFC_SET_INSTRUMENT:
+      cmd_data = &static_data.instrument;
+      cmd_datasize = sizeof(SF_INSTRUMENT);
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+    case SFC_GET_LOOP_INFO:
+      cmd_data = &static_data.loop_info;
+      cmd_datasize = sizeof(SF_LOOP_INFO);
+      break;
+    case SFC_GET_BROADCAST_INFO:
+    case SFC_SET_BROADCAST_INFO:
+      cmd_data = &static_data.broadcast_info;
+      cmd_datasize = sizeof(SF_BROADCAST_INFO);
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+    case SFC_GET_CART_INFO:
+    case SFC_SET_CART_INFO:
+      cmd_data = &static_data.cart_info;
+      cmd_datasize = sizeof(SF_CART_INFO);
+      provider.ConsumeData(cmd_data, cmd_datasize);
+      break;
+
+    case SFC_CALC_MAX_ALL_CHANNELS:
+    case SFC_CALC_NORM_MAX_ALL_CHANNELS:
+    case SFC_GET_MAX_ALL_CHANNELS:
+      if (target_sndfile != NULL && sndfile_info.channels > 0 && (sizeof(double) * sndfile_info.channels < sizeof(static_data.d))) {
+        cmd_data = static_data.d;
+        cmd_datasize = sizeof(double) * sndfile_info.channels;
+      }
+      break;
+
+    case SFC_GET_CHANNEL_MAP_INFO:
+    case SFC_SET_CHANNEL_MAP_INFO:
+      if (target_sndfile != NULL && sndfile_info.channels > 0 && (sizeof(int) * sndfile_info.channels < sizeof(static_data.i))) {
+        cmd_data = static_data.i;
+        cmd_datasize = sizeof(int) * sndfile_info.channels;
+        provider.ConsumeData(cmd_data, cmd_datasize);
+      }
+      break;
+
+    default:
+      cmd_datasize = provider.ConsumeIntegralInRange<int>(0, sizeof(static_data.c));
+      if (cmd_datasize > 0) {
+        cmd_data = &static_data.c[0];
+        provider.ConsumeData(cmd_data, cmd_datasize);
+      }
+      break;
+    }
+
+    sf_command(target_sndfile, command, cmd_data, cmd_datasize);
+  }
+
+  if (sndfile != NULL) {
+    sf_close(sndfile);
+  }
+
+  return 0;
+}
+	

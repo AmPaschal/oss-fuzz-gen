@@ -1,0 +1,170 @@
+
+	
+<description>
+The function `modbus_read_input_bits` reads the content of a number of input bits from a Modbus device. It takes a Modbus context, a starting address, the number of bits to read, and a destination buffer as arguments. The function returns the number of read bits if successful, or -1 on failure.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `ctx`, must be a valid pointer to a `modbus_t` object. This object should be initialized by calling `modbus_new_tcp`, `modbus_new_tcp_pi`, or `modbus_new_rtu` and a connection should be established using `modbus_connect`.
+</requirement>
+<requirement>
+The third argument, `nb`, which represents the number of bits to read, must be greater than 0 and less than or equal to `MODBUS_MAX_READ_BITS` (2000). A value outside this range will cause the function to return an error.
+</requirement>
+<requirement>
+The fourth argument, `dest`, must be a valid pointer to a buffer of at least `nb` bytes. This is to prevent a buffer overflow when the function writes the read bits to this buffer.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_read_input_bits(modbus_t *, int, int, uint8_t *)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/src/modbus.h"
+#include "unit-test.h"
+
+#define PORT 8080
+#define kMinInputLength 9
+#define kMaxInputLength MODBUS_RTU_MAX_ADU_LENGTH
+
+struct Fuzzer {
+  uint16_t port;
+  char *file;
+
+  FILE *inFile;
+  uint64_t size;
+  const uint8_t *buffer;
+
+  pthread_t thread;
+  int socket;
+};
+typedef struct Fuzzer Fuzzer;
+
+int client(Fuzzer *fuzzer);
+
+void fuzzinit(Fuzzer *fuzzer) {
+  struct sockaddr_in server_addr;
+  fuzzer->socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(fuzzer->port);
+  server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  setsockopt(fuzzer->socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+  bind(fuzzer->socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  listen(fuzzer->socket, 1);
+}
+
+void *Server(void *args) {
+
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  {
+    int client;
+    char clientData[10240];
+    struct sockaddr_in clientAddr;
+    uint32_t clientSZ = sizeof(clientAddr);
+
+    client = accept(fuzzer->socket, (struct sockaddr *)&clientAddr, &clientSZ);
+
+    /* The server sends the fuzzer data as a response */
+    send(client, fuzzer->buffer, fuzzer->size, 0);
+    /* The client will send a request, which we ignore */
+    recv(client, clientData, sizeof(clientData), 0);
+
+    shutdown(client, SHUT_RDWR);
+    close(client);
+  }
+  pthread_exit(NULL);
+}
+
+void clean(Fuzzer *fuzzer) {
+  { // Server
+    shutdown(fuzzer->socket, SHUT_RDWR);
+    close(fuzzer->socket);
+  }
+  free(fuzzer);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  fuzzinit(fuzzer);
+
+  pthread_create(&fuzzer->thread, NULL, Server, fuzzer);
+  client(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* To Avoid UAF*/
+
+  clean(fuzzer);
+  return 0;
+}
+
+int client(Fuzzer *fuzzer) {
+
+  uint8_t *tab_rp_bits = NULL;
+  modbus_t *ctx = NULL;
+  int rc;
+  const int nb_points = UT_INPUT_BITS_NB;
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+
+  if (ctx == NULL) {
+    fprintf(stderr, "Unable to allocate libmodbus context\n");
+    return -1;
+  }
+
+  if (modbus_connect(ctx) == -1) {
+    fprintf(stderr, "Connection failed: %s\n", modbus_strerror(errno));
+    modbus_free(ctx);
+    return -1;
+  }
+
+  /* Allocate and initialize the memory to store the bits */
+  tab_rp_bits = (uint8_t *)malloc(nb_points * sizeof(uint8_t));
+  if (tab_rp_bits == NULL) {
+    modbus_close(ctx);
+    modbus_free(ctx);
+    return -1;
+  }
+  memset(tab_rp_bits, 0, nb_points * sizeof(uint8_t));
+
+  /* Fuzz the target function */
+  int modbus_read_input_bits(modbus_t *, int, int, uint8_t *);
+  rc = modbus_read_input_bits(ctx, UT_INPUT_BITS_ADDRESS, nb_points, tab_rp_bits);
+
+  /* Free the memory */
+  free(tab_rp_bits);
+
+  /* Close the connection */
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return rc;
+}
+	

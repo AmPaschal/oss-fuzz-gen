@@ -1,0 +1,196 @@
+
+	
+<description>
+The function `modbus_write_and_read_registers` performs a combination of writing and reading multiple registers in a single Modbus transaction. It sends a request to a Modbus server to write a specified number of registers starting from a given address with the provided data. After the write operation, it reads a specified number of registers from a given address on the same server and stores the result in a destination buffer. The function returns the number of read registers on success, and -1 on failure.
+</description>
+<requirements>
+
+<requirement>
+The `modbus_t` context pointer `ctx` must be initialized by calling `modbus_new_tcp` or `modbus_new_rtu` and connected with `modbus_connect`. This is because the function requires an active connection to send and receive Modbus messages.
+</requirement>
+<requirement>
+The `write_nb` argument must be less than or equal to `MODBUS_MAX_WR_WRITE_REGISTERS` (121). A value greater than this will cause the function to return an error.
+</requirement>
+<requirement>
+The `read_nb` argument must be less than or equal to `MODBUS_MAX_WR_READ_REGISTERS` (125). A value greater than this will cause the function to return an error.
+</requirement>
+<requirement>
+The `src` buffer must be allocated with a size of at least `write_nb * sizeof(uint16_t)`. This is to prevent a buffer over-read when the function accesses the `src` buffer.
+</requirement>
+<requirement>
+The `dest` buffer must be allocated with a size of at least `read_nb * sizeof(uint16_t)`. This is to prevent a buffer overflow when the function writes to the `dest` buffer.
+</requirement>
+<requirement>
+The `ctx` pointer must not be NULL. The function will return an error if the context is NULL.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_write_and_read_registers(modbus_t *, int, int, const uint16_t *, int, int, uint16_t *)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/fuzz/unit-test.h"
+#include <modbus.h>
+
+#define PORT 8080
+#define kMinInputLength 4
+#define kMaxInputLength MODBUS_RTU_MAX_ADU_LENGTH
+
+struct Fuzzer {
+  uint16_t port;
+  char *file;
+
+  FILE *inFile;
+  uint64_t size;
+  const uint8_t *buffer;
+
+  pthread_t thread;
+  int socket;
+};
+typedef struct Fuzzer Fuzzer;
+
+int client(Fuzzer *fuzzer);
+
+void fuzzinit(Fuzzer *fuzzer) {
+  struct sockaddr_in server_addr;
+  fuzzer->socket = socket(AF_INET, SOCK_STREAM, 0);
+
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(fuzzer->port);
+  server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  setsockopt(fuzzer->socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+  bind(fuzzer->socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+  listen(fuzzer->socket, 1);
+}
+
+void *Server(void *args) {
+
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  {
+    int client_sock;
+    char clientData[10240];
+    struct sockaddr_in clientAddr;
+    uint32_t clientSZ = sizeof(clientAddr);
+
+    client_sock = accept(fuzzer->socket, (struct sockaddr *)&clientAddr, &clientSZ);
+
+    if (client_sock != -1) {
+        send(client_sock, fuzzer->buffer, fuzzer->size, 0);
+        recv(client_sock, clientData, sizeof(clientData), 0);
+
+        shutdown(client_sock, SHUT_RDWR);
+        close(client_sock);
+    }
+  }
+  pthread_exit(NULL);
+}
+
+void clean(Fuzzer *fuzzer) {
+  { // Server
+    shutdown(fuzzer->socket, SHUT_RDWR);
+    close(fuzzer->socket);
+  }
+  free(fuzzer);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  fuzzinit(fuzzer);
+
+  pthread_create(&fuzzer->thread, NULL, Server, fuzzer);
+  client(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* To Avoid UAF*/
+
+  clean(fuzzer);
+  return 0;
+}
+
+int client(Fuzzer *fuzzer) {
+
+  uint16_t *tab_rp_registers = NULL;
+  modbus_t *ctx = NULL;
+  int rc;
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+
+  if (ctx == NULL) {
+    fprintf(stderr, "Unable to allocate libmodbus context\n");
+    return -1;
+  }
+
+  if (modbus_connect(ctx) == -1) {
+    fprintf(stderr, "Connection failed: %s\n", modbus_strerror(errno));
+    modbus_free(ctx);
+    return -1;
+  }
+
+  /* Allocate and initialize the memory to store the registers */
+  int dest_nb_max = MODBUS_MAX_WR_READ_REGISTERS;
+  tab_rp_registers = (uint16_t *)malloc(dest_nb_max * sizeof(uint16_t));
+  if (tab_rp_registers == NULL) {
+      modbus_close(ctx);
+      modbus_free(ctx);
+      return -1;
+  }
+  memset(tab_rp_registers, 0, dest_nb_max * sizeof(uint16_t));
+
+  int write_nb = *(const uint16_t*)fuzzer->buffer % (MODBUS_MAX_WR_WRITE_REGISTERS + 1);
+  int read_nb = *(const uint16_t*)(fuzzer->buffer + 2) % (MODBUS_MAX_WR_READ_REGISTERS + 1);
+
+  const int params_size = 4;
+  if (fuzzer->size < params_size + (size_t)write_nb * sizeof(uint16_t)) {
+      free(tab_rp_registers);
+      modbus_close(ctx);
+      modbus_free(ctx);
+      return 0;
+  }
+
+  const uint16_t *src = (const uint16_t*)(fuzzer->buffer + params_size);
+
+  rc = modbus_write_and_read_registers(ctx,
+                                       UT_REGISTERS_ADDRESS,
+                                       write_nb,
+                                       src,
+                                       UT_REGISTERS_ADDRESS,
+                                       read_nb,
+                                       tab_rp_registers);
+
+  /* Free the memory */
+  free(tab_rp_registers);
+
+  /* Close the connection */
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return rc;
+}
+	

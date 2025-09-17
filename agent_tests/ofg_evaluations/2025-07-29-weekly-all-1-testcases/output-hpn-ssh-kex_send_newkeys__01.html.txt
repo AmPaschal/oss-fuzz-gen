@@ -1,0 +1,121 @@
+
+	
+<description>
+The function `kex_send_newkeys` is called after the key exchange process has been completed and shared secrets have been exchanged. It sends a `SSH2_MSG_NEWKEYS` message to the other party, indicating that subsequent packets will be encrypted. It also sets a handler, `kex_input_newkeys`, to handle the `SSH2_MSG_NEWKEYS` message from the peer. This handler, in turn, calls `ssh_set_newkeys` to install the new keys for the connection. The callers of `kex_send_newkeys` always call `kex_derive_keys` immediately before it, which is responsible for deriving the encryption keys and storing them in the `ssh->kex->newkeys` structure. Thus, for `kex_send_newkeys` to work correctly and for the entire key exchange to succeed, the `ssh` object must be in a state where `kex_derive_keys` has been successfully called.
+</description>
+<requirements>
+<requirement>
+The function `kex_derive_keys` must be called before calling `kex_send_newkeys`. This is because `kex_derive_keys` populates the `ssh->kex->newkeys` structure which is used by the `kex_input_newkeys` handler (set by `kex_send_newkeys`) to install the new encryption keys.
+</requirement>
+<requirement>
+The `ssh->kex` field of the `ssh` struct must be properly initialized before calling `kex_derive_keys` and `kex_send_newkeys`. This includes setting the key exchange algorithms, hash algorithm, and other parameters, which is normally done during the key exchange setup.
+</requirement>
+<requirement>
+The `ssh->kex->newkeys` array must be allocated and its contained structures should be initialized. This is because `kex_derive_keys` will write to the members of these structures, and if they are not initialized, it will lead to a crash. This initialization is normally done during the creation of the `kex` object.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_send_newkeys(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+extern "C" {
+#include "includes.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "packet.h"
+#include "myproposal.h"
+#include "xmalloc.h"
+#include "log.h"
+#include "/src/hpn-ssh/kex.h"
+#include "cipher.h"
+#include "mac.h"
+#include "digest.h"
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    static bool initialized = false;
+    if (!initialized) {
+        log_init("kex_fuzzer", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_AUTH, 1);
+        initialized = true;
+    }
+
+    FuzzedDataProvider provider(data, size);
+
+    struct ssh *ssh = NULL;
+    struct kex_params kex_params;
+    const char *myproposal[PROPOSAL_MAX] = { KEX_CLIENT };
+    memcpy(kex_params.proposal, myproposal, sizeof(kex_params.proposal));
+
+    if (ssh_init(&ssh, 1, &kex_params) != 0) {
+        return 0;
+    }
+
+    struct kex *kex = ssh->kex;
+    if (kex == NULL) {
+        ssh_free(ssh);
+        return 0;
+    }
+
+    const char *ciph_name = "aes128-ctr";
+    const char *mac_name = "hmac-sha2-256";
+
+    for (int mode = 0; mode < MODE_MAX; mode++) {
+        struct newkeys *nk = kex->newkeys[mode];
+        nk->enc.cipher = cipher_by_name(ciph_name);
+        if (nk->enc.cipher == NULL) {
+             ssh_free(ssh);
+             return 0;
+        }
+        nk->enc.key_len = cipher_keylen(nk->enc.cipher);
+        nk->enc.iv_len = cipher_ivlen(nk->enc.cipher);
+        nk->enc.block_size = cipher_blocksize(nk->enc.cipher);
+        nk->enc.enabled = 1;
+
+        if (mac_setup(&nk->mac, (char *)mac_name) != 0) {
+            ssh_free(ssh);
+            return 0;
+        }
+        nk->mac.enabled = 1;
+    }
+    
+    kex->hash_alg = SSH_DIGEST_SHA256;
+    
+    size_t hash_len = provider.ConsumeIntegralInRange<size_t>(16, 64);
+    std::vector<uint8_t> hash = provider.ConsumeBytes<uint8_t>(hash_len);
+    if (hash.size() != hash_len) {
+        ssh_free(ssh);
+        return 0;
+    }
+
+    std::vector<uint8_t> secret_bytes = provider.ConsumeRemainingBytes<uint8_t>();
+    struct sshbuf *shared_secret = sshbuf_from(secret_bytes.data(), secret_bytes.size());
+    if (shared_secret == NULL) {
+        ssh_free(ssh);
+        return 0;
+    }
+
+    int r = kex_derive_keys(ssh, hash.data(), hash.size(), shared_secret);
+
+    if (r == 0) {
+        kex_send_newkeys(ssh);
+    }
+
+    sshbuf_free(shared_secret);
+    ssh_free(ssh);
+
+    return 0;
+}
+	

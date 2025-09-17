@@ -1,0 +1,170 @@
+
+	
+<description>
+The function `firebase::firestore::core::OrderBy::Compare` compares two `Document` objects based on a specified field and direction. The comparison logic depends on whether the `OrderBy` object is configured to sort by the document key or by a specific field within the document. If sorting by a field, the function retrieves the field's value from both documents and compares them. The function will fail with an assertion if the specified field is not present in both documents.
+</description>
+<requirements>
+<requirement>
+Both `Document` arguments, `lhs` and `rhs`, must be created from `MutableDocument` objects that have been initialized as `FoundDocument`. This ensures that the documents contain data and can be compared.
+</requirement>
+<requirement>
+The `OrderBy` object must be initialized with a `FieldPath` that exists in both `Document` arguments. This is to prevent an assertion failure when the function tries to access a non-existent field.
+</requirement>
+<requirement>
+If the `OrderBy` object is configured to sort by a specific field (i.e., `field_.IsKeyFieldPath()` is false), both `Document` arguments must contain the field specified by the `OrderBy` object. This is because the function asserts that both documents have the field before comparison, and will crash if the assertion fails.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+firebase::firestore::core::OrderBy::Compare(const Document &, const Document &)
+</function_signature>
+<project_name>
+firestore
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <string>
+#include <utility>
+
+#include "Firestore/core/include/firebase/firestore/timestamp.h"
+#include "Firestore/core/src/core/order_by.h"
+#include "Firestore/core/src/model/document.h"
+#include "Firestore/core/src/model/document_key.h"
+#include "Firestore/core/src/model/field_path.h"
+#include "Firestore/core/src/model/mutable_document.h"
+#include "Firestore/core/src/model/object_value.h"
+#include "Firestore/core/src/model/snapshot_version.h"
+#include "Firestore/core/src/nanopb/message.h"
+#include "Firestore/core/src/nanopb/nanopb_util.h"
+
+using firebase::Timestamp;
+using firebase::firestore::core::Direction;
+using firebase::firestore::core::OrderBy;
+using firebase::firestore::model::Document;
+using firebase::firestore::model::DocumentKey;
+using firebase::firestore::model::FieldPath;
+using firebase::firestore::model::MutableDocument;
+using firebase::firestore::model::ObjectValue;
+using firebase::firestore::model::SnapshotVersion;
+
+namespace firebase {
+namespace firestore {
+namespace {
+
+nanopb::Message<google_firestore_v1_Value> Value(bool value) {
+  nanopb::Message<google_firestore_v1_Value> result;
+  result->which_value_type = google_firestore_v1_Value_boolean_value_tag;
+  result->boolean_value = value;
+  return result;
+}
+
+nanopb::Message<google_firestore_v1_Value> Value(int64_t value) {
+  nanopb::Message<google_firestore_v1_Value> result;
+  result->which_value_type = google_firestore_v1_Value_integer_value_tag;
+  result->integer_value = value;
+  return result;
+}
+
+nanopb::Message<google_firestore_v1_Value> Value(double value) {
+  nanopb::Message<google_firestore_v1_Value> result;
+  result->which_value_type = google_firestore_v1_Value_double_value_tag;
+  result->double_value = value;
+  return result;
+}
+
+nanopb::Message<google_firestore_v1_Value> Value(const std::string& value) {
+  nanopb::Message<google_firestore_v1_Value> result;
+  result->which_value_type = google_firestore_v1_Value_string_value_tag;
+  result->string_value = nanopb::MakeBytesArray(value);
+  return result;
+}
+
+nanopb::Message<google_firestore_v1_Value> Value(Timestamp value) {
+  nanopb::Message<google_firestore_v1_Value> result;
+  result->which_value_type = google_firestore_v1_Value_timestamp_value_tag;
+  result->timestamp_value.seconds = value.seconds();
+  result->timestamp_value.nanos = value.nanoseconds();
+  return result;
+}
+
+// Creates a document for testing.
+//
+// The document will have a single field, specified by `field_path`, whose
+// value is generated from the `FuzzedDataProvider`.
+model::Document MakeDocument(
+    FuzzedDataProvider* provider,
+    const model::FieldPath& field_path) {
+  std::string document_path = provider->ConsumeRandomLengthString(100);
+  // DocumentKey::FromPathString requires an even number of segments.
+  if (std::count(document_path.begin(), document_path.end(), '/') % 2 == 0) {
+    document_path += "/a";
+  }
+  auto key = model::DocumentKey::FromPathString(document_path);
+
+  auto version = model::SnapshotVersion{
+      Timestamp{provider->ConsumeIntegral<int64_t>(),
+                provider->ConsumeIntegralInRange<int32_t>(0, 999999999)}};
+
+  model::ObjectValue data;
+  switch (provider->ConsumeIntegralInRange<int>(0, 4)) {
+    case 0:
+      data.Set(field_path, Value(provider->ConsumeBool()));
+      break;
+    case 1:
+      data.Set(field_path, Value(provider->ConsumeIntegral<int64_t>()));
+      break;
+    case 2:
+      data.Set(field_path, Value(provider->ConsumeFloatingPoint<double>()));
+      break;
+    case 3:
+      data.Set(field_path, Value(provider->ConsumeRandomLengthString(100)));
+      break;
+    case 4:
+      data.Set(field_path, Value(Timestamp{
+                                provider->ConsumeIntegral<int64_t>(),
+                                provider->ConsumeIntegralInRange<int32_t>(
+                                    0, 999999999)}));
+      break;
+  }
+
+  return model::Document{
+      model::MutableDocument::FoundDocument(key, version, std::move(data))};
+}
+
+}  // namespace
+}  // namespace firestore
+}  // namespace firebase
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  try {
+    const auto& direction = provider.ConsumeBool() ? Direction::Ascending
+                                                  : Direction::Descending;
+    std::string field_path_str = provider.ConsumeRandomLengthString(100);
+    // `FieldPath::FromDotSeparatedString` has assertions against invalid
+    // characters.
+    if (field_path_str.empty() ||
+        field_path_str.find_first_of(".[]*`") != std::string::npos) {
+      return 0;
+    }
+    FieldPath field = FieldPath::FromDotSeparatedString(field_path_str);
+
+    OrderBy order_by(field, direction);
+
+    Document doc1 = firebase::firestore::MakeDocument(&provider, field);
+    Document doc2 = firebase::firestore::MakeDocument(&provider, field);
+
+    order_by.Compare(doc1, doc2);
+
+  } catch (...) {
+    // Ignore exceptions from invalid, fuzzer-generated input.
+  }
+
+  return 0;
+}
+	

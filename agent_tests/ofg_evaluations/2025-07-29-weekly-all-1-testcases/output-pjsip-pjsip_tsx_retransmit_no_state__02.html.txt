@@ -1,0 +1,177 @@
+
+	
+<description>
+The function `pjsip_tsx_retransmit_no_state` retransmits a message without checking the transaction state. It acquires a group lock from the transaction, sends the message using `tsx_send_msg`, and then releases the lock. If the `tdata` argument is NULL, it uses the `last_tx` field from the `tsx` argument. The reference counter of `tdata` is decremented only on successful transmission.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `tsx`, must not be a NULL pointer. This is because the function dereferences this argument to access the `grp_lock` and `last_tx` members.
+</requirement>
+<requirement>
+The `grp_lock` member of the `tsx` argument must be a valid, initialized group lock. This is to prevent a crash when `pj_grp_lock_acquire` is called.
+</requirement>
+<requirement>
+If the second argument, `tdata`, is NULL, the `last_tx` member of the `tsx` argument must point to a valid `pjsip_tx_data` structure. This is because `tsx->last_tx` is used as the transmit data in this case.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+pj_status_t pjsip_tsx_retransmit_no_state(pjsip_transaction *, pjsip_tx_data *)
+</function_signature>
+<project_name>
+pjsip
+</project_name>
+
+	Fuzz target source:
+/*
+ * Copyright (C) 2023 Teluu Inc. (http://www.teluu.com)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <pjlib.h>
+#include <pjlib-util.h>
+#include <pjsip.h>
+#include <pjsip_ua.h>
+#include <pjsip/sip_endpoint.h>
+#include <pjsip/sip_msg.h>
+#include "/src/pjsip/pjsip/include/pjsip/sip_transaction.h"
+
+#define kMinInputLength 1
+#define kMaxInputLength 256
+
+/* A dummy module to act as transaction user, as required by
+ * pjsip_tsx_create_uac().
+ */
+static pjsip_module mod_dummy_ua = {
+    NULL,
+    NULL,                           /* prev, next.      */
+    {"mod-dummy-ua", 12},           /* Name.            */
+    -1,                             /* Id               */
+    PJSIP_MOD_PRIORITY_APPLICATION, /* Priority         */
+    NULL,                           /* load()           */
+    NULL,                           /* start()          */
+    NULL,                           /* stop()           */
+    NULL,                           /* unload()         */
+    NULL,                           /* on_rx_request()  */
+    NULL,                           /* on_rx_response() */
+    NULL,                           /* on_tx_request()  */
+    NULL,                           /* on_tx_response() */
+    NULL,                           /* on_tsx_state()   */
+};
+
+/*
+ * This function sets up the necessary PJSIP objects, calls the target
+ * function pjsip_tsx_retransmit_no_state, and cleans up.
+ */
+static int fuzz_retransmit(pj_pool_factory *pf, const uint8_t *data,
+                           size_t size) {
+  pjsip_endpoint *endpt = NULL;
+  pj_pool_t *pool = NULL;
+  pjsip_tx_data *tdata = NULL;
+  pjsip_transaction *tsx = NULL;
+  pj_status_t status;
+
+  /* Create endpoint */
+  status = pjsip_endpt_create(pf, "fuzzer", &endpt);
+  if (status != PJ_SUCCESS)
+    return 0;
+
+  /* Init transaction layer and register a dummy module */
+  pjsip_tsx_layer_init_module(endpt);
+  pjsip_endpt_register_module(endpt, &mod_dummy_ua);
+
+  /* Create memory pool for this run */
+  pool = pj_pool_create(pf, "fuzzer-pool", 1024, 1024, NULL);
+  if (!pool) {
+    pjsip_endpt_destroy(endpt);
+    return 0;
+  }
+
+  /* Create a minimal but valid request message in a tdata. */
+  pjsip_method method;
+  method.id = PJSIP_INVITE_METHOD;
+  method.name = pj_str("INVITE");
+
+  pj_str_t target_uri = pj_str("sip:fuzzer@127.0.0.1");
+  pj_str_t from_uri = pj_str("sip:fuzzer@localhost");
+  pj_str_t to_uri = pj_str("sip:fuzz-target@example.com");
+  pj_str_t call_id;
+  char call_id_buf[kMaxInputLength + 1];
+
+  /* Use fuzzer data for Call-ID to introduce some variability */
+  memcpy(call_id_buf, data, size);
+  call_id_buf[size] = '\0';
+  call_id = pj_str(call_id_buf);
+
+  status = pjsip_endpt_create_request(endpt, &method, &target_uri, &from_uri,
+                                      &to_uri, NULL, &call_id, 1, NULL, &tdata);
+
+  if (status != PJ_SUCCESS) {
+    pj_pool_release(pool);
+    pjsip_endpt_destroy(endpt);
+    return 0;
+  }
+
+  /* Create a UAC transaction from the request */
+  status = pjsip_tsx_create_uac(&mod_dummy_ua, tdata, &tsx);
+  if (status != PJ_SUCCESS) {
+    pjsip_tx_data_dec_ref(tdata);
+    pj_pool_release(pool);
+    pjsip_endpt_destroy(endpt);
+    return 0;
+  }
+
+  /* Call the function under test */
+  pjsip_tsx_retransmit_no_state(tsx, tdata);
+  pjsip_tsx_retransmit_no_state(tsx, NULL);
+
+  /* Cleanup */
+  pjsip_tx_data_dec_ref(tdata);
+  pjsip_tsx_terminate(tsx, PJSIP_SC_REQUEST_TERMINATED);
+  pj_pool_release(pool);
+  pjsip_endpt_destroy(endpt);
+
+  return 0;
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  pj_caching_pool caching_pool;
+
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  /* Init PJSIP */
+  pj_init();
+  pj_caching_pool_init(&caching_pool, &pj_pool_factory_default_policy, 0);
+  pj_log_set_level(0);
+
+  /* Fuzz */
+  fuzz_retransmit(&caching_pool.factory, data, size);
+
+  /* Shutdown PJSIP */
+  pj_caching_pool_destroy(&caching_pool);
+
+  return 0;
+}
+	

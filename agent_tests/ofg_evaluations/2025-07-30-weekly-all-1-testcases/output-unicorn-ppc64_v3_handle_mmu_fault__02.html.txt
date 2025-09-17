@@ -1,0 +1,107 @@
+
+	
+<description>
+The function `ppc64_v3_handle_mmu_fault` is a dispatcher function that handles MMU faults for PowerPC 64-bit CPUs. It determines whether the guest is using radix or hash-based address translation by calling `ppc64_v3_radix()`. Based on the result, it calls either `ppc_radix64_handle_mmu_fault()` or `ppc_hash64_handle_mmu_fault()` to handle the fault. The function is called from `ppc_cpu_do_interrupts`, `ppc_cpu_tlb_fill` and `helper_store_access` when a memory access causes a fault. The `rwx` parameter indicates the type of access that caused the fault (read, write, or execute).
+</description>
+<requirements>
+
+<requirement>
+The first argument, `PowerPCCPU *cpu`, must be a valid pointer to a `PowerPCCPU` struct. This is because it is dereferenced in the `ppc64_v3_radix` function to determine the address translation mode.
+</requirement>
+<requirement>
+The `rwx` argument should be a valid combination of `MMU_INST_FETCH`, `MMU_DATA_LOAD`, and `MMU_DATA_STORE`. The callers of `ppc64_v3_handle_mmu_fault` use these values to indicate the type of memory access that caused the fault, and the function passes this value to `ppc_radix64_handle_mmu_fault` or `ppc_hash64_handle_mmu_fault`, so valid values are required to ensure correct fault handling.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int ppc64_v3_handle_mmu_fault(PowerPCCPU *, vaddr, int, int)
+</function_signature>
+<project_name>
+unicorn
+</project_name>
+
+	Fuzz target source:
+#include <unicorn/unicorn.h>
+#include <string.h>
+#include <stddef.h>
+
+// uc_priv.h is needed for uc_struct, and it should bring in the
+// definition for vaddr and CPUState.
+#include "uc_priv.h"
+
+// Forward declare the PowerPCCPU struct to avoid including the
+// poisoned header "target/ppc/cpu-qom.h".
+// A pointer to an incomplete type is sufficient here.
+typedef struct PowerPCCPU PowerPCCPU;
+
+// The function under test is not declared in any public header,
+// so we provide a forward declaration.
+int ppc64_v3_handle_mmu_fault(PowerPCCPU *, vaddr, int, int);
+
+// This define was provided in the problem description to resolve a
+// symbol name collision, likely because the final library is a
+// combination of multiple architectures.
+#define cpu_mmu_index riscv_cpu_mmu_index
+
+// The POWERPC_CPU macro is just a cast, so we can define it ourselves
+// since we cannot include the header that defines it.
+#define POWERPC_CPU(obj) ((PowerPCCPU *)obj)
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // The fuzzer input must be large enough to provide all parameters.
+    // vaddr (uint64_t) + rwx (int) + mmu_idx (int)
+    if (size < sizeof(vaddr) + sizeof(int) * 2) {
+        return 0;
+    }
+
+    uc_engine *uc;
+    uc_err err;
+
+    // Initialize a PowerPC 64-bit big-endian Unicorn engine.
+    // This creates the necessary CPU state for the test.
+    err = uc_open(UC_ARCH_PPC, UC_MODE_PPC64 | UC_MODE_BIG_ENDIAN, &uc);
+    if (err != UC_ERR_OK) {
+        // It's possible for uc_open to fail if the PPC target was not built.
+        // If so, we can't proceed.
+        return 0;
+    }
+
+    // The MMU fault handler may need to access memory, so we map a region.
+    uc_mem_map(uc, 0x1000000, 4 * 1024 * 1024, UC_PROT_ALL);
+
+    // Access internal Unicorn structures to get the CPU state.
+    struct uc_struct *internal_uc = (struct uc_struct *)uc;
+    if (!internal_uc || !internal_uc->cpu) {
+        uc_close(uc);
+        return 0;
+    }
+
+    // Cast the generic CPUState* to the required PowerPCCPU*.
+    // This works because PowerPCCPU is a QEMU-style subclass of CPUState,
+    // and the cast is valid.
+    PowerPCCPU *ppc_cpu = POWERPC_CPU(internal_uc->cpu);
+
+    // Extract function parameters from the fuzzer input data.
+    // Using memcpy is safer than direct casting to avoid alignment issues.
+    vaddr eaddr;
+    int rwx;
+    int mmu_idx;
+
+    memcpy(&eaddr, data, sizeof(vaddr));
+    memcpy(&rwx, data + sizeof(vaddr), sizeof(int));
+    memcpy(&mmu_idx, data + sizeof(vaddr) + sizeof(int), sizeof(int));
+
+    // Call the function under test with the fuzzed parameters.
+    // The linker should find this function in the static libunicorn.a,
+    // assuming it was built with PPC support.
+    ppc64_v3_handle_mmu_fault(ppc_cpu, eaddr, rwx, mmu_idx);
+
+    // Clean up and release resources.
+    uc_close(uc);
+
+    return 0;
+}
+	

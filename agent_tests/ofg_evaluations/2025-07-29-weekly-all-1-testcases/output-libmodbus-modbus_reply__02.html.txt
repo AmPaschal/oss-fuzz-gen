@@ -1,0 +1,193 @@
+
+	
+<description>
+The `modbus_reply` function is a server-side function in the libmodbus library that processes a request from a Modbus client, interacts with the server's data model (`modbus_mapping_t`), and sends back a response or an exception. The function's behavior is primarily driven by the function code specified in the client's request buffer. It validates the request against the data mapping to prevent invalid memory accesses and delegates the actual network communication to backend-specific functions defined in the `modbus_t` context.
+</description>
+<requirements>
+<requirement>
+The `modbus_t` context pointer, `ctx`, must be initialized by calling either `modbus_new_tcp()` or `modbus_new_rtu()`. This is crucial because `modbus_reply` relies on backend-specific function pointers within the `ctx->backend` structure to construct and send the response.
+</requirement>
+<requirement>
+The `modbus_mapping_t` pointer, `mb_mapping`, must be allocated and initialized using `modbus_mapping_new()` or `modbus_mapping_new_start_address()`. Failing to do so will result in the function accessing uninitialized or invalid memory for the data tables (bits and registers).
+</requirement>
+<requirement>
+Before calling `modbus_reply`, the server must be configured to listen for and accept client connections, for instance by using `modbus_tcp_listen()` and `modbus_tcp_accept()` for a TCP backend. This establishes a valid socket descriptor in the `ctx` object, which is necessary for sending the reply.
+</requirement>
+<requirement>
+The request buffer `req` and its length `req_length` should be populated by calling `modbus_receive()`. This ensures that `modbus_reply` processes a valid, well-formed request from a client, as it is intended to do in a real-world server application.
+</requirement>
+<requirement>
+The data addresses and item counts parsed from the `req` buffer must fall within the boundaries defined in the `mb_mapping` structure. The function checks this relationship (`address >= start_address` and `address + count <= start_address + size`) to prevent out-of-bounds reads or writes on the data tables.
+</requirement>
+<requirement>
+The byte at `req[ctx->backend->header_length]` should be fuzzed with various values. This byte represents the Modbus function code and dictates the primary control flow path within a large switch statement in the function.
+</requirement>
+<requirement>
+The `req_length` argument must be consistent with the length expected for the function code and payload in the `req` buffer. The function validates this for certain operations, and mismatches lead to exception paths that should be tested.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int modbus_reply(modbus_t *, const uint8_t *, int, modbus_mapping_t *)
+</function_signature>
+<project_name>
+libmodbus
+</project_name>
+
+	Fuzz target source:
+/* Copyright 2022 Google LLC
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+      http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "/src/libmodbus/src/modbus.h"
+#include "unit-test.h"
+
+#define PORT 8080
+#define kMinInputLength 9
+#define kMaxInputLength MODBUS_RTU_MAX_ADU_LENGTH
+
+struct Fuzzer {
+  uint16_t port;
+  uint64_t size;
+  const uint8_t *buffer;
+  pthread_t thread;
+};
+typedef struct Fuzzer Fuzzer;
+
+int server(Fuzzer *fuzzer);
+
+void *client(void *args) {
+  Fuzzer *fuzzer = (Fuzzer *)args;
+  int sockfd;
+  struct sockaddr_in serv_addr;
+
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0) {
+    pthread_exit(NULL);
+  }
+
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(fuzzer->port);
+  serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+  /* Try to connect until the server is ready */
+  while (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) <
+         0) {
+    usleep(1000);
+  }
+
+  send(sockfd, fuzzer->buffer, fuzzer->size, 0);
+
+  close(sockfd);
+  pthread_exit(NULL);
+}
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < kMinInputLength || size > kMaxInputLength) {
+    return 0;
+  }
+
+  Fuzzer *fuzzer = (Fuzzer *)malloc(sizeof(Fuzzer));
+  if (fuzzer == NULL) {
+    return 0;
+  }
+  fuzzer->port = PORT;
+  fuzzer->size = size;
+  fuzzer->buffer = data;
+
+  pthread_create(&fuzzer->thread, NULL, client, fuzzer);
+  server(fuzzer);
+  pthread_join(fuzzer->thread, NULL); /* Avoid UAF */
+
+  free(fuzzer);
+  return 0;
+}
+
+int server(Fuzzer *fuzzer) {
+  int s = -1;
+  modbus_t *ctx;
+  modbus_mapping_t *mb_mapping;
+  int rc;
+  uint8_t *query;
+
+  ctx = modbus_new_tcp("127.0.0.1", fuzzer->port);
+  if (ctx == NULL) {
+    return -1;
+  }
+  query = malloc(MODBUS_TCP_MAX_ADU_LENGTH);
+  if (query == NULL) {
+    modbus_free(ctx);
+    return -1;
+  }
+
+  mb_mapping = modbus_mapping_new_start_address(
+      UT_BITS_ADDRESS, UT_BITS_NB, UT_INPUT_BITS_ADDRESS, UT_INPUT_BITS_NB,
+      UT_REGISTERS_ADDRESS, UT_REGISTERS_NB_MAX, UT_INPUT_REGISTERS_ADDRESS,
+      UT_INPUT_REGISTERS_NB);
+  if (mb_mapping == NULL) {
+    fprintf(stderr, "Failed to allocate the mapping: %s\n",
+            modbus_strerror(errno));
+    free(query);
+    modbus_free(ctx);
+    return -1;
+  }
+
+  /* Initialize input values that's can be only done server side. */
+  modbus_set_bits_from_bytes(mb_mapping->tab_input_bits, 0, UT_INPUT_BITS_NB,
+                             UT_INPUT_BITS_TAB);
+
+  /* Initialize values of INPUT REGISTERS */
+  for (int i = 0; i < UT_INPUT_REGISTERS_NB; i++) {
+    mb_mapping->tab_input_registers[i] = UT_INPUT_REGISTERS_TAB[i];
+  }
+
+  s = modbus_tcp_listen(ctx, 1);
+  if (s == -1) {
+    modbus_mapping_free(mb_mapping);
+    free(query);
+    modbus_free(ctx);
+    return -1;
+  }
+
+  modbus_tcp_accept(ctx, &s);
+
+  rc = modbus_receive(ctx, query);
+  if (rc > 0) {
+    /* Function under test */
+    modbus_reply(ctx, query, rc, mb_mapping);
+  }
+
+  if (s != -1) {
+    close(s);
+  }
+
+  modbus_mapping_free(mb_mapping);
+  free(query);
+  modbus_close(ctx);
+  modbus_free(ctx);
+
+  return 0;
+}
+	

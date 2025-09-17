@@ -90,7 +90,7 @@ def sanitize_json_maybe(s: str) -> str:
   return s
 
 
-def build_prompt_parts(full_text: str) -> Tuple[str, str]:
+def build_prompt_parts(prompt: prompts.Prompt, full_text: str) -> prompts.Prompt:
   system_instruction = (
       "You are evaluating whether a fuzz driver satisfies all listed requirements for a target function in a given project. "
       "Read the requirements and the fuzz target source embedded in the text. "
@@ -102,20 +102,20 @@ def build_prompt_parts(full_text: str) -> Tuple[str, str]:
       "No extra text, no markdown, no code fences — output just the JSON object."
   )
 
-  prompt = prompts.TextPrompt()
   prompt.add_priming(system_instruction)
-  prompt.append(full_text)
+  prompt.add_problem(full_text)
   return prompt
 
 
-def eval_file(llm: models.LLM, project: str, location: str, group: str,
-              p: Path) -> Optional[FileEval]:
+def eval_file(llm: models.LLM, p: Path) -> Optional[Dict[str, Any]]:
   text = read_text(p)
 
   if not "<requirement>" in text or not "Fuzz target source:" in text:
     return None
 
-  prompt = build_prompt_parts(text)
+  prompt = llm.prompt_type()(None)
+
+  prompt = build_prompt_parts(prompt, text)
 
   client = llm.get_chat_client(model=llm.get_model())
   response = llm.chat_llm(client, prompt)
@@ -128,12 +128,13 @@ def eval_file(llm: models.LLM, project: str, location: str, group: str,
     )
     return None
 
-  return FileEval(
-      group=group,
-      name=p.name,
-      path=p,
-      result=parsed,
-  )
+  result = {
+    'file_name': p.name,
+  }
+
+  result.update(parsed)
+
+  return result
 
 
 def iter_txt_files(dir_path: Path) -> Iterable[Path]:
@@ -156,64 +157,48 @@ def write_jsonl(output: Path, record: Dict[str, Any]) -> None:
   with output.open('a', encoding='utf-8') as f:
     f.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
 
+def summarize_result(results: list[Dict[str, Any]]) -> dict[str, Any]:
+  total = len(results)
+  true_count = sum(1 for r in results if r.get('conclusion') is True)
+  false_count = sum(1 for r in results if r.get('conclusion') is False)
+  print(f"Total fuzz drivers evaluated: {total}")
+  print(f"Files satisfying all requirements (conclusion=True): {true_count}")
+  print(f"Files NOT satisfying all requirements (conclusion=False): {false_count}")
 
-def compare_and_print(with_evals: Dict[str, FileEval],
-                      without_evals: Dict[str, FileEval]) -> None:
-  print("\nSummary (with-fa vs without-fa):")
-  print("-" * 60)
+  summary = {
+    "total_fuzz_drivers": total,
+    "total_properties": 0,
+    "all_satisfied": true_count,
+  }
 
-  wins = draws = losses = 0
-  total_with_x = total_with_y = 0
-  total_without_x = total_without_y = 0
-  total_w_true = total_wo_true = 0
+  # Compute percentage satisfying all requirements, and all-but-one requirements
+  if total > 0:
+    # Total
+    percent_true = (true_count / total) * 100
+    print(f"Percentage satisfying all requirements: {percent_true:.2f}%")
 
-  all_names = sorted(set(with_evals.keys()) | set(without_evals.keys()))
-  for name in all_names:
-    w = with_evals.get(name)
-    wo = without_evals.get(name)
-    if not w and not wo:
-      continue
+    # All-but-one
+    all_but_one_count = 0
+    total_x = total_y = 0
+    for result in results:
+      num_satisfied = result.get('num_satisfied', '0/0')
+      x, y = parse_num_satisfied(num_satisfied)
+      total_x += x
+      total_y += y
+      if y > 0 and x == y - 1:
+        all_but_one_count += 1
 
-    w_x, w_y = parse_num_satisfied(w.result.get('num_satisfied') if w else None)
-    wo_x, wo_y = parse_num_satisfied(
-        wo.result.get('num_satisfied') if wo else None)
+    summary["total_properties"] = total_y
 
-    total_with_x += w_x
-    total_with_y += w_y
-    total_without_x += wo_x
-    total_without_y += wo_y
+    percent_all_but_one = (all_but_one_count / total) * 100
+    print(f"Percentage satisfying all-but-one requirements: {percent_all_but_one:.2f}%")
+    summary["all_but_one"] = all_but_one_count
 
-    w_conc = w.result.get('conclusion', False) if w else False
-    wo_conc = wo.result.get('conclusion', False) if wo else False
+    percent_satisfied = (total_x / total_y) * 100 if total_y > 0 else 0
+    print(f"Overall percentage of requirements satisfied: {percent_satisfied:.2f}%")
+    summary["requirements_satisfied"] = percent_satisfied
 
-    if w_conc:
-      total_w_true += 1
-    if wo_conc:
-      total_wo_true += 1
-
-    delta = (w_x - wo_x) if (w and wo) else 0
-    if w and wo:
-      if w_conc and not wo_conc:
-        wins += 1
-      elif w_conc == wo_conc:
-        draws += 1
-      else:
-        losses += 1
-
-    print(
-        f"{name}: with-fa {w_x}/{w_y} (conclusion={w_conc}) vs without-fa {wo_x}/{wo_y} (conclusion={wo_conc}) | Δ={delta}"
-    )
-
-  print("-" * 60)
-
-  def ratio(x: int, y: int) -> str:
-    return f"{x}/{y}" if y else "0/0"
-
-  print(
-      f"Totals: with-fa {ratio(total_with_x, total_with_y)} ; without-fa {ratio(total_without_x, total_without_y)}"
-  )
-  print(f"Pairwise: wins={wins}, draws={draws}, losses={losses}")
-
+  return summary
 
 # ------------------------------ Main ------------------------------ #
 
@@ -221,20 +206,34 @@ def compare_and_print(with_evals: Dict[str, FileEval],
 def main(argv: Optional[List[str]] = None) -> int:
   parser = argparse.ArgumentParser(
       description="Evaluate fuzz drivers against requirements using an LLM")
-  parser.add_argument('--with-dir',
+  parser.add_argument('--input-dir',
+                      type=Path,
                       required=True,
                       help='Directory with FA-assisted requirement files')
-  parser.add_argument('--without-dir',
-                      required=True,
-                      help='Directory without FA requirement files')
-  parser.add_argument('--output', required=True, help='Output JSONL file')
+  parser.add_argument('-o', '--output', help='Output JSONL file')
   parser.add_argument(
+      '-l',
       '--model',
       type=str,
       default='gemini-2.5-flash',
       help='Gemini model name (e.g., gemini-2.5-flash, gemini-2.5-pro)')
-
+  parser.add_argument(
+      '--max', 
+      type=int, 
+      default=None, 
+      help='Max files per directory (for quick runs)')
+    
   args = parser.parse_args(argv)
+
+  if args.output:
+    output_file = Path(args.output)
+  else:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_file = Path(f"results-fa-influence-{timestamp}.jsonl")
+
+  # clear output file if it exists
+  if output_file.exists():
+    os.remove(output_file)
 
   args.llm = models.LLM.setup(
       ai_binary='',
@@ -244,40 +243,26 @@ def main(argv: Optional[List[str]] = None) -> int:
   timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   records: List[Dict[str, Any]] = []
 
-  with_evals: Dict[str, FileEval] = {}
-  without_evals: Dict[str, FileEval] = {}
+  count = 0
+  for file in iter_txt_files(args.input_dir):
+    if args.max is not None and count >= args.max:
+      break
+    print(f"Evaluating file: {file}")
+    file_result = eval_file(args.llm, file)
+    if file_result is None:
+      print(f"Skipping file {file} due to evaluation error.")
+      continue
 
-  for group, dir_path in [('with-fa', args.with_dir),
-                          ('without-fa', args.without_dir)]:
-    count = 0
-    for p in iter_txt_files(dir_path):
-      if args.max is not None and count >= args.max:
-        break
-      print(f"Evaluating {group} file: {p}")
-      fe = eval_file(args.llm, args.gcp_project, args.location, group, p)
-      if fe is None:
-        print(f"Skipping file {p} due to evaluation error.")
-        continue
-      rec = {
-          'ts': timestamp,
-          'group': group,
-          'filename': fe.name,
-          'path': str(p),
-          'model': args.llm.name,
-          'result': fe.result,
-      }
-      records.append(rec)
-      write_jsonl(args.output, rec)
-      if group == 'with-fa':
-        with_evals[fe.name] = fe
-      else:
-        without_evals[fe.name] = fe
-      count += 1
+    records.append(file_result)
+    write_jsonl(output_file, file_result)
+    count += 1
 
   # write_jsonl(args.output, records)
-  compare_and_print(with_evals, without_evals)
+  summary = summarize_result(records)
 
-  print(f"\nSaved {len(records)} records to {args.output}")
+  write_jsonl(output_file, summary)
+
+  print(f"\nSaved {len(records)} records to {output_file}")
   return 0
 
 

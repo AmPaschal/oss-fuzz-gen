@@ -1,0 +1,157 @@
+
+	
+<description>
+The `smux_accept` function accepts a new SMUX peer connection on the listening socket descriptor `sd`. It performs the initial SMUX open handshake, including authentication. If the handshake is successful, it returns a new socket descriptor for the peer connection. Otherwise, it returns -1.
+</description>
+<requirements>
+<requirement>
+The `init_smux()` function must be called before `real_init_smux()`. This is because `init_smux()` registers the configuration handlers for SMUX, which are used in `real_init_smux()`.
+</requirement>
+<requirement>
+The `real_init_smux()` function must be called before `smux_accept()`. This is because `real_init_smux()` creates and initializes the listening socket `smux_listen_sd`, which is passed as the argument to `smux_accept()`.
+</requirement>
+<requirement>
+The integer argument `sd` must be a valid listening socket file descriptor. This is because it is used in the `accept()` system call to accept new connections.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int smux_accept(int sd)
+</function_signature>
+<project_name>
+net-snmp
+</project_name>
+
+	Fuzz target source:
+/*
+ * Fuzzer for the smux_accept() function.
+ *
+ * This fuzzer sets up a listening SMUX socket and then, for each input,
+ * acts as a client to connect to this socket, sends the fuzzer data,
+ * and calls smux_accept() to process it. This allows fuzzing of the
+ * initial PDU parsing and connection handling logic.
+ */
+#include <net-snmp/net-snmp-config.h>
+#include <net-snmp/net-snmp-includes.h>
+#include <net-snmp/agent/net-snmp-agent-includes.h>
+
+/*
+ * Include the header for the function under test using a relative path
+ * from this fuzzer's location (testing/fuzzing/) to the header's
+ * location (agent/mibgroup/smux/).
+ */
+#include "../../agent/mibgroup/smux/smux.h"
+
+/* Standard headers for networking */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+/*
+ * The smux_listen_sd variable is defined in agent/mibgroup/smux/smux.c
+ * but not exposed in any header. We declare it as extern here to be able
+ * to access it after real_init_smux() sets it up.
+ */
+extern int smux_listen_sd;
+
+/* Global state to hold the listening socket and its address */
+static int g_smux_listen_sd = -1;
+static struct sockaddr_in g_smux_addr;
+
+/*
+ * The function under test. The prototype is included as a good practice
+ * and to satisfy the prompt's requirements.
+ */
+int smux_accept(int);
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    socklen_t addr_len;
+
+    /* Do not read system-wide configuration files to ensure a clean environment */
+    netsnmp_ds_set_boolean(NETSNMP_DS_LIBRARY_ID, NETSNMP_DS_LIB_DONT_READ_CONFIGS, 1);
+
+    /* Initialize the agent and SNMP library */
+    init_agent("smux_fuzzer");
+    init_snmp("smux_fuzzer");
+
+    /* Initialize the SMUX subsystem, which registers config handlers */
+    init_smux();
+
+    /*
+     * Configure the SMUX socket to listen on 127.0.0.1 with an ephemeral port.
+     * Port 0 tells the OS to assign an available port automatically.
+     */
+    netsnmp_ds_set_string(NETSNMP_DS_APPLICATION_ID, NETSNMP_DS_SMUX_SOCKET, "127.0.0.1:0");
+
+    /* This creates and binds the listening socket (smux_listen_sd) */
+    real_init_smux();
+
+    /*
+     * The listening socket descriptor is stored in an exported global variable.
+     * We copy it to our own global for use in the fuzzer.
+     */
+    g_smux_listen_sd = smux_listen_sd;
+
+    if (g_smux_listen_sd < 0) {
+        snmp_log(LOG_ERR, "Failed to initialize SMUX listening socket.\n");
+        return -1; /* A non-zero return from LLVMFuzzerInitialize is a fatal error */
+    }
+
+    /* Get the actual address and port the socket was bound to */
+    addr_len = sizeof(g_smux_addr);
+    if (getsockname(g_smux_listen_sd, (struct sockaddr *)&g_smux_addr, &addr_len) != 0) {
+        snmp_log_perror("getsockname failed");
+        close(g_smux_listen_sd);
+        g_smux_listen_sd = -1;
+        return -1;
+    }
+
+    return 0; /* Success */
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    int client_sd = -1;
+    int peer_sd = -1;
+
+    if (g_smux_listen_sd < 0 || size == 0) {
+        /* Don't proceed if initialization failed or if the input is empty */
+        return 0;
+    }
+
+    /* 1. Create a client socket to act as the SMUX peer */
+    client_sd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_sd < 0) {
+        return 0; /* Cannot create socket, skip this input */
+    }
+
+    /* 2. Connect the client to the listening SMUX socket */
+    if (connect(client_sd, (struct sockaddr *)&g_smux_addr, sizeof(g_smux_addr)) != 0) {
+        close(client_sd);
+        return 0; /* Connection failed, skip this input */
+    }
+
+    /* 3. Send the fuzzer-generated data to the listening socket */
+    send(client_sd, data, size, 0);
+
+    /*
+     * 4. Call the function under test. It will now accept our client's
+     *    connection and read the data we just sent, triggering the
+     *    parsing logic we want to fuzz.
+     */
+    peer_sd = smux_accept(g_smux_listen_sd);
+
+    /* 5. Clean up the sockets */
+    if (peer_sd >= 0) {
+        close(peer_sd);
+    }
+    close(client_sd);
+
+    return 0;
+}
+	

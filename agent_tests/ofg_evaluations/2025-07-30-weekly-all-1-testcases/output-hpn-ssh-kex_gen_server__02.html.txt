@@ -1,0 +1,220 @@
+
+	
+<description>
+The function kex_gen_server is part of the server-side key exchange process in hpn-ssh. It's not meant to be called directly. Instead, it is assigned as a callback function for a specific key exchange algorithm. When the key exchange process for that algorithm starts, kex_gen_server is invoked. Its primary role is to set up a message handler for the SSH2_MSG_KEX_ECDH_INIT message. The actual key exchange logic is handled by the input_kex_gen_init function, which is set as the handler. Therefore, for kex_gen_server to be tested properly, the ssh session object must be in a state where it is ready for a key exchange, and the input buffer should contain the expected message to trigger the handler.
+</description>
+<requirements>
+<requirement>
+The `ssh` structure, which is the main session object, must be created and initialized. The `ssh_test_new` function can be used for this purpose in a testing environment, as it properly allocates and sets up a `struct ssh`.
+</requirement>
+<requirement>
+The `kex_setup` function must be called before `kex_gen_server`. This function is responsible for initializing the key exchange-related members of the `ssh` structure, including setting up the `kex` substructure and algorithm proposals.
+</requirement>
+<requirement>
+The `ssh->my_proposal` and `ssh->peer_proposal` arrays should be populated with valid algorithm identifiers. These proposals are used by `kex_setup` to determine which key exchange algorithm to use, and `kex_gen_server` is one of the potential functions to be selected.
+</requirement>
+<requirement>
+The input packet buffer in the `ssh` object must be populated with a `SSH2_MSG_KEX_ECDH_INIT` message. The `kex_gen_server` function sets up `input_kex_gen_init` to handle this specific message, so the message must be present to trigger the core logic.
+</requirement>
+<requirement>
+The `SSH2_MSG_KEX_ECDH_INIT` message in the input buffer must contain a client public key. `input_kex_gen_init` parses this public key from the message, and a valid key is required for the cryptographic operations to succeed.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int kex_gen_server(struct ssh *)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+
+extern "C" {
+
+#include "includes.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "packet.h"
+#include "myproposal.h"
+#include "xmalloc.h"
+#include "authfile.h"
+#include "log.h"
+#include "/src/hpn-ssh/kex.h"
+#include "fixed-keys.h"
+
+// Helper functions and structs adapted from kex_fuzz.cc
+struct shared_state {
+	size_t nkeys;
+	struct sshkey **privkeys, **pubkeys;
+};
+
+static void
+store_key(struct shared_state *st, struct sshkey *pubkey,
+    struct sshkey *privkey)
+{
+	if (st == NULL || pubkey->type < 0 || pubkey->type > INT_MAX ||
+	    privkey->type != pubkey->type ||
+	    ((size_t)pubkey->type < st->nkeys &&
+	     st->pubkeys[pubkey->type] != NULL))
+		abort();
+	if ((size_t)pubkey->type >= st->nkeys) {
+		st->pubkeys = (struct sshkey **)xrecallocarray(st->pubkeys,
+		    st->nkeys, pubkey->type + 1, sizeof(*st->pubkeys));
+		st->privkeys = (struct sshkey **)xrecallocarray(st->privkeys,
+		    st->nkeys, privkey->type + 1, sizeof(*st->privkeys));
+		st->nkeys = privkey->type + 1;
+	}
+	st->pubkeys[pubkey->type] = pubkey;
+	st->privkeys[privkey->type] = privkey;
+}
+
+static int
+prepare_key(struct shared_state *st, int kt)
+{
+	const char *pubstr = NULL;
+	const char *privstr = NULL;
+	char *tmp = NULL, *cp = NULL;
+	struct sshkey *privkey = NULL, *pubkey = NULL;
+	struct sshbuf *b = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	switch (kt) {
+	case KEY_RSA:
+		pubstr = PUB_RSA;
+		privstr = PRIV_RSA;
+		break;
+	case KEY_ECDSA:
+		pubstr = PUB_ECDSA;
+		privstr = PRIV_ECDSA;
+		break;
+	case KEY_ED25519:
+		pubstr = PUB_ED25519;
+		privstr = PRIV_ED25519;
+		break;
+	default:
+		abort();
+	}
+
+	if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+		abort();
+	if ((r = sshkey_parse_private_fileblob(b, "", &privkey, NULL)) != 0)
+		goto out;
+
+	tmp = cp = xstrdup(pubstr);
+	if ((pubkey = sshkey_new(KEY_UNSPEC)) == NULL) {
+		r = SSH_ERR_ALLOC_FAIL;
+		goto out;
+	}
+	if ((r = sshkey_read(pubkey, &cp)) != 0)
+		goto out;
+
+	store_key(st, pubkey, privkey);
+	r = 0; /* success */
+	pubkey = NULL; /* transferred */
+	privkey = NULL; /* transferred */
+
+out:
+	sshbuf_free(b);
+	free(tmp);
+	sshkey_free(privkey);
+	sshkey_free(pubkey);
+	return r;
+}
+
+static int
+prepare_keys(struct shared_state *st)
+{
+	if (prepare_key(st, KEY_RSA) != 0 ||
+	    prepare_key(st, KEY_ECDSA) != 0 ||
+	    prepare_key(st, KEY_ED25519) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static struct sshkey *
+get_privkey(struct shared_state *st, int keytype)
+{
+	if (st == NULL || keytype < 0 || (size_t)keytype >= st->nkeys ||
+	    st->privkeys == NULL || st->privkeys[keytype] == NULL)
+		abort();
+	return st->privkeys[keytype];
+}
+
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    static struct shared_state *st;
+    struct ssh *server = NULL;
+    struct kex_params kex_params;
+    char *myproposal[PROPOSAL_MAX] = {0};
+    const char *ccp, *proposal[PROPOSAL_MAX] = { KEX_SERVER };
+    int r, i;
+    u_char type;
+    char *keyname = NULL;
+
+    if (st == NULL) {
+        log_init("kex_fuzz", SYSLOG_LEVEL_ERROR, SYSLOG_FACILITY_AUTH, 1);
+        st = (struct shared_state *)xcalloc(1, sizeof(*st));
+        if (prepare_keys(st) != 0) {
+            // Cannot proceed without keys.
+            return 0;
+        }
+    }
+
+    struct sshkey *privkey = get_privkey(st, KEY_RSA);
+    keyname = xstrdup(sshkey_ssh_name(privkey));
+
+    for (i = 0; i < PROPOSAL_MAX; i++) {
+        ccp = proposal[i];
+        if (i == PROPOSAL_SERVER_HOST_KEY_ALGS)
+            ccp = keyname;
+        if ((myproposal[i] = strdup(ccp)) == NULL) {
+            r = SSH_ERR_ALLOC_FAIL;
+            goto out;
+        }
+    }
+
+    memcpy(kex_params.proposal, myproposal, sizeof(myproposal));
+
+    if ((r = ssh_init(&server, 1, &kex_params)) != 0) {
+        goto out;
+    }
+
+    if ((r = ssh_add_hostkey(server, privkey)) != 0) {
+        goto out;
+    }
+
+    // Feed the fuzzer data as input to the server
+    if (ssh_input_append(server, data, size) != 0) {
+        goto out;
+    }
+
+    // Call the function under test
+    kex_gen_server(server);
+
+    // Try to process the next packet, which should trigger the handler
+    // set by kex_gen_server if the input is a valid KEX message.
+    (void)ssh_packet_next(server, &type);
+
+out:
+    for (i = 0; i < PROPOSAL_MAX; i++)
+        free(myproposal[i]);
+    free(keyname);
+    if (server)
+        ssh_free(server);
+
+    return 0;
+}
+
+} // extern "C"
+	

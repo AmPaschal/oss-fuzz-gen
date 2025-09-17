@@ -1,0 +1,153 @@
+
+	
+<description>
+The function `JS_NewTypedArray` is a factory for creating JavaScript `TypedArray` objects. It is a wrapper around the internal `js_typed_array_constructor` function. The `type` argument specifies the underlying element type of the array (e.g., `Int8`, `Float32`, etc.). The `argc` and `argv` parameters determine how the typed array is constructed. There are several ways to construct a `TypedArray`:
+1.  By specifying a length. `argv[0]` is a number representing the number of elements.
+2.  From an existing `ArrayBuffer`. `argv[0]` is the `ArrayBuffer`, `argv[1]` is the byte offset (optional, defaults to 0), and `argv[2]` is the length (optional, defaults to the rest of the buffer).
+3.  From another `TypedArray`. `argv[0]` is the source `TypedArray`. A new `TypedArray` of the requested `type` is created, and elements are copied (and converted if necessary).
+4.  From an iterable object. `argv[0]` is an object that can be iterated, and a new `TypedArray` is created from its elements.
+</description>
+<requirements>
+<requirement>
+The `ctx` argument must be a valid `JSContext*` created by `JS_NewContext()` or `JS_NewContextRaw()`. The context must not be freed before calling the function, as it is required for all internal operations.
+</requirement>
+<requirement>
+The `type` argument must be an integer value between `JS_TYPED_ARRAY_UINT8C` (0) and `JS_TYPED_ARRAY_FLOAT64` (11), inclusive. Providing a value outside this range will cause the function to return a `RangeError`, as checked by the first `if` statement.
+</requirement>
+<requirement>
+When creating a `TypedArray` by length, `argc` should be 1 and `argv[0]` must be a `JSValue` representing a non-negative integer. This is because `js_typed_array_constructor` will call `JS_ToIndex` on `argv[0]` to determine the array length.
+</requirement>
+<requirement>
+When constructing from an `ArrayBuffer`, `argv[0]` must be a valid `ArrayBuffer` object. This is because the internal function will access the `u.array_buffer` field of the corresponding `JSObject`.
+</requirement>
+<requirement>
+When using an `ArrayBuffer`, the offset provided in `argv[1]` must be a multiple of the size of the element for the given `type`. An unaligned offset will result in a `RangeError` inside `js_typed_array_constructor`.
+</requirement>
+<requirement>
+When using an `ArrayBuffer`, the offset (`argv[1]`) and length (`argv[2]`) must specify a region that is entirely contained within the `ArrayBuffer`. `offset + (length * element_size)` must be less than or equal to the buffer's `byte_length`, otherwise a `RangeError` is thrown.
+</requirement>
+<requirement>
+The `argc` and `argv` parameters should be fuzzed to explore the different constructor paths. This includes providing non-object types for length, `ArrayBuffer` objects, other `TypedArray` objects, and generic iterable objects for `argv[0]`, along with corresponding values for `argv[1]` and `argv[2]`.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+JSValue JS_NewTypedArray(JSContext *, int, JSValue *, JSTypedArrayEnum)
+</function_signature>
+<project_name>
+quickjs
+</project_name>
+
+	Fuzz target source:
+#include "/src/quickjs/quickjs.h"
+#include "cutils.h"
+#include "quickjs-libc.h"
+
+#include <stdint.h>
+#include <string.h>
+
+// Forward declaration for the function under test, with the correct signature.
+JSValue JS_NewTypedArray(JSContext *, int, JSValueConst *, JSTypedArrayEnum);
+
+static int initialized = 0;
+static JSRuntime *rt;
+static JSContext *ctx;
+
+// One-time setup for the JS runtime and context
+static void initialize_js_env(void) {
+  if (!initialized) {
+    rt = JS_NewRuntime();
+    // Set a memory limit to prevent OOMs from the fuzzer.
+    JS_SetMemoryLimit(rt, 1024 * 1024 * 64);
+    ctx = JS_NewContext(rt);
+    initialized = 1;
+  }
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  initialize_js_env();
+
+  if (size < 4) {
+    return 0;
+  }
+
+  // Use a byte to determine the TypedArray type.
+  // The valid range is [JS_TYPED_ARRAY_UINT8C, JS_TYPED_ARRAY_FLOAT64].
+  // From the header, this corresponds to [0, 10], which is 11 types.
+  JSTypedArrayEnum type = (JSTypedArrayEnum)(data[0] % 11);
+  data++;
+  size--;
+
+  // Use a byte to select the constructor path
+  uint8_t path = data[0] % 4;
+  data++;
+  size--;
+
+  int argc = 0;
+  JSValueConst argv[3] = {JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED};
+  JSValue res;
+
+  switch (path) {
+  case 0: // Constructor from length: new TypedArray(len)
+  {
+    if (size < sizeof(uint32_t))
+      break;
+    // Use a small portion of the input as the length to avoid large allocations.
+    uint32_t len = *(const uint32_t *)data % 1024;
+    argc = 1;
+    argv[0] = JS_NewUint32(ctx, len);
+    break;
+  }
+  case 1: // Constructor from ArrayBuffer: new TypedArray(buffer, [offset], [len])
+  {
+    if (size < 1)
+      break;
+    // Use JS_NewArrayBufferCopy for simplicity and safety.
+    argc = 1;
+    argv[0] = JS_NewArrayBufferCopy(ctx, data, size);
+    break;
+  }
+  case 2: // Constructor from another TypedArray: new TypedArray(typedArray)
+  {
+    if (size < sizeof(uint32_t))
+      break;
+    uint32_t len = *(const uint32_t *)data % 1024;
+    // Create a source typed array (e.g., Int8Array)
+    JSValueConst src_argv[] = {JS_NewUint32(ctx, len)};
+    argc = 1;
+    // The result of JS_NewTypedArray is a JSValue, which can be assigned to a JSValueConst
+    argv[0] = JS_NewTypedArray(ctx, 1, src_argv, JS_TYPED_ARRAY_INT8);
+    JS_FreeValue(ctx, src_argv[0]);
+    break;
+  }
+  case 3: // Constructor from an iterable: new TypedArray([1, 2, 3])
+  {
+    if (size < sizeof(uint32_t))
+      break;
+    uint32_t val = *(const uint32_t *)data;
+    argc = 1;
+    argv[0] = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, argv[0], 0, JS_NewUint32(ctx, val));
+    break;
+  }
+  }
+
+  if (argc > 0) {
+    res = JS_NewTypedArray(ctx, argc, argv, type);
+    if (!JS_IsException(res)) {
+      JS_FreeValue(ctx, res);
+    } else {
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    for (int i = 0; i < argc; i++) {
+      JS_FreeValue(ctx, argv[i]);
+    }
+  }
+
+  // The runtime and context are not freed to be reused across inputs.
+  return 0;
+}
+	

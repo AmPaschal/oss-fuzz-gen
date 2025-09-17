@@ -1,0 +1,181 @@
+
+	
+<description>
+The function `TPM_Process_GetCapability` retrieves information about the TPM's capabilities. It takes a command buffer containing the capability area and sub-capability to query, and returns the result in a response buffer. The function is not called directly, but is dispatched from a command table based on the TPM command ordinal.
+</description>
+<requirements>
+<requirement>
+The `tpm_state` parameter must be initialized. The `tpm_state->testState` should not be `TPM_TEST_STATE_FAILURE` or `TPM_TEST_STATE_LIMITED` for most capability requests, as this will result in a `TPM_FAILEDSELFTEST` or `TPM_ContinueSelfTestCmd` error.
+</requirement>
+<requirement>
+The `command` buffer must contain a valid serialized TPM command. The `paramSize` must accurately reflect the size of the data in the `command` buffer.
+</requirement>
+<requirement>
+The `command` buffer must contain a 4-byte capability area (`capArea`) followed by a sized buffer for the sub-capability (`subCap`). The function will return `TPM_BAD_PARAM_SIZE` if the `paramSize` is not fully consumed after parsing these.
+</requirement>
+<requirement>
+The `tag` parameter should be a valid TPM request tag. The function calls `TPM_CheckRequestTag0` to validate the tag, which will return an error if the tag is invalid.
+</requirement>
+<requirement>
+The `ordinal` parameter should correspond to `TPM_ORD_GetCapability`. This is because the function is designed to handle this specific command.
+</requirement>
+<requirement>
+The `response` buffer must be an initialized `TPM_STORE_BUFFER`. This is used to store the result of the capability query.
+</requirement>
+<requirement>
+The `transportInternal` parameter can be NULL. If it is not NULL, it is used for transport encryption and auditing, but it is not required for basic operation.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+TPM_RESULT TPM_Process_GetCapability(tpm_state_t *, TPM_STORE_BUFFER *, TPM_TAG, uint32_t, TPM_COMMAND_CODE, unsigned char *, TPM_TRANSPORT_INTERNAL *)
+</function_signature>
+<project_name>
+libtpms
+</project_name>
+
+	Fuzz target source:
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <vector>
+#include <arpa/inet.h>
+
+#include <fuzzer/FuzzedDataProvider.h>
+#include <libtpms/tpm_error.h>
+#include <libtpms/tpm_library.h>
+#include <libtpms/tpm_memory.h>
+#include <libtpms/tpm_nvfilename.h>
+#include <libtpms/tpm_types.h>
+
+// Manually define constants from the internal tpm_constants.h
+#define TPM_TAG_RQU_COMMAND 0x00C1
+#define TPM_ORD_GetCapability 0x00000065
+
+// Define byte-swapping macros using standard library functions
+#define TPM_HTONS(x) htons(x)
+#define TPM_HTONL(x) htonl(x)
+
+// This is a helper function to pack data in big-endian format.
+static void AppendToVector(std::vector<unsigned char>& vec, const void* data, size_t size) {
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    vec.insert(vec.end(), bytes, bytes + size);
+}
+
+static void die(const char *msg) {
+  fprintf(stderr, "%s", msg);
+  assert(false);
+}
+
+static TPM_RESULT mytpm_io_init(void) { return TPM_SUCCESS; }
+
+static TPM_RESULT mytpm_io_getlocality(TPM_MODIFIER_INDICATOR *locModif, uint32_t tpm_number) {
+  *locModif = 0;
+  return TPM_SUCCESS;
+}
+
+static TPM_RESULT mytpm_io_getphysicalpresence(TPM_BOOL *phyPres, uint32_t tpm_number) {
+  *phyPres = FALSE;
+  return TPM_SUCCESS;
+}
+
+static unsigned char *permall;
+static uint32_t permall_length;
+
+static TPM_RESULT mytpm_nvram_loaddata(unsigned char **data, uint32_t *length, uint32_t tpm_number, const char *name) {
+  if (!strcmp(name, TPM_PERMANENT_ALL_NAME)) {
+    if (permall) {
+      *data = NULL;
+      assert(TPM_Malloc(data, permall_length) == TPM_SUCCESS);
+      memcpy(*data, permall, permall_length);
+      *length = permall_length;
+      return TPM_SUCCESS;
+    }
+  }
+  return TPM_RETRY;
+}
+
+static TPM_RESULT mytpm_nvram_storedata(const unsigned char *data, uint32_t length, uint32_t tpm_number, const char *name) {
+  if (!strcmp(name, TPM_PERMANENT_ALL_NAME)) {
+    free(permall);
+    permall = NULL;
+    assert(TPM_Malloc(&permall, length) == TPM_SUCCESS);
+    memcpy(permall, data, length);
+    permall_length = length;
+  }
+  return TPM_SUCCESS;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Boilerplate initialization from existing fuzzer
+  unsigned char *rbuffer = NULL;
+  uint32_t rlength;
+  uint32_t rtotal = 0;
+  TPM_RESULT res;
+  unsigned char startup[] = {0x80, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00};
+  struct libtpms_callbacks cbs = {
+      .sizeOfStruct = sizeof(struct libtpms_callbacks),
+      .tpm_nvram_init = NULL,
+      .tpm_nvram_loaddata = mytpm_nvram_loaddata,
+      .tpm_nvram_storedata = mytpm_nvram_storedata,
+      .tpm_nvram_deletename = NULL,
+      .tpm_io_init = mytpm_io_init,
+      .tpm_io_getlocality = mytpm_io_getlocality,
+      .tpm_io_getphysicalpresence = mytpm_io_getphysicalpresence,
+  };
+  res = TPMLIB_RegisterCallbacks(&cbs);
+  if (res != TPM_SUCCESS)
+    die("Could not register callbacks\n");
+
+  res = TPMLIB_ChooseTPMVersion(TPMLIB_TPM_VERSION_1_2);
+  if (res != TPM_SUCCESS)
+    die("Could not choose the TPM version\n");
+
+  res = TPMLIB_MainInit();
+  if (res != TPM_SUCCESS)
+    die("Error: TPMLIB_MainInit() failed\n");
+
+  res = TPMLIB_Process(&rbuffer, &rlength, &rtotal, startup, sizeof(startup));
+  // It's ok if startup fails, we can continue.
+  TPM_Free(rbuffer);
+  rbuffer = NULL;
+
+  // Construct the GetCapability command payload from fuzzer data
+  std::vector<uint8_t> payload = provider.ConsumeRemainingBytes<uint8_t>();
+  
+  // Header: tag (2), size (4), ordinal (4)
+  const uint32_t command_size = 10 + payload.size();
+
+  std::vector<unsigned char> command_vec;
+  command_vec.reserve(command_size);
+
+  uint16_t tag_n = TPM_HTONS(TPM_TAG_RQU_COMMAND);
+  AppendToVector(command_vec, &tag_n, sizeof(tag_n));
+
+  uint32_t paramSize_n = TPM_HTONL(command_size);
+  AppendToVector(command_vec, &paramSize_n, sizeof(paramSize_n));
+  
+  uint32_t ordinal_n = TPM_HTONL(TPM_ORD_GetCapability);
+  AppendToVector(command_vec, &ordinal_n, sizeof(ordinal_n));
+
+  // Append fuzzed payload
+  AppendToVector(command_vec, payload.data(), payload.size());
+
+  // Process the constructed command
+  TPMLIB_Process(&rbuffer, &rlength, &rtotal, command_vec.data(), command_vec.size());
+
+  // Cleanup
+  TPMLIB_Terminate();
+  TPM_Free(rbuffer);
+  free(permall);
+  permall = NULL;
+
+  return 0;
+}
+	

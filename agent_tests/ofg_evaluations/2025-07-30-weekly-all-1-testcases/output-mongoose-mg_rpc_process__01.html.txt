@@ -1,0 +1,199 @@
+
+	
+<description>
+The `mg_rpc_process` function is the core of the JSON-RPC implementation. It takes a `mg_rpc_req` structure, which encapsulates the entire RPC request context. The function's primary role is to parse the JSON request frame contained within the structure, identify the requested method, and dispatch it to the appropriate handler. The handlers are stored in a linked list pointed to by the `head` field of the request structure. If a matching handler for the method is found, it is executed. If the method is not found, or if the request frame is malformed or not a method call (i.e., it's a result or error), the function generates a corresponding JSON-RPC error or response frame. The response is written out using a generic printing function and its associated data pointer, also provided in the `mg_rpc_req` structure. This design allows the RPC engine to be agnostic of the underlying communication transport.
+</description>
+<requirements>
+<requirement>
+The `r` argument, which is a pointer to `struct mg_rpc_req`, must not be NULL.
+This is because the function immediately dereferences this pointer to access its members, and a NULL value would cause a crash.
+</requirement>
+<requirement>
+The `r->frame.buf` field must point to a valid, fuzzer-controlled memory buffer, and `r->frame.len` must accurately represent the size of that buffer.
+This is because the function parses this buffer as a JSON string, and an invalid pointer or length will lead to memory-related crashes. This is the main input for fuzzing.
+</requirement>
+<requirement>
+The `r->head` field must be initialized to point to a valid `struct mg_rpc *` pointer, which acts as the head of the RPC handler list.
+This is because the function traverses this list to find the requested method handler; an uninitialized pointer would lead to unpredictable behavior or crashes.
+</requirement>
+<requirement>
+Before calling `mg_rpc_process`, the `mg_rpc_add` function must be used to populate the RPC handler list pointed to by `r->head`.
+This is to ensure that there are registered handlers to service requests, allowing the fuzzer to explore the code paths of the actual RPC methods and not just the "method not found" error path.
+</requirement>
+<requirement>
+The `r->pfn` field must be set to a valid function pointer, and `r->pfn_data` must point to the data required by that function.
+This is necessary for the function to be able to output responses, particularly error messages for malformed requests. A common and safe practice observed in the code is to use `mg_pfn_iobuf` for `r->pfn` and a pointer to an initialized `struct mg_iobuf` for `r->pfn_data`.
+</requirement>
+<requirement>
+The function pointer `fn` in the `struct mg_rpc` provided to `mg_rpc_add` must be a valid function pointer.
+This is because if a matching method is found for the request, this function pointer will be called. A NULL or invalid pointer would result in a crash.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void mg_rpc_process(struct mg_rpc_req *)
+</function_signature>
+<project_name>
+mongoose
+</project_name>
+
+	Fuzz target source:
+#define MG_ENABLE_SOCKET 0
+#define MG_ENABLE_LOG 0
+#define MG_ENABLE_LINES 1
+#define MG_ENABLE_TCPIP 1
+#define MG_IO_SIZE (32 * 1024 * 1024)
+#include "mongoose.c"
+
+#include "driver_mock.c"
+
+#ifdef __cplusplus
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *, size_t);
+#else
+int LLVMFuzzerTestOneInput(const uint8_t *, size_t);
+#endif
+
+static void fn(struct mg_connection *c, int ev, void *ev_data) {
+  struct mg_http_serve_opts opts = {.root_dir = "."};
+  if (ev == MG_EV_HTTP_MSG) {
+    mg_http_serve_dir(c, (struct mg_http_message *)ev_data, &opts);
+  }
+}
+
+// Dummy RPC handler that simply acknowledges the request.
+// This allows fuzzing of the RPC dispatch logic without needing valid methods.
+static void dummy_rpc_handler(struct mg_rpc_req *r) {
+  mg_rpc_ok(r, "{\"result\":\"ok\"}");
+}
+
+void mg_rpc_process(struct mg_rpc_req *);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  mg_log_set(MG_LL_INFO);
+
+  struct mg_dns_message dm;
+  mg_dns_parse(data, size, &dm);
+  mg_dns_parse(NULL, 0, &dm);
+
+  struct mg_http_message hm;
+  if (mg_http_parse((const char *)data, size, &hm) > 0) {
+    mg_crc32(0, hm.method.buf, hm.method.len);
+    mg_crc32(0, hm.uri.buf, hm.uri.len);
+    mg_crc32(0, hm.uri.buf, hm.uri.len);
+    for (size_t i = 0; i < sizeof(hm.headers) / sizeof(hm.headers[0]); i++) {
+      struct mg_str *k = &hm.headers[i].name, *v = &hm.headers[i].value;
+      mg_crc32(0, k->buf, k->len);
+      mg_crc32(0, v->buf, v->len);
+    }
+  }
+  mg_http_parse(NULL, 0, &hm);
+
+  struct mg_str body = mg_str_n((const char *)data, size);
+  char tmp[256];
+  mg_http_get_var(&body, "key", tmp, sizeof(tmp));
+  mg_http_get_var(&body, "key", NULL, 0);
+  mg_url_decode((char *)data, size, tmp, sizeof(tmp), 1);
+  mg_url_decode((char *)data, size, tmp, 1, 1);
+  mg_url_decode(NULL, 0, tmp, 1, 1);
+
+  struct mg_mqtt_message mm;
+  if (mg_mqtt_parse(data, size, 0, &mm) == MQTT_OK) {
+    mg_crc32(0, mm.topic.buf, mm.topic.len);
+    mg_crc32(0, mm.data.buf, mm.data.len);
+    mg_crc32(0, mm.dgram.buf, mm.dgram.len);
+  }
+  mg_mqtt_parse(NULL, 0, 0, &mm);
+  if (mg_mqtt_parse(data, size, 5, &mm) == MQTT_OK) {
+    mg_crc32(0, mm.topic.buf, mm.topic.len);
+    mg_crc32(0, mm.data.buf, mm.data.len);
+    mg_crc32(0, mm.dgram.buf, mm.dgram.len);
+  }
+  mg_mqtt_parse(NULL, 0, 5, &mm);
+
+  mg_sntp_parse(data, size);
+  mg_sntp_parse(NULL, 0);
+
+  char buf[size * 4 / 3 + 5]; // At least 4 chars and nul termination
+  mg_base64_decode((char *)data, size, buf, sizeof(buf));
+  mg_base64_decode(NULL, 0, buf, sizeof(buf));
+  mg_base64_encode(data, size, buf, sizeof(buf));
+  mg_base64_encode(NULL, 0, buf, sizeof(buf));
+
+  mg_match(mg_str_n((char *)data, size), mg_str_n((char *)data, size), NULL);
+
+  struct mg_str entry, s = mg_str_n((char *)data, size);
+  while (mg_span(s, &entry, &s, ','))
+    entry.len = 0;
+
+  int n;
+  mg_json_get(mg_str_n((char *)data, size), "$", &n);
+  mg_json_get(mg_str_n((char *)data, size), "$.a.b", &n);
+  mg_json_get(mg_str_n((char *)data, size), "$[0]", &n);
+
+  // Fuzz mg_rpc_process
+  {
+    struct mg_rpc *head = NULL;
+    struct mg_iobuf io = {0, 0, 0};
+    struct mg_rpc_req req = {&head, NULL, mg_pfn_iobuf, &io, NULL, mg_str_n((const char *) data, size)};
+    
+    // Add a wildcard handler to catch any method, exercising more code paths
+    mg_rpc_add(&head, mg_str("*"), dummy_rpc_handler, NULL);
+    
+    mg_rpc_process(&req);
+    
+    mg_iobuf_free(&io);
+    mg_rpc_del(&head, dummy_rpc_handler);
+  }
+
+  if (size > 0) {
+    struct mg_tcpip_if mif = {.ip = 0x01020304, .mask = 255, .gw = 0x01010101, .driver = &mg_tcpip_driver_mock};
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+    mg_tcpip_init(&mgr, &mif);
+
+    // Make a copy of the random data, in order to modify it
+    void *pkt = malloc(size);
+    struct eth *eth = (struct eth *)pkt;
+    memcpy(pkt, data, size);
+    if (size > sizeof(*eth)) {
+      static size_t i;
+      uint16_t eth_types[] = {0x800, 0x800, 0x806, 0x86dd};
+      memcpy(eth->dst, mif.mac, 6); // Set valid destination MAC
+      eth->type = mg_htons(eth_types[i++]);
+      if (i >= sizeof(eth_types) / sizeof(eth_types[0]))
+        i = 0;
+    }
+
+    mg_tcpip_rx(&mif, pkt, size);
+
+    // Test HTTP serving
+    const char *url = "http://localhost:12345";
+    struct mg_connection *c = mg_http_connect(&mgr, url, fn, NULL);
+    mg_iobuf_add(&c->recv, 0, data, size);
+    c->pfn(c, MG_EV_READ, NULL); // manually invoke protocol event handler
+
+    mg_mgr_free(&mgr);
+    free(pkt);
+    mg_tcpip_free(&mif);
+  }
+
+  return 0;
+}
+
+#if defined(MAIN)
+int main(int argc, char *argv[]) {
+  int res = EXIT_FAILURE;
+  if (argc > 1) {
+    struct mg_str data = mg_file_read(&mg_fs_posix, argv[1]);
+    if (data.buf != NULL) {
+      LLVMFuzzerTestOneInput((uint8_t *)data.buf, data.len);
+      res = EXIT_SUCCESS;
+    }
+    free(data.buf);
+  }
+  return res;
+}
+#endif
+	

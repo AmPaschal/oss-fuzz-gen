@@ -1,0 +1,138 @@
+
+	
+<description>
+The `g_obex_put_req` function sends an OBEX PUT request. It is a variadic function that takes a `GObex` object, a data producer callback (`GObexDataProducer`), a completion callback (`GObexFunc`), user data, a `GError` pointer, and a variable number of arguments that represent OBEX headers. The function is asynchronous; it initiates the request and returns immediately. The completion callback is invoked when the transfer is finished or an error occurs.
+</description>
+<requirements>
+
+<requirement>
+The first argument, `obex`, must be a valid `GObex` object. This is because the function internally dereferences this object to send the request, and a `NULL` or invalid object will cause a crash.
+</requirement>
+<requirement>
+The second argument, `data_func`, must be a valid function pointer of type `GObexDataProducer`. This callback is responsible for providing the data for the PUT request and will be called by the library. A `NULL` function pointer will lead to a crash when the library attempts to call it.
+</requirement>
+<requirement>
+The third argument, `complete_func`, must be a valid function pointer of type `GObexFunc`. This callback is invoked upon completion of the data transfer. Providing a `NULL` pointer will result in a crash when the library tries to call it.
+</requirement>
+<requirement>
+The variadic arguments must be a list of key-value pairs representing OBEX headers, and the list must be terminated by `G_OBEX_HDR_INVALID`. Failing to terminate the list with `G_OBEX_HDR_INVALID` will cause the function to read beyond the intended arguments, leading to a crash.
+</requirement>
+<requirement>
+The fifth argument, `err`, must be a pointer to a `GError*` initialized to `NULL`. This is standard practice for GLib functions, and the function will attempt to write to this pointer if an error occurs.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+guint g_obex_put_req(GObex *, GObexDataProducer, GObexFunc, gpointer, GError **, guint, void)
+</function_signature>
+<project_name>
+bluez
+</project_name>
+
+	Fuzz target source:
+#include <config.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <glib.h>
+
+#include "gobex/gobex.h"
+#include "gobex/gobex-header.h"
+
+// User data for the data producer callback
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t offset;
+} FuzzUserData;
+
+// Callback to provide data for the PUT request
+static gssize data_producer_cb(void *buf, gsize len, gpointer user_data) {
+    FuzzUserData *fuzz_data = (FuzzUserData *)user_data;
+
+    if (!fuzz_data || !fuzz_data->data || fuzz_data->offset >= fuzz_data->size) {
+        return 0; // No more data
+    }
+
+    gsize to_copy = MIN(len, fuzz_data->size - fuzz_data->offset);
+    memcpy(buf, fuzz_data->data + fuzz_data->offset, to_copy);
+    fuzz_data->offset += to_copy;
+
+    return to_copy;
+}
+
+// Callback for when the transfer is complete
+static void transfer_complete_cb(GObex *obex, GError *err, gpointer user_data) {
+    // This function is required but can be empty for our fuzzing purposes.
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // We need at least 1 byte for name length and some for the name itself.
+    if (size < 2) {
+        return 0;
+    }
+
+    // Use a pipe to create a dummy GIOChannel
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return 0;
+    }
+
+    GIOChannel *io = g_io_channel_unix_new(fds[0]);
+    if (!io) {
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+
+    // Create a GObex session object
+    GObex *obex = g_obex_new(io, G_OBEX_TRANSPORT_STREAM, 4096, 4096);
+    if (!obex) {
+        g_io_channel_unref(io);
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+
+    // Split the input data: one part for the object name, the rest for the body
+    size_t name_len = data[0];
+    const uint8_t *name_data = data + 1;
+    if (name_len >= size) {
+        name_len = size - 1;
+    }
+    char *name_str = g_strndup((const char *)name_data, name_len);
+
+    // Set up user data for the data producer
+    FuzzUserData user_data;
+    user_data.data = name_data + name_len;
+    user_data.size = size - 1 - name_len;
+    user_data.offset = 0;
+
+    GError *error = NULL;
+
+    // Call the function under test with a NAME header
+    g_obex_put_req(obex,
+                   data_producer_cb,
+                   transfer_complete_cb,
+                   &user_data,
+                   &error,
+                   G_OBEX_HDR_NAME, name_str,
+                   G_OBEX_HDR_INVALID);
+
+    // Cleanup
+    if (error) {
+        g_error_free(error);
+    }
+    g_free(name_str);
+    g_obex_unref(obex);
+    g_io_channel_unref(io);
+    close(fds[0]);
+    close(fds[1]);
+
+    return 0;
+}
+	

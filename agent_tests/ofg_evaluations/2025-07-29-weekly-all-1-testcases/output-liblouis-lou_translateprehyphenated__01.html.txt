@@ -1,0 +1,148 @@
+
+	
+<description>
+The function `lou_translatePrehyphenated` is a wrapper around `lou_translate`. It first calls `lou_translate` to perform the main translation, and then it processes hyphenation information. If `inputHyphens` is provided, it computes `outputHyphens` based on the `inputPos` array returned by `lou_translate`. It can optionally allocate memory for `inputPos` if it is not provided.
+</description>
+<requirements>
+<requirement>
+The `tableList` argument should be a comma-separated list of valid table names. This is because it is passed to `lou_translate` which in turn passes it to `lou_compileString` to compile the tables.
+</requirement>
+<requirement>
+If the `inputHyphens` argument is not NULL, then the `outputHyphens` argument must also not be NULL. This is to prevent a NULL pointer dereference when `outputHyphens` is written to.
+</requirement>
+<requirement>
+The `outlen` argument must point to an integer that represents the size of the `outbuf` and `outputHyphens` buffers. This is because `outlen` is used to determine the amount of memory to allocate for `inputPos` and to loop over the `outputHyphens` and `inputPos` arrays.
+</requirement>
+<requirement>
+The `inlen` argument must point to an integer that represents the size of the `inbufx` buffer. This is to avoid out-of-bounds reads in the `lou_translate` function.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int lou_translatePrehyphenated(const char *, const widechar *, int *, widechar *, int *, formtype *, char *, int *, int *, int *, char *, char *, int)
+</function_signature>
+<project_name>
+liblouis
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+extern "C" {
+#include <liblouis.h>
+#include <internal.h>
+}
+
+// Dummy log callback to suppress output
+static void avoid_log(logLevels level, const char *msg) {
+  (void)level;
+  (void)msg;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  static bool initialized = false;
+  if (!initialized) {
+    lou_registerLogCallback(avoid_log);
+    initialized = true;
+  }
+
+  FuzzedDataProvider provider(data, size);
+
+  // Need at least some data for the table and the text
+  if (provider.remaining_bytes() < 10) {
+    return 0;
+  }
+
+  // 1. Create a translation table from fuzzer data.
+  const size_t table_data_size = provider.ConsumeIntegralInRange<size_t>(1, 512);
+  std::string table_data_str = provider.ConsumeBytesAsString(table_data_size);
+  if (table_data_str.empty()) {
+    return 0;
+  }
+
+  static int counter = 0;
+  char table_filename[256];
+  sprintf(table_filename, "/tmp/fuzzer-prehyphen-%d.ctb", counter++);
+
+  FILE *fp = fopen(table_filename, "wb");
+  if (!fp) {
+    return 0;
+  }
+  fwrite(table_data_str.c_str(), 1, table_data_str.size(), fp);
+  fclose(fp);
+
+  if (lou_checkTable(table_filename) == 0) {
+    unlink(table_filename);
+    lou_free();
+    return 0;
+  }
+
+  // 2. Prepare parameters for lou_translatePrehyphenated
+  std::string text_to_translate = provider.ConsumeRemainingBytesAsString();
+  if (text_to_translate.empty()) {
+    unlink(table_filename);
+    lou_free();
+    return 0;
+  }
+
+  int inlen_max = text_to_translate.length() * 4 + 1;
+  std::vector<widechar> inbuf(inlen_max);
+  int inlen = _lou_extParseChars(text_to_translate.c_str(), inbuf.data());
+  if (inlen <= 0) {
+    unlink(table_filename);
+    lou_free();
+    return 0;
+  }
+  inbuf.resize(inlen);
+
+  int outlen = inlen * 16 + 1;
+  std::vector<widechar> outbuf(outlen);
+  std::vector<formtype> typeform(outlen, 0);
+  std::vector<char> spacing(outlen, 0);
+  std::vector<int> outputPos(outlen, 0);
+  std::vector<int> inputPos(outlen, 0);
+  int cursorPos = provider.ConsumeIntegralInRange<int>(0, inlen);
+  int mode = provider.ConsumeIntegral<int>();
+
+  bool test_hyphens = provider.ConsumeBool();
+  std::vector<char> inputHyphens;
+  std::vector<char> outputHyphens;
+  char *inputHyphens_ptr = nullptr;
+  char *outputHyphens_ptr = nullptr;
+
+  if (test_hyphens) {
+    inputHyphens.resize(inlen + 1);
+    for (int i = 0; i < inlen; ++i) {
+      inputHyphens[i] = provider.ConsumeBool() ? '1' : '0';
+    }
+    inputHyphens[inlen] = '\0';
+
+    outputHyphens.resize(outlen + 1, '0');
+    outputHyphens[outlen] = '\0';
+    inputHyphens_ptr = inputHyphens.data();
+    outputHyphens_ptr = outputHyphens.data();
+  }
+
+  // 3. Call the function under test
+  int inlen_copy = inlen;
+  int outlen_copy = outlen;
+  lou_translatePrehyphenated(
+      table_filename, inbuf.data(), &inlen_copy, outbuf.data(), &outlen_copy,
+      typeform.data(), spacing.data(), outputPos.data(), inputPos.data(),
+      &cursorPos, inputHyphens_ptr, outputHyphens_ptr, mode);
+
+  // 4. Cleanup
+  unlink(table_filename);
+  lou_free();
+
+  return 0;
+}
+	

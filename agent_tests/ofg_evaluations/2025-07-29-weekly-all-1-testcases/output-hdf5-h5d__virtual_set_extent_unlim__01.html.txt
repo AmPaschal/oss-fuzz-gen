@@ -1,0 +1,137 @@
+
+	
+<description>
+The function `H5D__virtual_set_extent_unlim` is an internal function within the HDF5 library responsible for updating the extent (dimensions) of a virtual dataset (VDS). A virtual dataset is a dataset whose data is stored in other datasets, potentially in other HDF5 files. This function is called when the application needs to get the dataspace of a virtual dataset, as the extent of a VDS can change depending on the extents of the source datasets. It examines the mappings between the virtual dataset and its source datasets. For mappings with an unlimited dimension, it determines the new size of that dimension based on the availability of the source data and the "view" property (`H5D_VDS_FIRST_MISSING` or `H5D_VDS_LAST_AVAILABLE`). It handles both regular and "printf-style" mappings (where source dataset names are generated from a format string). Finally, if the calculated extent has changed, it updates the virtual dataset's dataspace.
+</description>
+<requirements>
+
+<requirement>
+The `dset` argument must not be a NULL pointer. This is a basic sanity check at the beginning of the function to prevent null pointer dereferencing.
+</requirement>
+<requirement>
+The `dset` argument must point to a valid H5D_t object that represents a virtual dataset. Specifically, `dset->shared->layout.storage.type` must be equal to `H5D_VIRTUAL`.
+</requirement>
+<requirement>
+The `view` property of the virtual dataset storage (`dset->shared->layout.storage.u.virt.view`) must be either `H5D_VDS_FIRST_MISSING` or `H5D_VDS_LAST_AVAILABLE`. The function's logic for calculating the new extent depends on this property.
+</requirement>
+<requirement>
+The dataspace associated with the virtual dataset (`dset->shared->space`) must be properly initialized. The function calls `H5S_GET_EXTENT_NDIMS` and other `H5S_*` functions that expect a valid dataspace object.
+</requirement>
+<requirement>
+The virtual dataset's mappings, stored in `dset->shared->layout.storage.u.virt.list`, must be consistent with `dset->shared->layout.storage.u.virt.list_nused`. The function iterates through the mappings up to `list_nused`.
+</requirement>
+<requirement>
+For "printf" style mappings (where `unlim_dim_source` is negative), the `printf_gap` field in the virtual storage (`dset->shared->layout.storage.u.virt.printf_gap`) must not be `HSIZE_UNDEF`. This is asserted in the code.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+herr_t H5D__virtual_set_extent_unlim(const H5D_t *)
+</function_signature>
+<project_name>
+hdf5
+</project_name>
+
+	Fuzz target source:
+#define H5D_MODULE
+#include "hdf5.h"
+#include <unistd.h>
+#include <stdlib.h>
+
+/*
+ * Order is important for internal headers.
+ * H5private.h must be included before other
+ * private headers.
+ */
+#include "H5private.h"
+#include "H5Dpkg.h"
+
+/* Forward declaration for the function under test */
+herr_t H5D__virtual_set_extent_unlim(const H5D_t *dset);
+
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+
+    char vds_filename[256];
+    char src_filename[256];
+    sprintf(vds_filename, "/tmp/vds_fuzz.%d.h5", getpid());
+    sprintf(src_filename, "/tmp/src_fuzz.%d.h5", getpid());
+
+    hid_t src_file_id = H5I_INVALID_HID;
+    hid_t vds_file_id = H5I_INVALID_HID;
+    hid_t vspace_id = H5I_INVALID_HID;
+    hid_t src_space_id = H5I_INVALID_HID;
+    hid_t dcpl_id = H5I_INVALID_HID;
+    hid_t dset_id = H5I_INVALID_HID;
+    hid_t src_dset_id = H5I_INVALID_HID;
+    H5D_t *dset = NULL;
+
+    /* Suppress error messages */
+    H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+
+    /* 1. Create a source HDF5 file with a dataset */
+    src_file_id = H5Fcreate(src_filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (src_file_id < 0) goto cleanup;
+
+    hsize_t src_dims[] = {10, 20};
+    src_space_id = H5Screate_simple(2, src_dims, NULL);
+    if (src_space_id < 0) goto cleanup;
+
+    src_dset_id = H5Dcreate2(src_file_id, "source_dset", H5T_NATIVE_INT, src_space_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    if (src_dset_id < 0) goto cleanup;
+
+    /* 2. Create the virtual dataset in a separate file */
+    vds_file_id = H5Fcreate(vds_filename, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (vds_file_id < 0) goto cleanup;
+
+    /* Virtual dataspace (2D, unlimited in the first dimension) */
+    hsize_t vds_dims[2] = {H5S_UNLIMITED, 20};
+    hsize_t vds_max_dims[2] = {H5S_UNLIMITED, 20};
+    vspace_id = H5Screate_simple(2, vds_dims, vds_max_dims);
+    if (vspace_id < 0) goto cleanup;
+
+    /* Select the entire source dataspace for the mapping */
+    if (H5Sselect_all(src_space_id) < 0) goto cleanup;
+
+    /* Create and configure the dataset creation property list for VDS */
+    dcpl_id = H5Pcreate(H5P_DATASET_CREATE);
+    if (dcpl_id < 0) goto cleanup;
+
+    /* Use a byte from fuzzer input to select the VDS view */
+    H5D_vds_view_t view = (data[0] % 2 == 0) ? H5D_VDS_FIRST_MISSING : H5D_VDS_LAST_AVAILABLE;
+    if (H5Pset_virtual_view(dcpl_id, view) < 0) goto cleanup;
+
+    /* Create the virtual mapping */
+    if (H5Pset_virtual(dcpl_id, vspace_id, src_filename, "source_dset", src_space_id) < 0) goto cleanup;
+
+    /* Create the virtual dataset */
+    dset_id = H5Dcreate2(vds_file_id, "vds", H5T_NATIVE_INT, vspace_id, H5P_DEFAULT, dcpl_id, H5P_DEFAULT);
+    if (dset_id < 0) goto cleanup;
+
+    /* Get the internal H5D_t pointer from the dataset ID */
+    dset = (H5D_t *)H5I_object_verify(dset_id, H5I_DATASET);
+    if (dset) {
+        /* Call the function under test */
+        H5D__virtual_set_extent_unlim(dset);
+    }
+
+cleanup:
+    if (dset_id >= 0) H5Dclose(dset_id);
+    if (dcpl_id >= 0) H5Pclose(dcpl_id);
+    if (vspace_id >= 0) H5Sclose(vspace_id);
+    if (vds_file_id >= 0) H5Fclose(vds_file_id);
+    if (src_dset_id >= 0) H5Dclose(src_dset_id);
+    if (src_space_id >= 0) H5Sclose(src_space_id);
+    if (src_file_id >= 0) H5Fclose(src_file_id);
+
+    unlink(vds_filename);
+    unlink(src_filename);
+
+    return 0;
+}
+	

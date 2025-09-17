@@ -1,0 +1,122 @@
+
+	
+<description>
+The function `process_and_close_socket` is a member function of the `httplib::Server` class. It takes a socket descriptor as input, processes the request on that socket, and then closes the socket. This function is called in a new thread from a task queue for each accepted connection.
+</description>
+<requirements>
+
+<requirement>
+The `sock` argument must be a valid and connected socket descriptor. This is because the function and its callees perform socket operations that will fail or crash if the socket is invalid.
+</requirement>
+<requirement>
+The `httplib::Server` object on which this function is called must be properly initialized. The function accesses several member variables of the `Server` object, and they must have valid values for the function to work correctly.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool httplib::Server::process_and_close_socket(socket_t)
+</function_signature>
+<project_name>
+cpp-httplib
+</project_name>
+
+	Fuzz target source:
+#include "/src/cpp-httplib/httplib.h"
+#include <fuzzer/FuzzedDataProvider.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <thread>
+#include <vector>
+#include <atomic>
+
+// A derived class to expose the private function and its dependencies for fuzzing.
+class FuzzableServer : public httplib::Server {
+public:
+  // Re-implementation of the private httplib::Server::process_and_close_socket
+  // as a public method for the fuzzer to call.
+  bool fuzz_process_and_close_socket(socket_t sock) {
+    std::string remote_addr;
+    int remote_port = 0;
+    httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
+
+    std::string local_addr;
+    int local_port = 0;
+    httplib::detail::get_local_ip_and_port(sock, local_addr, local_port);
+
+    auto ret = httplib::detail::process_server_socket(
+        svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
+        read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
+        write_timeout_usec_,
+        [&](httplib::Stream &strm, bool close_connection, bool &connection_closed) {
+          return process_request(strm, remote_addr, remote_port, local_addr,
+                                 local_port, close_connection, connection_closed,
+                                 nullptr);
+        });
+
+    httplib::detail::shutdown_socket(sock);
+    httplib::detail::close_socket(sock);
+    return ret;
+  }
+
+private:
+  // Dependencies of the original private function, initialized with default values.
+  std::atomic<socket_t> svr_sock_{INVALID_SOCKET};
+  size_t keep_alive_max_count_ = 5;
+  time_t keep_alive_timeout_sec_ = 5;
+  time_t read_timeout_sec_ = 5;
+  time_t read_timeout_usec_ = 0;
+  time_t write_timeout_sec_ = 5;
+  time_t write_timeout_usec_ = 0;
+};
+
+static FuzzableServer g_server;
+
+extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
+  g_server.Get(R"(.*)",
+               [&](const httplib::Request &, httplib::Response &res) {
+                 res.set_content("response", "text/plain");
+               });
+  g_server.Post(R"(.*)",
+                [&](const httplib::Request &, httplib::Response &res) {
+                  res.set_content("response", "text/plain");
+                });
+  return 0;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    return 0;
+  }
+
+  std::vector<uint8_t> input(data, data + size);
+
+  std::thread client_thread([&]() {
+    close(sv[0]);
+    ssize_t written = 0;
+    while (written < (ssize_t)input.size()) {
+        ssize_t ret = write(sv[1], input.data() + written, input.size() - written);
+        if (ret < 0) {
+            break;
+        }
+        written += ret;
+    }
+    shutdown(sv[1], SHUT_RDWR);
+    close(sv[1]);
+  });
+
+  close(sv[1]);
+  g_server.fuzz_process_and_close_socket(sv[0]);
+
+  client_thread.join();
+
+  return 0;
+}
+	

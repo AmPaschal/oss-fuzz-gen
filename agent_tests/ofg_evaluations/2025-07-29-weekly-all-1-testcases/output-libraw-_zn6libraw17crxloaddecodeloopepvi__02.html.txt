@@ -1,0 +1,238 @@
+
+	
+<description>
+The `crxLoadDecodeLoop` function is responsible for decoding the planes of a CRX (Canon Raw v3) image. It iterates through the number of planes specified by the `nPlanes` argument and, for each plane, invokes the `crxDecodePlane` function to perform the actual decoding. The first argument to `crxLoadDecodeLoop` is a void pointer that is cast to a `CrxImage` struct. This struct is a container for all the necessary information about the image, such as its dimensions, tiling information, number of color planes, bit depth, and pointers to data buffers and the input stream.
+
+The `CrxImage` struct is not meant to be manually populated. Instead, the `crxLoadRaw` function, which is the primary user of `crxLoadDecodeLoop`, first calls `crxSetupImageData`. This setup function is responsible for parsing the CRX image headers and initializing all the fields of the `CrxImage` struct, including allocating memory for tiles and other data structures. Therefore, any call to `crxLoadDecodeLoop` must be preceded by a call to `crxSetupImageData` to ensure the `CrxImage` struct is in a valid state.
+
+The core of the decoding logic lies within `crxDecodePlane` and its callees. These functions read compressed image data from the input stream, perform inverse quantization and wavelet transforms, and write the decoded pixel data into the output buffers. The number of planes to be decoded is determined by the `nPlanes` field in the CRX header, which is passed as the second argument to `crxLoadDecodeLoop`. The implementation of `crxLoadDecodeLoop` uses a fixed-size array of 4 to store the results of each plane's decoding, implying that `nPlanes` should not exceed 4. The `crxParseImageHeader` function, which is called before `crxSetupImageData`, validates that `nPlanes` is either 1 or 4.
+
+In summary, to correctly use `crxLoadDecodeLoop`, one must first create a `CrxImage` object, initialize it using `crxSetupImageData` with the correct image headers and other metadata, and then pass a pointer to this object and the number of planes to `crxLoadDecodeLoop`. Failure to follow this procedure will result in undefined behavior, likely leading to crashes due to null pointer dereferences or out-of-bounds memory accesses.
+</description>
+<requirements>
+<requirement>
+The first argument must be a pointer to a `CrxImage` struct that has been initialized by `crxSetupImageData`. This is because the function directly accesses members of this struct to guide the decoding process.
+</requirement>
+<requirement>
+The `nPlanes` argument must be an integer between 1 and 4, inclusive. This is to avoid out-of-bounds access on the `results` array inside the function, which is of size 4.
+</requirement>
+<requirement>
+The `input` member of the `CrxImage` structure must be a valid pointer to a `LibRaw_abstract_datastream` object. This is necessary for the function to read the compressed image data from the source.
+</requirement>
+<requirement>
+The `tiles` member of the `CrxImage` structure must point to an array of `CrxTile` objects. This array is allocated and initialized by `crxReadImageHeaders` (called from `crxSetupImageData`), and it is essential for tile-based decoding.
+</requirement>
+<requirement>
+The `outBufs` member of the `CrxImage` structure must be an array of 4 pointers, each pointing to a sufficiently large buffer. These buffers are used to store the decoded plane data, and they must be allocated before calling the function.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void LibRaw::crxLoadDecodeLoop(void *, int)
+</function_signature>
+<project_name>
+libraw
+</project_name>
+
+	Fuzz target source:
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
+
+#include "libraw.h"
+#include "libraw_internal.h"
+#include <fuzzer/FuzzedDataProvider.h>
+
+// Copied internal struct definitions from crx.cpp and libraw_internal.h
+// to allow calling internal setup functions.
+
+struct CrxBitstream {
+  uint64_t bitData;
+  int32_t bitsLeft;
+  uint64_t mdatSize;
+  uint64_t curPos;
+  uint32_t curBufSize;
+  uint64_t curBufOffset;
+  LibRaw_abstract_datastream *input;
+};
+
+struct CrxBandParam {
+  int32_t *paramData;
+  int32_t *nonProgrData;
+  int32_t subbandWidth;
+  int32_t subbandHeight;
+  int32_t roundedBits;
+  int32_t curLine;
+  uint32_t roundedBitsMask;
+  bool supportsPartial;
+  CrxBitstream bitStream;
+  int32_t sParam;
+  int32_t kParam;
+};
+
+struct CrxQStep {
+  uint32_t *qStepTbl;
+  uint32_t width;
+  uint32_t height;
+};
+
+struct CrxSubband {
+  uint32_t width;
+  uint32_t height;
+  uint64_t dataOffset;
+  uint64_t dataSize;
+  uint8_t *bandBuf;
+  uint32_t bandSize;
+  CrxBandParam *bandParam;
+  int32_t kParam;
+  int32_t qParam;
+  bool supportsPartial;
+  int32_t qStepBase;
+  int32_t qStepMult;
+  short rowStartAddOn;
+  short rowEndAddOn;
+  short colStartAddOn;
+  short colEndAddOn;
+  short levelShift;
+};
+
+struct CrxWaveletTransform {
+  int32_t *lineBuf[8];
+  int32_t *subband0Buf;
+  int32_t *subband1Buf;
+  int32_t *subband2Buf;
+  int32_t *subband3Buf;
+  uint32_t width;
+  uint32_t height;
+  int32_t curLine;
+  int32_t curH;
+  int32_t fltTapH;
+};
+
+struct CrxPlaneComp {
+  uint32_t compNumber;
+  uint64_t dataOffset;
+  uint64_t compSize;
+  uint32_t tileFlag;
+  bool supportsPartial;
+  uint32_t roundedBitsMask;
+  CrxSubband *subBands;
+  uint8_t *compBuf;
+  CrxWaveletTransform *wvltTransform;
+};
+
+struct CrxTile {
+  uint32_t tileNumber;
+  uint32_t tileFlag;
+  uint32_t width;
+  uint32_t height;
+  uint64_t tileSize;
+  uint64_t dataOffset;
+  CrxPlaneComp *comps;
+  CrxQStep *qStep;
+  bool hasQPData;
+  uint32_t mdatQPDataSize;
+  uint32_t mdatExtraSize;
+};
+
+struct CrxImage {
+  uint8_t nPlanes;
+  uint16_t planeWidth;
+  uint16_t planeHeight;
+  uint8_t samplePrecision;
+  uint8_t medianBits;
+  uint8_t subbandCount;
+  uint8_t levels;
+  uint8_t nBits;
+  uint8_t encType;
+  uint8_t tileCols;
+  uint8_t tileRows;
+  CrxTile *tiles;
+  uint64_t mdatOffset;
+  uint64_t mdatSize;
+  int16_t *outBufs[4];
+  int16_t *planeBuf;
+  LibRaw_abstract_datastream *input;
+#ifdef LIBRAW_CR3_MEMPOOL
+  libraw_memmgr memmgr;
+  CrxImage() : memmgr(0) {}
+#endif
+};
+
+// Forward declare the internal functions we need to call.
+// These are not static and will be available from libraw.a for linking.
+int crxSetupImageData(crx_data_header_t *hdr, CrxImage *img,
+                      int16_t *outBuf, int64_t mdatOffset,
+                      int64_t mdatSize, uint8_t *mdatHdrPtr,
+                      int32_t mdatHdrSize);
+int crxFreeImageData(CrxImage *img);
+
+// A derived class to expose the protected crxLoadDecodeLoop method.
+class FuzzLibRaw : public LibRaw {
+public:
+  using LibRaw::crxLoadDecodeLoop;
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 256)
+    return 0;
+
+  FuzzedDataProvider provider(data, size);
+
+  FuzzLibRaw processor;
+  // The input stream is the fuzzed data.
+  LibRaw_buffer_datastream stream(data, size);
+
+  crx_data_header_t hdr;
+  memset(&hdr, 0, sizeof(hdr));
+
+  // Populate the header with constrained, fuzzed values to pass validation.
+  hdr.f_width = provider.ConsumeIntegralInRange<int32_t>(22, 2048);
+  hdr.f_height = provider.ConsumeIntegralInRange<int32_t>(22, 2048);
+  hdr.tileWidth = provider.ConsumeIntegralInRange<int32_t>(22, hdr.f_width);
+  hdr.tileHeight = provider.ConsumeIntegralInRange<int32_t>(22, hdr.f_height);
+  hdr.nPlanes = provider.PickValueInArray<int32_t>({1, 4});
+  hdr.encType = provider.PickValueInArray<int32_t>({0, 1, 3});
+  hdr.imageLevels = provider.ConsumeIntegralInRange<int32_t>(0, 3);
+  hdr.version = provider.PickValueInArray<int32_t>({0x100, 0x200});
+  hdr.cfaLayout = provider.ConsumeIntegralInRange<int32_t>(0, 3);
+
+  if (hdr.nPlanes == 1) {
+    hdr.cfaLayout = 0;
+    hdr.encType = 0;
+    hdr.nBits = 8;
+  } else { // nPlanes == 4
+    if (hdr.encType == 1) {
+      hdr.nBits = provider.ConsumeIntegralInRange<int32_t>(9, 15);
+    } else {
+      hdr.nBits = provider.ConsumeIntegralInRange<int32_t>(9, 14);
+    }
+  }
+  hdr.medianBits = hdr.nBits;
+
+  CrxImage img;
+  memset(&img, 0, sizeof(img));
+  img.input = &stream;
+
+  size_t out_buf_size =
+      (size_t)hdr.f_width * hdr.f_height * hdr.nPlanes * 2;
+  if (out_buf_size == 0 || out_buf_size > 20 * 1024 * 1024)
+    return 0;
+  std::vector<int16_t> outBuf(out_buf_size);
+
+  std::vector<uint8_t> mdatHdr =
+      provider.ConsumeRemainingBytes<uint8_t>();
+
+  if (crxSetupImageData(&hdr, &img, outBuf.data(), 0, size, mdatHdr.data(),
+                        mdatHdr.size()) == 0) {
+    processor.crxLoadDecodeLoop(&img, img.nPlanes);
+  }
+
+  crxFreeImageData(&img);
+
+  return 0;
+}
+	

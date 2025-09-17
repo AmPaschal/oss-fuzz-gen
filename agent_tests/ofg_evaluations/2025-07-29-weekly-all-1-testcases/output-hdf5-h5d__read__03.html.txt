@@ -1,0 +1,131 @@
+
+	
+<description>
+The function `H5D__read` is an internal function in the HDF5 library responsible for reading data from one or more datasets. It takes a count of datasets and a pointer to an array of `H5D_dset_io_info_t` structures, which specify the details of the read operations. The function iterates through each dataset's I/O information, performs setup for data type and dataspace, and then invokes the appropriate low-level I/O routines to read the data. It handles various storage layouts, including contiguous, chunked, and virtual datasets. It also manages data type conversions and data filtering pipelines. The callers of this function are responsible for setting up the `H5D_dset_io_info_t` structures correctly, which includes providing valid dataset handles, memory and file dataspaces, and output buffers.
+</description>
+<requirements>
+<requirement>
+The `count` argument must be greater than 0. This is because the function is designed to read from at least one dataset.
+</requirement>
+<requirement>
+The `dset_info` argument must be a valid pointer to an array of `H5D_dset_io_info_t` structs with `count` elements. This is to avoid memory access violations when the function iterates through the array.
+</requirement>
+<requirement>
+For each `H5D_dset_io_info_t` struct in the `dset_info` array, the `dset` member must not be NULL. A NULL `dset` member will cause the function to fail with an error.
+</requirement>
+<requirement>
+For each `H5D_dset_io_info_t` struct, the `dset->oloc.file` member must not be NULL. The function relies on this to access file-level information.
+</requirement>
+<requirement>
+For each `H5D_dset_io_info_t` struct, the `mem_space` and `file_space` members must be valid `H5S_t` objects. These are used to determine the selection of data to be read.
+</requirement>
+<requirement>
+The number of elements selected in `mem_space` and `file_space` must be equal. An unequal number of elements will result in an error, as the source and destination selections must match.
+</requirement>
+<requirement>
+The `mem_space` and `file_space` dataspaces must have their extents set. The function checks for this and will fail if the extents are not set.
+</requirement>
+<requirement>
+If the number of elements to be read is greater than zero, the `buf.vp` member of each `H5D_dset_io_info_t` struct must point to a valid memory buffer. A NULL buffer with a non-zero number of elements to read will cause an error.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+herr_t H5D__read(size_t count, H5D_dset_io_info_t *dset_info)
+</function_signature>
+<project_name>
+hdf5
+</project_name>
+
+	Fuzz target source:
+#define H5D_FRIEND
+#define H5P_FRIEND
+
+#include "H5private.h"
+#include "H5Dpkg.h"
+#include "H5Eprivate.h"
+#include "H5Fprivate.h"
+#include "H5Iprivate.h"
+#include "H5Pprivate.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+extern int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (size < 16) {
+        return 0;
+    }
+
+    char filename[256];
+    sprintf(filename, "/tmp/libfuzzer.%d", getpid());
+
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        return 0;
+    }
+    fwrite(data, size, 1, fp);
+    fclose(fp);
+
+    H5E_auto2_t old_func;
+    void *old_client_data;
+    H5Eget_auto2(H5E_DEFAULT, &old_func, &old_client_data);
+    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+
+    hid_t file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file_id >= 0) {
+        hid_t dset_id = H5Dopen2(file_id, "dset", H5P_DEFAULT);
+        if (dset_id >= 0) {
+            H5D_t *dset = (H5D_t *)H5I_object_verify(dset_id, H5I_DATASET);
+            if (dset) {
+                hid_t file_space_id = H5Dget_space(dset_id);
+                if (file_space_id >= 0) {
+                    hssize_t nelmts = H5Sget_select_npoints(file_space_id);
+                    if (nelmts > 0) {
+                        hsize_t u_nelmts = (hsize_t)nelmts;
+                        hid_t mem_space_id = H5Screate_simple(1, &u_nelmts, NULL);
+                        if (mem_space_id >= 0) {
+                            hid_t mem_type_id = H5Dget_type(dset_id);
+                            if (mem_type_id >= 0) {
+                                size_t type_size = H5Tget_size(mem_type_id);
+                                if (type_size > 0 && (size_t)nelmts < (SIZE_MAX / type_size)) {
+                                    void *read_buf = malloc((size_t)nelmts * type_size);
+                                    if (read_buf) {
+                                        H5D_dset_io_info_t dset_info;
+                                        memset(&dset_info, 0, sizeof(H5D_dset_io_info_t));
+
+                                        dset_info.dset = dset;
+                                        dset_info.mem_type = (const H5T_t *)H5I_object_verify(mem_type_id, H5I_DATATYPE);
+                                        dset_info.file_space = (H5S_t *)H5I_object_verify(file_space_id, H5I_DATASPACE);
+                                        dset_info.mem_space = (H5S_t *)H5I_object_verify(mem_space_id, H5I_DATASPACE);
+                                        dset_info.buf.vp = read_buf;
+
+                                        if (dset_info.mem_type && dset_info.file_space && dset_info.mem_space) {
+                                            H5D__read(1, &dset_info);
+                                        }
+                                        free(read_buf);
+                                    }
+                                }
+                                H5Tclose(mem_type_id);
+                            }
+                            H5Sclose(mem_space_id);
+                        }
+                    }
+                    H5Sclose(file_space_id);
+                }
+            }
+            H5Dclose(dset_id);
+        }
+        H5Fclose(file_id);
+    }
+
+    H5Eset_auto2(H5E_DEFAULT, old_func, old_client_data);
+    unlink(filename);
+
+    return 0;
+}
+	

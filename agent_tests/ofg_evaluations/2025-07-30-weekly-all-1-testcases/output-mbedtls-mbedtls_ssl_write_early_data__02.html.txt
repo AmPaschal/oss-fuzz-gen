@@ -1,0 +1,253 @@
+
+	
+<description>
+The `mbedtls_ssl_write_early_data` function is used by a TLS 1.3 client to send application data to the server before the handshake is complete. This is known as 0-RTT (zero round trip time) data. The function will only send data if early data is enabled on both the client and the server, and if the server has indicated that it is willing to accept early data.
+</description>
+<requirements>
+
+<requirement>
+The `ssl` context must be initialized and configured for early data. This means the endpoint must be a client, TLS 1.3 must be enabled, the transport must not be datagram-based, and early data must be enabled in the configuration.
+</requirement>
+<requirement>
+The `ssl->tls_version` must be `MBEDTLS_SSL_VERSION_TLS1_3`. The function will return an error if the version is not TLS 1.3.
+</requirement>
+<requirement>
+The `ssl->early_data_state` must be either `MBEDTLS_SSL_EARLY_DATA_STATE_CAN_WRITE` or `MBEDTLS_SSL_EARLY_DATA_STATE_ACCEPTED`. The function will not send any data if the state is not one of these values.
+</requirement>
+<requirement>
+The `len` parameter must be less than or equal to the remaining early data size. The maximum early data size is determined by the server and communicated to the client in the session ticket.
+</requirement>
+<requirement>
+The `buf` parameter must be a valid pointer to a buffer of size `len`. A null or invalid pointer will lead to a crash.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mbedtls_ssl_write_early_data(mbedtls_ssl_context *, const unsigned char *, size_t)
+</function_signature>
+<project_name>
+mbedtls
+</project_name>
+
+	Fuzz target source:
+#include "common.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/ssl_ticket.h"
+#include "test/certs.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Definitions from common.c */
+static int ctr_drbg_f_random_failed;
+static int entropy_f_source_failed;
+
+void dummy_init(void) {
+  ctr_drbg_f_random_failed = 0;
+  entropy_f_source_failed = 0;
+}
+
+int dummy_send(void *ctx, const unsigned char *buf, size_t len) {
+  (void)ctx;
+  (void)buf;
+  return (int)len;
+}
+
+int fuzz_recv(void *ctx, unsigned char *buf, size_t len) {
+  fuzzBufferOffset_t *fuzz_data = (fuzzBufferOffset_t *)ctx;
+  if (fuzz_data->Offset + len > fuzz_data->Size) {
+    len = fuzz_data->Size - fuzz_data->Offset;
+  }
+  if (len > 0) {
+    memcpy(buf, fuzz_data->Data + fuzz_data->Offset, len);
+    fuzz_data->Offset += len;
+  }
+  return (int)len;
+}
+
+int dummy_random(void *p_rng, unsigned char *output, size_t output_len) {
+  (void)p_rng;
+  (void)output;
+  (void)output_len;
+  if (ctr_drbg_f_random_failed) {
+    return -1;
+  }
+  return 0;
+}
+
+int dummy_entropy(void *data, unsigned char *output, size_t len) {
+  (void)data;
+  (void)output;
+  (void)len;
+  if (entropy_f_source_failed) {
+    return -1;
+  }
+  return 0;
+}
+/* End of definitions from common.c */
+
+#if defined(MBEDTLS_SSL_CLI_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+const char *pers = "fuzz_client";
+static int initialized = 0;
+#if defined(MBEDTLS_X509_CRT_PARSE_C)
+static mbedtls_x509_crt cacert;
+#endif
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+const unsigned char psk[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+const char psk_id[] = "Client_identity";
+#endif
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+static mbedtls_ssl_session saved_session;
+#endif
+
+#define EARLY_DATA_MAX_LEN 256
+#endif // MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+#if defined(MBEDTLS_SSL_CLI_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+  int ret;
+  size_t len;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_context entropy;
+  unsigned char buf[4096];
+  fuzzBufferOffset_t biomemfuzz;
+
+  if (Size < 1) {
+    return 0;
+  }
+  const uint8_t options = Data[Size - 1];
+  const uint8_t *input_data = Data;
+  size_t input_size = Size - 1;
+
+  mbedtls_ssl_init(&ssl);
+  mbedtls_ssl_config_init(&conf);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  mbedtls_entropy_init(&entropy);
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) {
+    goto exit;
+  }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+  if (mbedtls_ctr_drbg_seed(&ctr_drbg, dummy_entropy, &entropy, (const unsigned char *)pers, strlen(pers)) != 0) {
+    return 1;
+  }
+
+  if (initialized == 0) {
+#if defined(MBEDTLS_X509_CRT_PARSE_C)
+    mbedtls_x509_crt_init(&cacert);
+    if (mbedtls_x509_crt_parse(&cacert, (const unsigned char *)mbedtls_test_cas_pem, mbedtls_test_cas_pem_len) != 0) {
+      return 1;
+    }
+#endif
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    mbedtls_ssl_session_init(&saved_session);
+#endif
+
+    dummy_init();
+
+    initialized = 1;
+  }
+
+  if (mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+    goto exit;
+  }
+
+  mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C)
+  mbedtls_ssl_conf_authmode(&conf, (options & 1) ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
+  mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+#endif
+
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+  if (options & 2) {
+    mbedtls_ssl_conf_psk(&conf, psk, sizeof(psk), (const unsigned char *)psk_id, sizeof(psk_id) - 1);
+  }
+#endif
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+  if (options & 8) {
+    mbedtls_ssl_conf_early_data(&conf, MBEDTLS_SSL_EARLY_DATA_ENABLED);
+  }
+#endif
+
+  if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+    goto exit;
+  }
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C)
+  if (mbedtls_ssl_set_hostname(&ssl, "localhost") != 0) {
+    goto exit;
+  }
+#endif
+
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+  if (options & 4) {
+    mbedtls_ssl_set_session(&ssl, &saved_session);
+  }
+#endif
+
+#if defined(MBEDTLS_SSL_EARLY_DATA)
+  if ((options & 8) && (options & 4)) {
+    size_t early_data_len = input_size > EARLY_DATA_MAX_LEN ? EARLY_DATA_MAX_LEN : input_size;
+    mbedtls_ssl_write_early_data(&ssl, input_data, early_data_len);
+
+    input_data += early_data_len;
+    input_size -= early_data_len;
+  }
+#endif
+
+  biomemfuzz.Data = input_data;
+  biomemfuzz.Size = input_size;
+  biomemfuzz.Offset = 0;
+  mbedtls_ssl_set_bio(&ssl, &biomemfuzz, dummy_send, fuzz_recv, NULL);
+
+  ret = mbedtls_ssl_handshake(&ssl);
+
+  if (ret == 0) {
+    do {
+      len = sizeof(buf) - 1;
+      ret = mbedtls_ssl_read(&ssl, buf, len);
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ)
+        continue;
+      else if (ret <= 0) {
+        break;
+      }
+    } while (1);
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    if (options & 4) {
+      if (mbedtls_ssl_get_session(&ssl, &saved_session) != 0) {
+        mbedtls_ssl_session_free(&saved_session);
+        mbedtls_ssl_session_init(&saved_session);
+      }
+    }
+#endif
+  }
+
+exit:
+  mbedtls_ssl_free(&ssl);
+  mbedtls_ssl_config_free(&conf);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_entropy_free(&entropy);
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  mbedtls_psa_crypto_free();
+#endif
+#else
+  (void)Data;
+  (void)Size;
+#endif /* MBEDTLS_SSL_CLI_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C */
+
+  return 0;
+}
+	

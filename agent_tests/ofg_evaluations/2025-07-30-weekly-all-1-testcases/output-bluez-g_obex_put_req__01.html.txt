@@ -1,0 +1,135 @@
+
+	
+<description>
+The g_obex_put_req function initiates a PUT request to an OBEX server. It is a variadic function that takes a variable number of arguments, which are pairs of OBEX header IDs and their corresponding values. The function returns a non-zero value on success and 0 on failure.
+</description>
+<requirements>
+<requirement> The first argument, `obex`, must be a valid GObex object. This is because it is dereferenced in the function and is essential for sending the OBEX request. </requirement> <requirement> The `data_func` callback must be a valid function pointer. This is because it is called to get the data to be sent. </requirement> <requirement> The `user_data` argument should point to a valid data structure that the `data_func` can use. In the provided example, this is a struct containing a file descriptor. </requirement> <requirement> The variadic arguments must be a list of header ID and value pairs. This is because the function expects this format to create the OBEX packet. </requirement> <requirement> The list of variadic arguments must be terminated with `G_OBEX_HDR_INVALID`. This is to prevent the function from reading beyond the end of the argument list. </requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+guint g_obex_put_req(GObex *, GObexDataProducer, GObexFunc, gpointer, GError **, guint, void)
+</function_signature>
+<project_name>
+bluez
+</project_name>
+
+	Fuzz target source:
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <glib.h>
+#include "gobex/gobex.h"
+#include "gobex/gobex-defs.h"
+
+// Fuzzer data context
+struct FuzzData {
+    const uint8_t *data;
+    size_t size;
+    size_t offset;
+};
+
+// Mock GObexDataProducer. This function is required by the g_obex_put_req
+// signature but may not be called in this fuzzing setup as we do not run a
+// GMainLoop to process the asynchronous events.
+static gssize fuzz_data_producer(void *buf, gsize len, gpointer user_data) {
+    struct FuzzData *fuzz_data = (struct FuzzData *)user_data;
+    if (!fuzz_data || fuzz_data->offset >= fuzz_data->size) {
+        return 0; // No more data
+    }
+
+    gsize to_copy = MIN(len, fuzz_data->size - fuzz_data->offset);
+    memcpy(buf, fuzz_data->data + fuzz_data->offset, to_copy);
+    fuzz_data->offset += to_copy;
+
+    return to_copy;
+}
+
+// Mock GObexFunc. This function is the completion callback.
+static void fuzz_complete_func(GObex *obex, GError *err, gpointer user_data) {
+    if (err) {
+        g_error_free(err);
+    }
+}
+
+// Provide a forward declaration of the function under test.
+guint g_obex_put_req(GObex *, GObexDataProducer, GObexFunc, gpointer, GError **, guint, ...);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 1) {
+        return 0;
+    }
+
+    // --- GObex object setup ---
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        return 0;
+    }
+
+    // The GObex object will own this channel and free it upon destruction.
+    GIOChannel *io_obex = g_io_channel_unix_new(fds[1]);
+    g_io_channel_set_encoding(io_obex, NULL, NULL);
+    g_io_channel_set_buffered(io_obex, FALSE);
+
+    // Use the first byte of fuzzer input to switch between transport types
+    GObexTransportType transport = (data[0] % 2 == 0) ?
+            G_OBEX_TRANSPORT_STREAM : G_OBEX_TRANSPORT_PACKET;
+
+    GObex *obex = g_obex_new(io_obex, transport, -1, -1);
+    if (!obex) {
+        // g_obex_new unrefs io_obex on failure. We just need to close the fds.
+        close(fds[0]);
+        // fds[1] is associated with io_obex and will be closed with it.
+        return 0;
+    }
+    // The peer socket is not used in this test.
+    close(fds[0]);
+
+    // --- Fuzz data setup ---
+    struct FuzzData fuzz_context = { .data = data + 1, .size = size - 1, .offset = 0 };
+    GError *error = NULL;
+
+    // --- Call the target function ---
+    // Use a portion of the fuzzer data for the NAME header.
+    // Ensure the name is a valid, null-terminated C-string.
+    size_t name_len = 0;
+    if (fuzz_context.size > 0) {
+        name_len = MIN(255, fuzz_context.size);
+    }
+    char *fuzzed_name = g_strndup((const char *)fuzz_context.data, name_len);
+    fuzz_context.offset = name_len;
+
+    // Use the rest of the data for the BODY header.
+    const guint8 *body_data = fuzz_context.data + fuzz_context.offset;
+    guint16 body_len = 0;
+    if (fuzz_context.size > fuzz_context.offset) {
+        body_len = MIN(G_MAXUINT16, fuzz_context.size - fuzz_context.offset);
+    }
+
+    // Call the function under test with a combination of fuzzed headers.
+    g_obex_put_req(obex,
+                   fuzz_data_producer,
+                   fuzz_complete_func,
+                   &fuzz_context,
+                   &error,
+                   G_OBEX_HDR_NAME, fuzzed_name,
+                   G_OBEX_HDR_BODY, body_data, body_len,
+                   G_OBEX_HDR_LENGTH, (guint32)size,
+                   G_OBEX_HDR_INVALID);
+
+    // --- Cleanup ---
+    g_free(fuzzed_name);
+    if (error) {
+        g_error_free(error);
+    }
+    g_obex_unref(obex);
+
+    return 0;
+}
+	

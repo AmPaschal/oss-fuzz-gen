@@ -1,0 +1,191 @@
+
+	
+<description>
+The ARM_getInstruction function is the entry point for disassembling a single ARM instruction. It is a wrapper around the internal function _ARM_getInstruction, which performs the actual decoding. The function takes a handle to the capstone engine, a buffer containing the instruction bytes, the buffer's size, a pointer to an MCInst structure to be filled, a pointer to store the instruction size, the instruction's address, and a user-defined pointer. The function returns true on success and false on failure.
+</description>
+<requirements>
+<requirement>
+The first argument, csh, should be a valid handle returned by cs_open(). This is because the function internally casts this handle to a cs_struct pointer and accesses its members.
+</requirement>
+<requirement>
+The `code` buffer, the second argument, must have a size of at least 4 bytes. This is because the function reads 4 bytes from the buffer to decode the instruction.
+</requirement>
+<requirement>
+The `ud->mode` field of the `cs_struct` should be initialized to test both big-endian and little-endian modes. This is because the instruction decoding logic depends on the endianness.
+</requirement>
+<requirement>
+The third argument, code_len, should be greater than or equal to 4. This is a precondition for the function to attempt to decode the instruction.
+</requirement>
+<requirement>
+The fourth argument, `instr`, must be a valid pointer to an `MCInst` struct. This struct is populated with the decoded instruction information.
+</requirement>
+<requirement>
+The fifth argument, `size`, must be a valid pointer to a `uint16_t`. This is used to return the size of the decoded instruction.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool ARM_getInstruction(csh, const uint8_t *, size_t, MCInst *, uint16_t *, uint64_t, void *)
+</function_signature>
+<project_name>
+capstone
+</project_name>
+
+	Fuzz target source:
+#include <capstone/capstone.h>
+
+#if CAPSTONE_VERSION_MAJOR == 6
+
+// Fuzzing logic for the 'next' branch (version 6)
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+// Use relative paths to ensure headers are found from the build directory.
+#include "../../MCInst.h"
+#include "../../arch/ARM/ARMMapping.h"
+
+// Forward declaration of the function under test.
+bool ARM_getInstruction(csh, const uint8_t *, size_t, MCInst *, uint16_t *, uint64_t, void *);
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+	if (Size < 5) {
+		return 0;
+	}
+
+	csh handle;
+	cs_err err;
+
+	cs_mode mode = CS_MODE_ARM;
+	if (Data[0] & 0x01) {
+		mode |= CS_MODE_THUMB;
+	}
+	if (Data[0] & 0x02) {
+		mode |= CS_MODE_BIG_ENDIAN;
+	}
+	if (Data[0] & 0x04) {
+		mode |= CS_MODE_MCLASS;
+	}
+	if (Data[0] & 0x08) {
+		mode |= CS_MODE_V8;
+	}
+
+	err = cs_open(CS_ARCH_ARM, mode, &handle);
+	if (err != CS_ERR_OK) {
+		return 0;
+	}
+
+	MCInst inst;
+	MCInst_clear(&inst);
+
+	uint16_t insn_size = 0;
+	uint64_t address = 0x1000;
+	const uint8_t *code = Data + 1;
+	size_t code_len = Size - 1;
+
+	ARM_getInstruction(handle, code, code_len, &inst, &insn_size, address, NULL);
+
+	cs_close(&handle);
+
+	return 0;
+}
+
+#else
+
+// Original fuzzing logic for the 'v5' branch
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+
+#include "platform.h"
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+
+static FILE *outfile = NULL;
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+    csh handle;
+    cs_insn *all_insn;
+    cs_detail *detail;
+    cs_err err;
+    unsigned int i;
+
+    if (Size < 1) {
+        // 1 byte for arch choice
+        return 0;
+    } else if (Size > 0x1000) {
+        //limit input to 4kb
+        Size = 0x1000;
+    }
+
+    if (outfile == NULL) {
+        // we compute the output
+        outfile = fopen("/dev/null", "w");
+        if (outfile == NULL) {
+            return 0;
+        }
+    }
+
+    i = get_platform_entry((uint8_t)Data[0]);
+
+    err = cs_open(platforms[i].arch, platforms[i].mode, &handle);
+    if (err) {
+        return 0;
+    }
+
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    if (Data[0]&0x80) {
+        //hack
+        cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+    }
+
+    uint64_t address = 0x1000;
+    size_t count = cs_disasm(handle, Data+1, Size-1, address, 0, &all_insn);
+
+    if (count) {
+        size_t j;
+        unsigned int n;
+
+        for (j = 0; j < count; j++) {
+            cs_insn *i = &(all_insn[j]);
+            fprintf(outfile, "0x%"PRIx64":\t%s\t\t%s // insn-ID: %u, insn-mnem: %s\n",
+                   i->address, i->mnemonic, i->op_str,
+                   i->id, cs_insn_name(handle, i->id));
+
+            detail = i->detail;
+
+            if (detail->regs_read_count > 0) {
+                fprintf(outfile, "\tImplicit registers read: ");
+                for (n = 0; n < detail->regs_read_count; n++) {
+                    fprintf(outfile, "%s ", cs_reg_name(handle, detail->regs_read[n]));
+                }
+            }
+
+            if (detail->regs_write_count > 0) {
+                fprintf(outfile, "\tImplicit registers modified: ");
+                for (n = 0; n < detail->regs_write_count; n++) {
+                    fprintf(outfile, "%s ", cs_reg_name(handle, detail->regs_write[n]));
+                }
+            }
+
+            if (detail->groups_count > 0) {
+                fprintf(outfile, "\tThis instruction belongs to groups: ");
+                for (n = 0; n < detail->groups_count; n++) {
+                    fprintf(outfile, "%s ", cs_group_name(handle, detail->groups[n]));
+                }
+            }
+        }
+
+        fprintf(outfile, "0x%"PRIx64":\n", all_insn[j-1].address + all_insn[j-1].size);
+        cs_free(all_insn, count);
+    }
+
+    cs_close(&handle);
+
+    return 0;
+}
+
+#endif
+	

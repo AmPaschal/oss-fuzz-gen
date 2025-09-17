@@ -1,0 +1,281 @@
+
+	
+<description>
+This function replaces an existing cipher type in the srtp crypto kernel with a new implementation. It acts as a wrapper for the `srtp_crypto_kernel_do_load_cipher_type` function, passing the new cipher type and its corresponding ID. The underlying function performs several checks to ensure the validity of the new cipher before loading it. These checks include verifying that the provided cipher type is not NULL, that its internal ID matches the one passed to the function, and that it passes a self-test to confirm its correctness. Although the function is named `replace_cipher_type`, its implementation allows for the addition of a new cipher if the provided ID does not already exist in the kernel.
+</description>
+<requirements>
+<requirement>
+The `new_ct` parameter must not be a NULL pointer. This is to prevent a NULL pointer dereference within the `srtp_crypto_kernel_do_load_cipher_type` function, which would lead to a crash.
+</requirement>
+<requirement>
+The `id` field of the `srtp_cipher_type_t` struct pointed to by `new_ct` must match the `id` parameter. This is a consistency check performed by the underlying `srtp_crypto_kernel_do_load_cipher_type` function to ensure the correct cipher is being replaced or added.
+</requirement>
+<requirement>
+The `srtp_cipher_type_t` struct pointed to by `new_ct` must be fully initialized with valid function pointers and test data. This is because the `srtp_cipher_type_self_test` function is called on `new_ct`, and it relies on these members to verify the correctness of the cipher implementation.
+</requirement>
+<requirement>
+The `id` parameter should be a value from the `srtp_cipher_type_id_t` enumeration. While the function can handle a new, previously unseen `id` by adding it, using a valid enum value ensures consistency and avoids potential issues with unhandled ID values.
+</requirement>
+<requirement>
+The `srtp_init()` function must be called before calling `srtp_replace_cipher_type`. This ensures that the crypto kernel is properly initialized and in a state where cipher types can be safely modified or added.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+srtp_err_status_t srtp_replace_cipher_type(const srtp_cipher_type_t *, srtp_cipher_type_id_t)
+</function_signature>
+<project_name>
+libsrtp
+</project_name>
+
+	Fuzz target source:
+/* By Guido Vranken <guidovranken@gmail.com> --
+ * https://guidovranken.wordpress.com/ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <limits.h>
+#include "srtp.h"
+#include "srtp_priv.h"
+#include "mt19937.h"
+#include "testmem.h"
+#include "/src/libsrtp/crypto/include/cipher.h"
+#include "/src/libsrtp/crypto/include/cipher_types.h"
+
+/* Global variables */
+static bool g_no_align = false; /* Can be enabled with --no_align */
+static bool g_post_init =
+    false; /* Set to true once past initialization phase */
+static bool g_write_input = false;
+
+#ifdef FUZZ_32BIT
+#include <sys/mman.h>
+static bool g_no_mmap = false; /* Can be enabled with --no_mmap */
+static void *g_mmap_allocation =
+    NULL; /* Keeps current mmap() allocation address */
+static size_t g_mmap_allocation_size =
+    0; /* Keeps current mmap() allocation size */
+#endif
+
+/* Custom allocator functions */
+
+static void *fuzz_alloc(const size_t size, const bool do_zero)
+{
+    void *ret = NULL;
+#ifdef FUZZ_32BIT
+    bool do_malloc = true;
+#endif
+    bool do_mmap, mmap_high = true;
+
+    if (size == 0) {
+        size_t ret_val;
+        /* Allocations of size 0 are not illegal, but are a bad practice, since
+         * writing just a single byte to this region constitutes undefined
+         * behavior per the C spec. glibc will return a small, valid memory
+         * region
+         * whereas OpenBSD will crash upon writing to it.
+         * Intentionally return a pointer to an invalid page to detect
+         * unsound code efficiently.
+         * fuzz_free is aware of this pointer range and will not attempt
+         * to free()/munmap() it.
+         */
+        ret_val = 0x01 + (fuzz_mt19937_get() % 1024);
+        return (void *)ret_val;
+    }
+
+    /* Don't do mmap()-based allocations during initialization */
+    if (g_post_init == true) {
+        /* Even extract these values if --no_mmap is specified.
+         * This keeps the PRNG output stream consistent across
+         * fuzzer configurations.
+         */
+        do_mmap = (fuzz_mt19937_get() % 64) == 0 ? true : false;
+        if (do_mmap == true) {
+            mmap_high = (fuzz_mt19937_get() % 2) == 0 ? true : false;
+        }
+    } else {
+        do_mmap = false;
+    }
+
+#ifdef FUZZ_32BIT
+    /* g_mmap_allocation must be NULL because we only support a single
+     * concurrent mmap allocation at a time
+     */
+    if (g_mmap_allocation == NULL && g_no_mmap == false && do_mmap == true) {
+        void *mmap_address;
+        if (mmap_high == true) {
+            mmap_address = (void *)0xFFFF0000;
+        } else {
+            mmap_address = (void *)0x00010000;
+        }
+        g_mmap_allocation_size = size;
+
+        ret = mmap(mmap_address, g_mmap_allocation_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (ret == MAP_FAILED) {
+            /* That's okay -- just return NULL to the caller */
+
+            ret = NULL;
+
+            /* Reset this for the sake of cleanliness */
+            g_mmap_allocation_size = 0;
+        }
+        /* ret not being MAP_FAILED does not mean that ret is the requested
+         * address (mmap_address). That's okay. We're not going to perform
+         * a munmap() on it and call malloc() instead. It won't gain us
+         * anything.
+         */
+
+        g_mmap_allocation = ret;
+        do_malloc = false;
+    }
+
+    if (do_malloc == true)
+#endif
+    {
+        ret = malloc(size);
+    }
+
+    /* Mimic calloc() if so requested */
+    if (ret != NULL && do_zero) {
+        memset(ret, 0, size);
+    }
+
+    return ret;
+}
+
+void *fuzz_calloc(const size_t nmemb, const size_t size)
+{
+    /* We must be past srtp_init() to prevent that that function fails */
+    if (g_post_init == true) {
+        /* Fail 1 in 64 allocations on average to test whether the library
+         * can deal with this properly.
+         */
+        if ((fuzz_mt19937_get() % 64) == 0) {
+            return NULL;
+        }
+    }
+
+    return fuzz_alloc(nmemb * size, true);
+}
+
+static bool fuzz_is_special_pointer(void *ptr)
+{
+    /* Special, invalid pointers introduced when code attempted
+     * to do size = 0 allocations.
+     */
+    if ((size_t)ptr >= 0x01 && (size_t)ptr < (0x01 + 1024)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void fuzz_free(void *ptr)
+{
+    if (fuzz_is_special_pointer(ptr) == true) {
+        return;
+    }
+
+#ifdef FUZZ_32BIT
+    if (g_post_init == true && ptr != NULL && ptr == g_mmap_allocation) {
+        if (munmap(g_mmap_allocation, g_mmap_allocation_size) == -1) {
+            /* Shouldn't happen */
+            abort();
+        }
+        g_mmap_allocation = NULL;
+    } else
+#endif
+    {
+        free(ptr);
+    }
+}
+
+void fuzz_srtp_event_handler(srtp_event_data_t *data)
+{
+    fuzz_testmem(data, sizeof(srtp_event_data_t));
+    if (data->session != NULL) {
+        fuzz_testmem(data->session, sizeof(*data->session));
+    }
+}
+
+int LLVMFuzzerInitialize(int *argc, char ***argv)
+{
+    char **_argv = *argv;
+    int i;
+    bool no_custom_event_handler = false;
+
+    if (srtp_init() != srtp_err_status_ok) {
+        /* Shouldn't happen */
+        abort();
+    }
+
+    for (i = 0; i < *argc; i++) {
+        if (strcmp("--no_align", _argv[i]) == 0) {
+            g_no_align = true;
+        } else if (strcmp("--no_custom_event_handler", _argv[i]) == 0) {
+            no_custom_event_handler = true;
+        } else if (strcmp("--write_input", _argv[i]) == 0) {
+            g_write_input = true;
+        }
+#ifdef FUZZ_32BIT
+        else if (strcmp("--no_mmap", _argv[i]) == 0) {
+            g_no_mmap = true;
+        }
+#endif
+        else if (strncmp("--", _argv[i], 2) == 0) {
+            printf("Invalid argument: %s\n", _argv[i]);
+            exit(0);
+        }
+    }
+
+    if (no_custom_event_handler == false) {
+        if (srtp_install_event_handler(fuzz_srtp_event_handler) !=
+            srtp_err_status_ok) {
+            /* Shouldn't happen */
+            abort();
+        }
+    }
+
+    /* Fully initialized -- past this point, simulated allocation failures
+     * are allowed to occur */
+    g_post_init = true;
+
+    return 0;
+}
+
+// Forward declaration of the function-under-test
+srtp_err_status_t srtp_replace_cipher_type(const srtp_cipher_type_t *, srtp_cipher_type_id_t);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    // We need at least enough data for the cipher ID.
+    if (size < sizeof(srtp_cipher_type_id_t)) {
+        return 0;
+    }
+
+    // Create a new cipher type to be used for replacement.
+    // We base it on the existing srtp_null_cipher to ensure all function
+    // pointers are valid and it can pass the self-test.
+    srtp_cipher_type_t fuzzed_cipher_type;
+    memcpy(&fuzzed_cipher_type, &srtp_null_cipher, sizeof(srtp_cipher_type_t));
+
+    // Extract the cipher ID from the fuzzer input.
+    srtp_cipher_type_id_t fuzzed_id;
+    memcpy(&fuzzed_id, data, sizeof(fuzzed_id));
+
+    // To satisfy the requirement that new_ct->id matches the id parameter,
+    // we set our custom cipher's ID to the fuzzed value.
+    fuzzed_cipher_type.id = fuzzed_id;
+
+    // Call the function under test.
+    srtp_replace_cipher_type(&fuzzed_cipher_type, fuzzed_id);
+
+    return 0;
+}
+	

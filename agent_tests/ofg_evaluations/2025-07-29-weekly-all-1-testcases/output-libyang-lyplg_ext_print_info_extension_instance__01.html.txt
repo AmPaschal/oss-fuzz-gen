@@ -1,0 +1,144 @@
+
+	
+<description>
+The `lyplg_ext_print_info_extension_instance` function is responsible for printing the content of a compiled YANG extension instance (`lysc_ext_instance`) in the `info` (compiled) format. It is used as a helper by various specific extension printer callbacks.
+
+The function iterates through the `substmts` array of the provided `ext` instance. This `substmts` is a sized array, and the function's main loop depends on `LY_ARRAY_COUNT` to correctly determine the number of substatements. Inside the loop, a large `switch` statement handles each substatement based on its `stmt` type.
+
+For each statement type, the function accesses the associated data via the `storage_p` member. The type of data pointed to by `*storage_p` varies depending on the statement. For example, for data node statements like `LY_STMT_CONTAINER`, `*storage_p` is a pointer to a linked list of `lysc_node`s. For simpler statements like `LY_STMT_DESCRIPTION`, it's a `const char *`. The function frequently dereferences `storage_p` and the data it points to, making their validity crucial for safe execution.
+
+The `ctx` parameter, a `lyspr_ctx` pointer, is cast to a `lys_ypr_ctx` to access the output stream (`out`) and other printing context information. The `flag` parameter is a boolean pointer used to track whether an opening brace has been printed, ensuring correct YANG formatting.
+
+The function's callers (`annotation_printer_info`, `yangdata_printer_info`, `structure_printer_info`) are simple wrappers that pass their arguments directly to this function. Therefore, the requirements for calling the target function are dictated by the internal logic of the function itself and the data structures it operates on.
+</description>
+<requirements>
+<requirement>
+The `ext` parameter, a pointer to `struct lysc_ext_instance`, must be a valid, fully initialized, and compiled extension instance. This is because the function iterates through its `substmts` array and accesses various members, assuming they are correctly populated during the schema compilation phase.
+</requirement>
+<requirement>
+The `ext->substmts` member must be a valid sized array. The function uses `LY_ARRAY_FOR` which relies on the sized array implementation to get the element count, and a corrupted or improperly created array will lead to memory errors.
+</requirement>
+<requirement>
+For each element in the `ext->substmts` array, the `storage_p` member must be a valid pointer. While the data it points to (`*storage_p`) can be NULL, `storage_p` itself must not be, as it is dereferenced in almost every case of the `switch` statement.
+</requirement>
+<requirement>
+The data pointed to by `*ext->substmts[u].storage_p` must match the type expected by the corresponding `ext->substmts[u].stmt`. For example, if `stmt` is `LY_STMT_CONFIG`, `*storage_p` must be a valid `uint16_t*`, and if it's `LY_STMT_MUST`, it must be a valid array of `lysc_must` structs. A type mismatch will lead to incorrect casting, memory corruption, and crashes.
+</requirement>
+<requirement>
+The `ctx` parameter must be a valid pointer to a `struct lyspr_ctx` (which is compatible with `struct lys_ypr_ctx`). This is because the function casts it to `struct lys_ypr_ctx *` and accesses its `out` and `module` members. A NULL or invalid context will cause a crash.
+</requirement>
+<requirement>
+The `flag` parameter must be a valid pointer to a `ly_bool` (boolean). The function reads from and writes to this flag to manage the output formatting, so a NULL pointer will cause a crash.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void lyplg_ext_print_info_extension_instance(struct lyspr_ctx *, const struct lysc_ext_instance *, ly_bool *)
+</function_signature>
+<project_name>
+libyang
+</project_name>
+
+	Fuzz target source:
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "libyang.h"
+#include "out.h"
+#include "/src/libyang/build/libyang/plugins_exts.h"
+#include "tree_schema.h"
+
+/*
+ * The definition of lyspr_ctx is internal to libyang, but we need to
+ * create one to call the target function. We replicate its definition here,
+ * which is based on its structure in src/printer_internal.h.
+ */
+struct lyspr_ctx {
+    struct ly_out *out;
+    uint16_t level;
+    uint16_t flags;
+    uint32_t options;
+    const struct lys_module *module;
+};
+
+void lyplg_ext_print_info_extension_instance(struct lyspr_ctx *, const struct lysc_ext_instance *, ly_bool *);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < 5) {
+        return 0;
+    }
+
+    static bool log_disabled = false;
+    if (!log_disabled) {
+        ly_log_options(0);
+        log_disabled = true;
+    }
+
+    static const char *ext_mod_str = "module ext-mod { yang-version 1.1; namespace \"urn:ext-mod\"; prefix em; extension my-ext; }";
+    static const char *user_mod_str = "module user-mod { yang-version 1.1; namespace \"urn:user-mod\"; prefix um; "
+                                      "import ext-mod { prefix em; } "
+                                      "container top { "
+                                      "  em:my-ext { "
+                                      "    description \"A test description for fuzzing.\"; "
+                                      "    status current; "
+                                      "  } "
+                                      "}}";
+
+    struct ly_ctx *ctx = NULL;
+    struct lys_module *mod = NULL;
+    const struct lysc_ext_instance *ext = NULL;
+
+    if (ly_ctx_new(NULL, 0, &ctx) != LY_SUCCESS) {
+        return 0;
+    }
+
+    if (lys_parse_mem(ctx, ext_mod_str, LYS_IN_YANG, NULL) != LY_SUCCESS) {
+        ly_ctx_destroy(ctx);
+        return 0;
+    }
+
+    if (lys_parse_mem(ctx, user_mod_str, LYS_IN_YANG, &mod) != LY_SUCCESS) {
+        ly_ctx_destroy(ctx);
+        return 0;
+    }
+    
+    if (mod && mod->compiled) {
+        const struct lysc_node *snode = NULL;
+        LY_LIST_FOR(mod->compiled->data, snode) {
+            if (strcmp(snode->name, "top") == 0) {
+                if (snode->exts && LY_ARRAY_COUNT(snode->exts)) {
+                    ext = &snode->exts[0];
+                }
+                break;
+            }
+        }
+    }
+
+    if (ext) {
+        struct lyspr_ctx pctx;
+        char *mem = NULL;
+
+        ly_bool flag = data[0] & 1;
+        uint32_t options = 0;
+        memcpy(&options, data + 1, sizeof(uint32_t));
+
+        if (ly_out_new_memory(&mem, 0, &pctx.out) == LY_SUCCESS) {
+            pctx.module = mod;
+            pctx.level = 1;
+            pctx.flags = 0;
+            pctx.options = options;
+
+            lyplg_ext_print_info_extension_instance(&pctx, ext, &flag);
+
+            ly_out_free(pctx.out, NULL, 1);
+        }
+    }
+
+    ly_ctx_destroy(ctx);
+    return 0;
+}
+	

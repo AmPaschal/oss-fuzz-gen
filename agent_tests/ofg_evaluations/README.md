@@ -18,9 +18,17 @@ Commands can be executed with ```nohup [command] &``` to run it in the backgroun
 
 ### Function Analyzer Influence
 
-```bash
+This command will be run on two directories. The first directory is testcases created from experiments conducted using the function analyzer, while the second contains testcases from experiments without the function analyzer.
 
+```bash
+python3 -m agent_tests.ofg_evaluations.function-analyzer-influence --input-dir agent_tests/ofg_evaluations/2025-07-29-weekly-all-1-testcases -o 2025-07-29-weekly-all-1-output.jsonl -l [model]
 ```
+
+```bash
+python3 -m agent_tests.ofg_evaluations.function-analyzer-influence --input-dir agent_tests/ofg_evaluations/2025-07-30-weekly-all-1-testcases -o 2025-07-30-weekly-all-1-output.jsonl -l [model]
+```
+
+The results of both commands will be written to files specified with the -o or --output flags, and located in the OSS-Fuzz-Gen's directory
 
 ### Context Analyzer Consistency
 ```bash

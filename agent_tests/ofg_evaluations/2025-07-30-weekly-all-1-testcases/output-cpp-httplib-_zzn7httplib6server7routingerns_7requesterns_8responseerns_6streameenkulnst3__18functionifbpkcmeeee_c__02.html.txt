@@ -1,0 +1,134 @@
+
+	
+<description>
+The target function is a lambda that reads the body of an HTTP request from a stream by calling `read_content_with_content_receiver`. Its behavior is primarily dictated by the headers of the `httplib::Request` object (`req`), handling standard, chunked, and multipart/form-data bodies. The content is passed to a `ContentReceiver` callback. When handling multipart data, the lambda provides null callbacks, meaning the content of multipart sections is discarded, though the structure is still parsed. The function's main role is to abstract the complexities of reading various request body formats.
+</description>
+<requirements>
+
+<requirement>
+The `strm` object (a `httplib::Stream`) must be readable and contain the HTTP request body. For fuzzing, a `httplib::detail::BufferStream` initialized with fuzzer data is recommended. This is because the function reads the request payload from this stream.
+</requirement>
+<requirement>
+The `req` object (`httplib::Request`) must be properly initialized with headers that are consistent with the data in `strm`. Specifically, either the 'Content-Length' header must be set to the size of the body in `strm`, or the 'Transfer-Encoding' header must be set to 'chunked' if the body is chunked. This is crucial for the function to correctly read the request body.
+</requirement>
+<requirement>
+If the 'Content-Type' header in the `req` object is 'multipart/form-data', it must also include a valid 'boundary' parameter. The function will return a 400 Bad Request status if the boundary is missing or invalid, as it is essential for parsing multipart data.
+</requirement>
+<requirement>
+The `receiver` argument, a `httplib::ContentReceiver`, must be a valid, callable function. This callback is invoked with chunks of the request body. It should return `true` to continue processing, and `false` to indicate an error and stop.
+</requirement>
+<requirement>
+The `res` object, of type `httplib::Response`, is used to report errors. A default-initialized object is sufficient, as the function will set its `status` member in case of an error.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool httplib::Server::operator()(const void *, ContentReceiver)
+</function_signature>
+<project_name>
+cpp-httplib
+</project_name>
+
+	Fuzz target source:
+#include <cstdint>
+#include <httplib.h>
+
+// Mandatory include as per prompt.
+#include "/usr/local/include/c++/v1/__algorithm/comp_ref_type.h"
+
+class FuzzedStream : public httplib::Stream {
+public:
+  FuzzedStream(const uint8_t *data, size_t size)
+      : data_(data), size_(size), read_pos_(0) {}
+
+  ssize_t read(char *ptr, size_t size) override {
+    if (read_pos_ >= size_) {
+      return -1;
+    }
+    if (size + read_pos_ > size_) {
+      size = size_ - read_pos_;
+    }
+    memcpy(ptr, data_ + read_pos_, size);
+    read_pos_ += size;
+    return static_cast<ssize_t>(size);
+  }
+
+  ssize_t write(const char *ptr, size_t size) override {
+    response_.append(ptr, size);
+    return static_cast<ssize_t>(size);
+  }
+
+  bool is_readable() const override { return read_pos_ < size_; }
+  bool wait_readable() const override { return true; }
+  bool wait_writable() const override { return true; }
+
+  void get_remote_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 8080;
+  }
+  void get_local_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 8080;
+  }
+  socket_t socket() const override { return 0; }
+  time_t duration() const override { return 0; };
+
+private:
+  const uint8_t *data_;
+  size_t size_;
+  size_t read_pos_;
+  std::string response_;
+};
+
+class FuzzableServer : public httplib::Server {
+public:
+  void ProcessFuzzedRequest(FuzzedStream &stream) {
+    bool connection_close = false;
+    process_request(stream, /*remote_addr=*/"", /*remote_port=*/0,
+                    /*local_addr=*/"", /*local_port=*/0,
+                    /*last_connection=*/false, connection_close, nullptr);
+  }
+};
+
+static FuzzableServer g_server;
+
+// Mandatory code snippet as per prompt.
+// This line is commented out because it is syntactically invalid C++
+// at the global scope. operator() can only be a non-static member function.
+// bool operator()(const void *, httplib::ContentReceiver);
+
+extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
+  auto handler = [](const httplib::Request & /*req*/, httplib::Response &res,
+                    const httplib::ContentReader &content_reader) {
+    // The function under test is the `ContentReader`'s internal lambda.
+    // It requires a `ContentReceiver` to be passed to it.
+    httplib::ContentReceiver receiver = [](const char * /*data*/,
+                                           size_t /*data_length*/) {
+      // Return true to continue receiving content.
+      return true;
+    };
+
+    // Call the target lambda via the ContentReader.
+    content_reader(receiver);
+    res.set_content("OK", "text/plain");
+  };
+
+  g_server.Post(R"(.*)", handler);
+  g_server.Put(R"(.*)", handler);
+  g_server.Patch(R"(.*)", handler);
+
+  return 0;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+  FuzzedStream stream{data, size};
+  g_server.ProcessFuzzedRequest(stream);
+  return 0;
+}
+	

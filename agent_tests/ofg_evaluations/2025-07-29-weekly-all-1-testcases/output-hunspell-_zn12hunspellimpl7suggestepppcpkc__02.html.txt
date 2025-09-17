@@ -1,0 +1,99 @@
+
+	
+<description>
+The `HunspellImpl::suggest` function generates a list of spelling suggestions for a given word. It internally calls another `suggest` method that returns a `std::vector<std::string>` of suggestions. This vector is then converted into a C-style string array by the `munge_vector` function. The caller is responsible for managing the memory of the returned suggestion list.
+</description>
+<requirements>
+<requirement>
+The `slst` parameter must be a non-null pointer to a `char**`. The `munge_vector` function allocates memory for the suggestion list and writes the address to `*slst`, so `slst` must be a valid pointer to avoid a crash.
+</requirement>
+<requirement>
+The `word` parameter must be a null-terminated string. To get meaningful suggestions and avoid being discarded, its length should be less than 100 characters (or 300 if UTF-8 is enabled), as defined by `MAXWORDLEN`.
+</requirement>
+<requirement>
+The `HunspellImpl` object must be properly initialized by loading a dictionary before calling `suggest`. This can be done using the `HunspellImpl::load(const char* affpath, const char* dpath, const char* key)` function, which populates the necessary internal data structures.
+</requirement>
+<requirement>
+The caller is responsible for freeing the memory allocated for the suggestion list. The `HunspellImpl::free_list` function should be called to deallocate the memory and prevent memory leaks.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int HunspellImpl::suggest(char ***, const char *)
+</function_signature>
+<project_name>
+hunspell
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <fstream>
+#include <string>
+#include <vector>
+
+// Include the C header which defines the public API and Hunhandle type.
+#include "/src/hunspell/src/hunspell/hunspell.h"
+
+// Provide a minimal declaration of the internal HunspellImpl class.
+// This is necessary for the compiler to understand the type when we cast
+// the Hunhandle and call the internal `suggest` method. The full
+// implementation is in the linked library.
+class HunspellImpl {
+public:
+  int suggest(char*** slst, const char* word);
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider provider(data, size);
+
+    // Split the data for affix file, dictionary file, and the word.
+    size_t aff_size = provider.ConsumeIntegralInRange<size_t>(0, size / 2);
+    std::string aff_data = provider.ConsumeBytesAsString(aff_size);
+
+    size_t dic_size = provider.ConsumeIntegralInRange<size_t>(0, provider.remaining_bytes() / 2);
+    std::string dic_data = provider.ConsumeBytesAsString(dic_size);
+
+    std::string word_to_suggest = provider.ConsumeRemainingBytesAsString();
+    if (word_to_suggest.empty()) {
+        return 0;
+    }
+
+    // Write the affix and dictionary data to temporary files.
+    const char* aff_path = "/tmp/fuzz.aff";
+    const char* dic_path = "/tmp/fuzz.dic";
+
+    std::ofstream aff_file(aff_path, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
+    aff_file.write(aff_data.c_str(), aff_data.length());
+    aff_file.close();
+
+    std::ofstream dic_file(dic_path, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
+    dic_file.write(dic_data.c_str(), dic_data.length());
+    dic_file.close();
+
+    // Create a Hunspell handle using the C API.
+    Hunhandle* handle = Hunspell_create(aff_path, dic_path);
+    if (!handle) {
+        return 0;
+    }
+
+    // The Hunhandle is an opaque pointer to the internal HunspellImpl object.
+    HunspellImpl* hunspell_impl = reinterpret_cast<HunspellImpl*>(handle);
+
+    char** slst = nullptr;
+    // Call the target function directly on the HunspellImpl object.
+    int num_sug = hunspell_impl->suggest(&slst, word_to_suggest.c_str());
+
+    // The caller is responsible for freeing the list.
+    if (num_sug > 0 && slst != nullptr) {
+        // Use the C API function to free the list.
+        Hunspell_free_list(handle, &slst, num_sug);
+    }
+
+    // Destroy the Hunspell handle to prevent memory leaks.
+    Hunspell_destroy(handle);
+
+    return 0;
+}
+	

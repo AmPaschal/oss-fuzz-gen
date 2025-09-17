@@ -1,0 +1,237 @@
+
+	
+<description>
+The PPC_getInstruction function is the main disassembler function for PowerPC architecture in Capstone. It takes a byte sequence, decodes it into a machine instruction (MCInst), and returns whether the decoding was successful. The function handles different PowerPC modes like QPX, SPE, and PS, and deals with both big-endian and little-endian byte orders.
+</description>
+<requirements>
+<requirement>
+The first argument, `csh ud`, must be a valid handle returned by `cs_open`. This handle contains the mode and other settings required for disassembly.
+</requirement>
+<requirement>
+The `code` buffer, the second argument, must point to a memory region of at least 4 bytes. The function reads 4 bytes to decode an instruction, and a smaller buffer will lead to a crash.
+</requirement>
+<requirement>
+The `code_len` argument, the third argument, should be at least 4. This is because the function expects to read a 4-byte instruction from the code buffer.
+</requirement>
+<requirement>
+The `instr` argument, a pointer to `MCInst`, must be initialized. It is used to store the decoded instruction, and its internal fields are accessed.
+</requirement>
+<requirement>
+The `size` argument, a pointer to `uint16_t`, must be a valid pointer. The function writes the size of the decoded instruction to this location.
+</requirement>
+<requirement>
+The `info` argument, a void pointer, is cast to `MCRegisterInfo *`. It must be properly initialized by calling `PPC_init` as part of the `cs_open` process. This is because it contains register mappings used during disassembly.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool PPC_getInstruction(csh, const uint8_t *, size_t, MCInst *, uint16_t *, uint64_t, void *)
+</function_signature>
+<project_name>
+capstone
+</project_name>
+
+	Fuzz target source:
+// This fuzzer is designed to be compiled against two different versions of Capstone.
+// It uses preprocessor directives based on the Capstone API version to select
+// the correct code to compile.
+
+#include <capstone/capstone.h>
+
+// Check the Capstone API version.
+// The target function PPC_getInstruction exists only in the 'next' branch (API >= 6).
+#if CS_API_MAJOR >= 6
+
+//
+// Fuzzer for PPC_getInstruction (Capstone 'next' branch)
+//
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Headers for Capstone internal structures, using relative paths
+// from suite/fuzz/ to the project root.
+#include "../../cs_priv.h"
+#include "../../MCInst.h"
+
+// Header for the function-under-test, using a relative path.
+#include "../../arch/PowerPC/PPCMapping.h"
+
+// Explicitly declare the function under test as required.
+bool PPC_getInstruction(csh, const uint8_t *, size_t, MCInst *, uint16_t *, uint64_t, void *);
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+	if (Size < 2) {
+		// We need at least 1 byte for mode selection and 1 byte for code.
+		return 0;
+	}
+
+	csh handle;
+	cs_err err;
+	cs_mode mode;
+	uint8_t mode_selector = Data[0];
+
+	// Basic modes: Endianness and bit-width
+	mode = (mode_selector & 1) ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN;
+	if (mode_selector & 2) {
+		mode |= CS_MODE_64;
+	}
+
+	// Additional PPC-specific modes to increase coverage
+	if (mode_selector & 4) {
+		mode |= CS_MODE_QPX;
+	}
+	if (mode_selector & 8) {
+		mode |= CS_MODE_SPE;
+	}
+	if (mode_selector & 16) {
+		mode |= CS_MODE_BOOKE;
+	}
+	if (mode_selector & 32) {
+		mode |= CS_MODE_PS;
+	}
+
+	err = cs_open(CS_ARCH_PPC, mode, &handle);
+	if (err != CS_ERR_OK) {
+		return 0;
+	}
+
+	// The 'info' parameter for PPC_getInstruction is the MCRegisterInfo struct,
+	// which is stored inside the handle. We access it by casting the handle
+	// to the internal cs_struct type.
+	cs_struct *ud = (cs_struct *)handle;
+	if (!ud || !ud->MRI) {
+		cs_close(&handle);
+		return 0;
+	}
+	void *info = ud->MRI;
+
+	// The MCInst structure needs to be provided by the caller.
+	MCInst mi;
+	memset(&mi, 0, sizeof(mi));
+	MCInst_Init(&mi, CS_ARCH_PPC);
+	mi.csh = ud;
+
+
+	uint16_t instr_size = 0;
+	uint64_t address = 0x1000;
+	const uint8_t *code = Data + 1;
+	size_t code_size = Size - 1;
+
+	// Call the target function.
+	PPC_getInstruction(handle, code, code_size, &mi, &instr_size, address, info);
+
+	cs_close(&handle);
+
+	return 0;
+}
+
+#else
+
+//
+// Original fuzz_disasm.c for Capstone v5 and older.
+// This block will be compiled for the v5 branch, allowing the build to succeed.
+//
+
+#if defined(_MSC_VER) && _MSC_VER < 1900
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+
+#include "platform.h"
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+
+static FILE *outfile = NULL;
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+    csh handle;
+    cs_insn *all_insn;
+    cs_detail *detail;
+    cs_err err;
+    unsigned int i;
+
+    if (Size < 1) {
+        // 1 byte for arch choice
+        return 0;
+    } else if (Size > 0x1000) {
+        //limit input to 4kb
+        Size = 0x1000;
+    }
+
+    if (outfile == NULL) {
+        // we compute the output
+        outfile = fopen("/dev/null", "w");
+        if (outfile == NULL) {
+            return 0;
+        }
+    }
+
+    i = get_platform_entry((uint8_t)Data[0]);
+
+    err = cs_open(platforms[i].arch, platforms[i].mode, &handle);
+    if (err) {
+        return 0;
+    }
+
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    if (Data[0]&0x80) {
+        //hack
+        cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
+    }
+
+    uint64_t address = 0x1000;
+    size_t count = cs_disasm(handle, Data+1, Size-1, address, 0, &all_insn);
+
+    if (count) {
+        size_t j;
+        unsigned int n;
+
+        for (j = 0; j < count; j++) {
+            cs_insn *i = &(all_insn[j]);
+            fprintf(outfile, "0x%"PRIx64":\t%s\t\t%s // insn-ID: %u, insn-mnem: %s\n",
+                   i->address, i->mnemonic, i->op_str,
+                   i->id, cs_insn_name(handle, i->id));
+
+            detail = i->detail;
+
+            if (detail->regs_read_count > 0) {
+                fprintf(outfile, "\tImplicit registers read: ");
+                for (n = 0; n < detail->regs_read_count; n++) {
+                    fprintf(outfile, "%s ", cs_reg_name(handle, detail->regs_read[n]));
+                }
+            }
+
+            if (detail->regs_write_count > 0) {
+                fprintf(outfile, "\tImplicit registers modified: ");
+                for (n = 0; n < detail->regs_write_count; n++) {
+                    fprintf(outfile, "%s ", cs_reg_name(handle, detail->regs_write[n]));
+                }
+            }
+
+            if (detail->groups_count > 0) {
+                fprintf(outfile, "\tThis instruction belongs to groups: ");
+                for (n = 0; n < detail->groups_count; n++) {
+                    fprintf(outfile, "%s ", cs_group_name(handle, detail->groups[n]));
+                }
+            }
+        }
+
+        fprintf(outfile, "0x%"PRIx64":\n", all_insn[j-1].address + all_insn[j-1].size);
+        cs_free(all_insn, count);
+    }
+
+    cs_close(&handle);
+
+    return 0;
+}
+
+#endif // CS_API_MAJOR >= 6
+	

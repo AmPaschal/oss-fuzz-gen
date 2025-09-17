@@ -1,0 +1,117 @@
+
+	
+<description>
+The function `process_url` is a member of the `HTTPParser` class template. It is called by the `on_url` callback of the underlying `http_parser` library when a URL is parsed from an HTTP request. The function's primary purpose is to delegate the handling of the parsed URL to a `handler_` object, which in this context is an instance of `crow::Connection`. The `process_url` function itself does not perform any complex logic, but its correct execution depends on the state of the `HTTPParser` and the `handler_` object.
+</description>
+<requirements>
+<requirement>
+The `handler_` member of the `HTTPParser` class must be a valid pointer to a `crow::Connection` object. This is because the `process_url` function dereferences this pointer to call the `handle_url` method, and a null or invalid pointer would lead to a crash.
+</requirement>
+<requirement>
+A `crow::Connection` object must be created and passed to the `HTTPParser` constructor. This is to ensure the `handler_` member is properly initialized, as demonstrated by the `HTTPParser`'s constructor which takes a `Handler*` argument.
+</requirement>
+<requirement>
+The `HTTPParser`'s `feed` method must be called with a valid HTTP request buffer before `process_url` is invoked. The `process_url` function is called from within the `on_url` callback, which is triggered by the `http_parser_execute` function inside of `feed`. Without calling `feed` with valid data, `on_url` and therefore `process_url` will not be called.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void crow::HTTPParser<crow::Connection<crow::SocketAdaptor, crow::Crow<>> >::process_url(struct HTTPParser<crow::Connection<crow::SocketAdaptor, crow::Crow<> > > *)
+</function_signature>
+<project_name>
+crow
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdint>
+#include <atomic>
+#include <functional>
+#include <string>
+#include <tuple>
+#include <algorithm>
+#include <memory>
+
+// This is a testing technique to access private members.
+// The Connection class has a private HTTPParser member that we need to access
+// to feed it data directly.
+#define private public
+#include "crow.h"
+#undef private
+
+#include "/src/crow/include/crow/middleware_context.h"
+
+// Define the specific types for clarity
+using Connection = crow::Connection<crow::SocketAdaptor, crow::Crow<>>;
+using HTTPParser = crow::HTTPParser<Connection>;
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size == 0) {
+        return 0;
+    }
+
+    FuzzedDataProvider provider(data, size);
+
+    // Setup dependencies for the Connection object
+    asio::io_context io_context;
+    crow::SimpleApp app;
+
+    // Register a dynamic route that matches any path for the GET method.
+    // This ensures that the router always finds a valid rule,
+    // preventing an early exit from the parsing logic.
+    app.route_dynamic("/<path>")
+        .methods(crow::HTTPMethod::Get)
+        ([](const crow::request&, crow::response& res, std::string /*path*/) {
+            res.code = 200;
+            res.write("fuzz");
+            res.end(); // This is safe, as the sync write will fail gracefully.
+        });
+
+    // The router needs to be validated after adding rules for them to be active.
+    app.validate();
+
+    std::string server_name = "fuzz_server";
+    std::tuple<> middlewares;
+    auto get_date = []() -> std::string { return "date"; };
+    std::function<std::string()> get_date_f = get_date;
+    crow::detail::task_timer task_timer(io_context);
+    std::atomic<unsigned int> queue_length(0);
+
+    // Create the Connection object as a shared_ptr because it uses enable_shared_from_this.
+    // This prevents a std::bad_weak_ptr exception when its methods call shared_from_this().
+    auto conn = std::make_shared<Connection>(
+        io_context,
+        &app,
+        server_name,
+        &middlewares,
+        get_date_f,
+        task_timer,
+        nullptr, // adaptor_ctx_
+        queue_length
+    );
+
+    // Consume the fuzzed data as the URL path part of an HTTP request.
+    std::string fuzzed_url_path = provider.ConsumeRemainingBytesAsString();
+    
+    // Sanitize the URL path to avoid issues with http-parser.
+    fuzzed_url_path.erase(std::remove(fuzzed_url_path.begin(), fuzzed_url_path.end(), '\0'), fuzzed_url_path.end());
+    std::replace(fuzzed_url_path.begin(), fuzzed_url_path.end(), ' ', '_');
+    fuzzed_url_path.erase(std::remove(fuzzed_url_path.begin(), fuzzed_url_path.end(), '\r'), fuzzed_url_path.end());
+    fuzzed_url_path.erase(std::remove(fuzzed_url_path.begin(), fuzzed_url_path.end(), '\n'), fuzzed_url_path.end());
+
+    // Construct a minimal but valid HTTP request. Adding a Host header is important for HTTP/1.1.
+    std::string http_request_str = "GET /" + fuzzed_url_path + " HTTP/1.1\r\nHost: fuzzer\r\n\r\n";
+    
+    // Feed the data to the Connection's *internal* parser.
+    // By using the internal parser, the request state is consistent when the
+    // connection's handler methods are called.
+    conn->parser_.feed(http_request_str.data(), http_request_str.size());
+    
+    // The reference cycle between Connection and Response is broken when res.end()
+    // is called by the handler, so manual cleanup is not needed here.
+
+    return 0;
+}
+	

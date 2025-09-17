@@ -1,0 +1,164 @@
+
+	
+<description>
+`auth_zones_notify` processes a notify message for a given zone. It first finds the corresponding zone transfer information (`auth_xfer`) based on the provided name and class. If a zone is found, it checks if the notification is allowed from the given address. If allowed, it processes the notification, which might involve updating the zone's serial number and initiating a zone transfer. The function returns 1 if the notify is processed and 0 otherwise, setting `*refused` to indicate if the notification was refused due to lack of a matching zone or access control restrictions.
+
+The primary caller of `auth_zones_notify` is the `answer_notify` function in `daemon/worker.c`. In this context, `auth_zones_notify` is part of the server's logic for handling incoming NOTIFY requests from other DNS servers. The arguments passed to `auth_zones_notify` in `answer_notify` are derived from the incoming network packet and the worker's environment. Specifically, the `auth_zones` and `module_env` are part of the worker's state, while the name, class, address, and serial information are extracted from the DNS query packet.
+
+To fuzz `auth_zones_notify` effectively, it is crucial to set up the `auth_zones` and `module_env` structures properly. An `auth_zones` structure should be created using `auth_zones_create()` and populated with at least one `auth_zone` and a corresponding `auth_xfer` so that `auth_xfer_find` can succeed. The `module_env` needs to have its `auth_zones` member pointing to this structure. The other arguments, such as the name, address, and serial number, can be fuzzed to simulate different notify messages.
+</description>
+<requirements>
+<requirement>
+The first argument, `az`, a `struct auth_zones*`, must be initialized by calling `auth_zones_create()`. This is necessary because the function dereferences this pointer to access the lock and find the appropriate zone.
+</requirement>
+<requirement>
+A zone corresponding to the input name `nm` must be added to the `auth_zones` struct `az`. This is required for `auth_xfer_find` to find a matching zone and prevent an early exit.
+</requirement>
+<requirement>
+The `allow_notify` list for the zone transfer must be configured to include the provided address `addr`. This ensures that `az_xfr_allowed_notify` will not refuse the notification, allowing the function to proceed to `xfr_process_notify`.
+</requirement>
+<requirement>
+The second argument, `env`, a `struct module_env*`, must be a valid pointer. The `auth_zones` member of this struct should point to the same `auth_zones` struct as the first argument.
+</requirement>
+<requirement>
+The third argument, `nm`, must be a valid pointer to a buffer representing the zone name. The fourth argument, `nmlen`, must be the length of this buffer.
+</requirement>
+<requirement>
+The sixth argument, `addr`, must be a valid pointer to a `struct sockaddr_storage`. The seventh argument, `addrlen`, must be the length of this structure.
+</requirement>
+<requirement>
+The tenth argument, `refused`, must be a valid pointer to an integer. The function writes to this location to indicate whether the notification was refused.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int auth_zones_notify(struct auth_zones *, struct module_env *, uint8_t *, size_t, uint16_t, struct sockaddr_storage *, socklen_t, int, uint32_t, int *)
+</function_signature>
+<project_name>
+unbound
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <time.h>
+
+#include "util/module.h"
+#include "util/config_file.h"
+#include "util/net_help.h"
+#include "sldns/sbuffer.h"
+#include "sldns/str2wire.h"
+#include "/src/unbound/services/authzone.h"
+
+// A minimal environment setup for the fuzzer.
+static struct module_env*
+get_fuzz_env(void)
+{
+	struct module_env* env = (struct module_env*)calloc(1, sizeof(*env));
+	if(!env) return NULL;
+	env->cfg = config_create();
+	if(!env->cfg) {
+		free(env);
+		return NULL;
+	}
+	// This field is complex to initialize and not strictly needed for the
+	// target function, so we leave it NULL.
+	env->now_tv = NULL;
+	return env;
+}
+
+static void
+free_fuzz_env(struct module_env* env)
+{
+	if(!env) return;
+	config_delete(env->cfg);
+	free(env);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+	// We need at least enough data for the fixed-size parameters
+	// and some for the sockaddr.
+	if (size < sizeof(uint16_t) + sizeof(int) + sizeof(uint32_t) + sizeof(struct sockaddr_in)) {
+		return 0;
+	}
+
+	struct module_env* env = get_fuzz_env();
+	if (!env) {
+		return 0;
+	}
+
+	struct auth_zones* az = auth_zones_create();
+	if (!az) {
+		free_fuzz_env(env);
+		return 0;
+	}
+
+	// Add a zone directly to the auth_zones structure so that auth_xfer_find can find it.
+	const char* zname = "example.com.";
+	uint8_t nm[256];
+	size_t nmlen = sizeof(nm);
+	if (sldns_str2wire_dname_buf(zname, nm, &nmlen) != 0) {
+		auth_zones_delete(az);
+		free_fuzz_env(env);
+		return 0;
+	}
+
+	// Consume data for the class parameter before creating the zone
+	uint16_t dclass = *(const uint16_t*)data;
+	data += sizeof(uint16_t);
+	size -= sizeof(uint16_t);
+
+	// Create the zone directly. This is the correct public API.
+	// This returns a write-locked zone, which we must unlock.
+	lock_rw_wrlock(&az->lock);
+	struct auth_zone* z = auth_zone_create(az, nm, nmlen, dclass);
+	lock_rw_unlock(&az->lock);
+	if (z) {
+		// Unlock the zone itself so the notify function can lock it.
+		lock_basic_unlock(&z->lock);
+	} else {
+		auth_zones_delete(az);
+		free_fuzz_env(env);
+		return 0;
+	}
+
+	// Consume remaining data for the function parameters
+	int has_serial = *(const int*)data;
+	data += sizeof(int);
+	size -= sizeof(int);
+
+	uint32_t serial = *(const uint32_t*)data;
+	data += sizeof(uint32_t);
+	size -= sizeof(uint32_t);
+
+	// Use the rest of the data for the sockaddr
+	struct sockaddr_storage addr;
+	socklen_t addrlen = (socklen_t)(size > sizeof(addr) ? sizeof(addr) : size);
+	memset(&addr, 0, sizeof(addr));
+	memcpy(&addr, data, addrlen);
+
+	// Set family to make it a valid address for some checks
+	if(addrlen >= sizeof(struct sockaddr_in))
+		((struct sockaddr_in*)&addr)->sin_family = AF_INET;
+	if(addrlen >= sizeof(struct sockaddr_in6))
+		((struct sockaddr_in6*)&addr)->sin6_family = AF_INET6;
+
+	int refused = 0;
+
+	// Call the function under test
+	auth_zones_notify(az, env, nm, nmlen, dclass, &addr, addrlen,
+		has_serial, serial, &refused);
+
+	// Cleanup
+	auth_zones_delete(az);
+	free_fuzz_env(env);
+
+	return 0;
+}
+	

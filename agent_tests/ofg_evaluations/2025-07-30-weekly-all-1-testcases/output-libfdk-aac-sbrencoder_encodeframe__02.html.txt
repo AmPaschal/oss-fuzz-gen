@@ -1,0 +1,113 @@
+
+	
+<description>
+The sbrEncoder_EncodeFrame function encodes a frame of SBR data. It takes an SBR encoder handle, PCM audio samples, and output buffers as input. The function iterates through the SBR elements in the handle, encodes the environment data for each element, and then downsamples the audio. The encoded SBR data and the number of bits are stored in the output buffers.
+</description>
+<requirements>
+
+<requirement>
+The sbrEncoder_Open function should be called before sbrEncoder_EncodeFrame. This is because it initializes the HANDLE_SBR_ENCODER handle required by the target function.
+</requirement>
+<requirement>
+The hSbrEncoder->noElements field should be less than or equal to 8. This is to prevent an out-of-bounds access on the sbrDataBits and sbrData arrays, which have a size of 8.
+</requirement>
+<requirement>
+The hSbrEncoder->downsampledOffset and hSbrEncoder->nChannels fields should be initialized such that downsampledOffset / nChannels is a valid offset within the samples buffer. This is to prevent an out-of-bounds access when calculating the pointer to the downsampled audio.
+</requirement>
+<requirement>
+The samples buffer should be large enough to hold the audio data for the current frame. The size should be at least hSbrEncoder->downsampledOffset + (hSbrEncoder->nChannels * frame_size) bytes.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+INT sbrEncoder_EncodeFrame(HANDLE_SBR_ENCODER, INT_PCM *, UINT, UINT *, DW_TAG_array_typeARRAY-SIZE: 256UCHAR *)
+</function_signature>
+<project_name>
+libfdk-aac
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <vector>
+#include <cstdint>
+#include <algorithm>
+
+#include "/src/aac/libSBRenc/include/sbr_encoder.h"
+#include "FDK_audio.h"
+#include "common_fix.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider provider(data, size);
+
+    const INT nElements = 1;
+    INT nChannels = provider.ConsumeIntegralInRange<INT>(1, 2);
+    INT supportPS = provider.ConsumeBool();
+
+    HANDLE_SBR_ENCODER hSbrEncoder = NULL;
+    if (sbrEncoder_Open(&hSbrEncoder, nElements, nChannels, supportPS) != 0) {
+        return 0;
+    }
+
+    SBR_ELEMENT_INFO elInfo[nElements];
+    for (int i = 0; i < nElements; i++) {
+        elInfo[i].elType = provider.PickValueInArray<MP4_ELEMENT_ID>({ID_SCE, ID_CPE});
+        elInfo[i].bitRate = provider.ConsumeIntegral<INT>();
+        elInfo[i].instanceTag = provider.ConsumeIntegral<int>();
+        elInfo[i].fParametricStereo = provider.ConsumeIntegral<UCHAR>();
+        elInfo[i].fDualMono = provider.ConsumeIntegral<UCHAR>();
+        elInfo[i].nChannelsInEl = provider.ConsumeIntegral<UCHAR>();
+        elInfo[i].ChannelIndex[0] = provider.ConsumeIntegral<UCHAR>();
+        elInfo[i].ChannelIndex[1] = provider.ConsumeIntegral<UCHAR>();
+    }
+
+    INT inBufSizeInSamples = sbrEncoder_GetInBufferSize(nChannels);
+    if (inBufSizeInSamples <= 0) {
+        sbrEncoder_Close(&hSbrEncoder);
+        return 0;
+    }
+    std::vector<INT_PCM> inputBuffer(inBufSizeInSamples);
+    UINT inputBufferBufSize = inBufSizeInSamples / nChannels;
+
+    INT coreBandwidth = 0, inputBufferOffset = 0;
+    INT numChannels_out = nChannels;
+    INT sampleRate_out = provider.ConsumeIntegralInRange<INT>(8000, 96000);
+    UINT downSampleFactor_out = 0;
+    INT frameLength_out = 0;
+    int delay_out = 0;
+
+    const UINT syntaxFlags = provider.ConsumeIntegral<UINT>();
+    AUDIO_OBJECT_TYPE aot = provider.PickValueInArray<AUDIO_OBJECT_TYPE>({AOT_SBR, AOT_PS, AOT_AAC_LC});
+    int transformFactor = provider.ConsumeIntegralInRange<int>(1, 8);
+    const int headerPeriod = provider.ConsumeIntegralInRange<int>(-1, 10);
+    ULONG statesInitFlag = provider.ConsumeIntegral<ULONG>();
+
+    if (sbrEncoder_Init(hSbrEncoder, elInfo, nElements, inputBuffer.data(), inputBufferBufSize,
+                         &coreBandwidth, &inputBufferOffset, &numChannels_out, syntaxFlags, &sampleRate_out,
+                         &downSampleFactor_out, &frameLength_out, aot, &delay_out, transformFactor,
+                         headerPeriod, statesInitFlag) != 0) {
+        sbrEncoder_Close(&hSbrEncoder);
+        return 0;
+    }
+
+    size_t consumed = provider.ConsumeData(inputBuffer.data(), inputBuffer.size() * sizeof(INT_PCM));
+    if (consumed == 0 && provider.remaining_bytes() > 0) {
+        // Not enough data to fill even one sample, but there is data left.
+        // To avoid trivial exits, let's at least fill one sample.
+        provider.ConsumeData(inputBuffer.data(), sizeof(INT_PCM));
+    }
+
+    UINT sbrDataBits[8] = {0};
+    UCHAR sbrData[8][MAX_PAYLOAD_SIZE];
+
+    sbrEncoder_EncodeFrame(hSbrEncoder, inputBuffer.data(), inputBufferBufSize, sbrDataBits, sbrData);
+
+    sbrEncoder_UpdateBuffers(hSbrEncoder, inputBuffer.data(), inputBufferBufSize);
+
+    sbrEncoder_Close(&hSbrEncoder);
+
+    return 0;
+}
+	

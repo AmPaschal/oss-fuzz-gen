@@ -1,0 +1,184 @@
+
+	
+<description>
+The function `pjsip_endpt_respond_stateless` sends a stateless response to a received SIP request. It constructs a response message with the provided status code, status text, headers, and body, and sends it to the source of the request. The function is called in various places in the pjsip library to handle requests that cannot be processed statefully, for example, when a request is invalid, a resource is not available, or an error occurs during processing.
+</description>
+<requirements>
+<requirement>
+The `pjsip_endpoint` instance pointed to by `endpt` must be created using `pjsip_endpt_create`. This is because the endpoint contains the necessary configuration and resources for sending and receiving SIP messages.
+</requirement>
+<requirement>
+A transport layer must be initialized for the endpoint. This is because the endpoint needs a transport mechanism, such as UDP, to send the response. This can be done by calling `pjsip_udp_transport_start`.
+</requirement>
+<requirement>
+The `pjsip_rx_data` object pointed to by `rdata` must not be null. This is because it contains the received request data which is necessary for constructing and sending the response.
+</requirement>
+<requirement>
+The `msg_info.msg` member of the `rdata` object must be a valid request message. This is because the function is designed to respond to requests, and it asserts that the message type is `PJSIP_REQUEST_MSG`.
+</requirement>
+<requirement>
+The transaction associated with `rdata` must be in a terminated state. This is because if a transaction exists and is not terminated, the response should be sent statefully using that transaction, not statelessly.
+</requirement>
+<requirement>
+The `st_code` argument should be a valid SIP status code. Callers of this function use a wide range of status codes to indicate the result of processing the request.
+</requirement>
+<requirement>
+The `st_text` argument, if not NULL, should point to a valid `pj_str_t` object. This string is used as the reason phrase in the status line of the response.
+</requirement>
+<requirement>
+The `hdr_list` argument, if not NULL, should be a valid list of `pjsip_hdr` objects. These headers are added to the response message.
+</requirement>
+<requirement>
+The `body` argument, if not NULL, should point to a valid `pjsip_msg_body` object. This is because the body is cloned and added to the response message.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+pj_status_t pjsip_endpt_respond_stateless(pjsip_endpoint *, pjsip_rx_data *, int, const pj_str_t *, const pjsip_hdr *, const pjsip_msg_body *)
+</function_signature>
+<project_name>
+pjsip
+</project_name>
+
+	Fuzz target source:
+#include <pjsip.h>
+#include <pjlib.h>
+#include <pjlib-util.h>
+#include <pjsip_ua.h>
+#include <pjsip/sip_transport_udp.h>
+#include "/src/pjsip/pjsip/include/pjsip/sip_util.h"
+
+#define kMinInputLength 16
+#define kMaxInputLength 4096
+
+static pj_caching_pool cp;
+static pjsip_endpoint *sip_endpt = NULL;
+static pjsip_transport *udp_transport = NULL;
+
+/*
+ * This callback is required when initializing the UA layer, but it
+ * will not be used in this fuzz target.
+ */
+static pj_bool_t on_rx_request(pjsip_rx_data *rdata) {
+    (void)rdata;
+    return PJ_TRUE;
+}
+
+static pjsip_module mod_fuzzer = {
+    NULL, NULL,
+    { "mod-fuzzer", 10 },
+    -1,
+    PJSIP_MOD_PRIORITY_APPLICATION,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    &on_rx_request,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+};
+
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+    PJ_UNUSED_ARG(argc);
+    PJ_UNUSED_ARG(argv);
+
+    pj_status_t status;
+
+    status = pj_init();
+    if (status != PJ_SUCCESS) return 1;
+
+    status = pjlib_util_init();
+    if (status != PJ_SUCCESS) return 1;
+
+    pj_caching_pool_init(&cp, &pj_pool_factory_default_policy, 0);
+
+    status = pjsip_endpt_create(&cp.factory, "fuzzer", &sip_endpt);
+    if (status != PJ_SUCCESS) return 1;
+
+    status = pjsip_tsx_layer_init_module(sip_endpt);
+    if (status != PJ_SUCCESS) return 1;
+
+    status = pjsip_ua_init_module(sip_endpt, NULL);
+    if (status != PJ_SUCCESS) return 1;
+
+    pj_sockaddr_in addr;
+    pj_bzero(&addr, sizeof(addr));
+    addr.sin_family = pj_AF_INET();
+    addr.sin_addr.s_addr = 0;
+    addr.sin_port = pj_htons(0); // Ephemeral port
+
+    status = pjsip_udp_transport_start(sip_endpt, &addr, NULL, 1, &udp_transport);
+    if (status != PJ_SUCCESS) {
+        pjsip_endpt_destroy(sip_endpt);
+        sip_endpt = NULL;
+        return 1;
+    }
+
+    status = pjsip_endpt_register_module(sip_endpt, &mod_fuzzer);
+    if (status != PJ_SUCCESS) {
+        pjsip_endpt_destroy(sip_endpt);
+        sip_endpt = NULL;
+        return 1;
+    }
+
+    pj_log_set_level(0);
+
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    if (size < kMinInputLength || size > kMaxInputLength || !sip_endpt) {
+        return 0;
+    }
+
+    pj_pool_t *pool = pj_pool_create(&cp.factory, "fuzz-pool", 1024, 1024, NULL);
+    if (!pool) {
+        return 0;
+    }
+
+    char *data_copy = (char *)pj_pool_alloc(pool, size + 1);
+    pj_memcpy(data_copy, data, size);
+    data_copy[size] = '\0';
+
+    pjsip_msg *msg = pjsip_parse_msg(pool, data_copy, size, NULL);
+    if (!msg) {
+        pj_pool_release(pool);
+        return 0;
+    }
+
+    if (msg->type != PJSIP_REQUEST_MSG) {
+        pj_pool_release(pool);
+        return 0;
+    }
+
+    pjsip_rx_data *rdata = PJ_POOL_ZALLOC_T(pool, pjsip_rx_data);
+    rdata->tp_info.transport = udp_transport;
+    rdata->tp_info.pool = pool;
+
+    pj_sockaddr_in *src_addr = (pj_sockaddr_in *)&rdata->pkt_info.src_addr;
+    pj_bzero(src_addr, sizeof(*src_addr));
+    src_addr->sin_family = pj_AF_INET();
+    src_addr->sin_port = pj_htons(5060);
+    
+    pj_str_t ip_addr_str = pj_str("127.0.0.1");
+    pj_inet_pton(pj_AF_INET(), &ip_addr_str, &src_addr->sin_addr);
+
+    rdata->pkt_info.src_addr_len = sizeof(*src_addr);
+
+    rdata->msg_info.msg = msg;
+    rdata->msg_info.len = size;
+    rdata->msg_info.msg_buf = data_copy;
+
+    int st_code = 100 + (data[0] % 600);
+
+    pjsip_endpt_respond_stateless(sip_endpt, rdata, st_code, NULL, NULL, NULL);
+
+    pj_pool_release(pool);
+
+    return 0;
+}
+	

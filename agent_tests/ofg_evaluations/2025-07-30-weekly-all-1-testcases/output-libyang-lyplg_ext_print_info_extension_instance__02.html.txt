@@ -1,0 +1,157 @@
+
+	
+<description>
+The `lyplg_ext_print_info_extension_instance` function is a core component of the libyang schema printing functionality. It is responsible for printing the compiled representation of YANG extension instances in the "info" format. The function takes a printer context (`lyspr_ctx`), a compiled extension instance (`lysc_ext_instance`), and a boolean flag as input. It iterates through the substatements of the extension instance and, based on the type of each substatement, calls the appropriate printing helper function (e.g., `yprc_node`, `ypr_substmt`, `yprc_type`). This process recursively prints the content of the extension instance, adhering to the specified output format and indentation. The callers of this function are other printer functions within libyang, which delegate the printing of extension-specific information to this centralized handler. To fuzz this function effectively, it is crucial to provide valid, well-formed input structures that reflect the complex relationships between schema nodes, extension definitions, and their compiled instances.
+</description>
+<requirements>
+
+<requirement>
+The `ctx` argument must be a valid pointer to a `struct lyspr_ctx` with initialized `out` and `module` members. This is because the function casts `ctx` and accesses `pctx->out` and `pctx->module->ctx`, which would otherwise lead to null pointer dereferences.
+</requirement>
+<requirement>
+The `ext` argument must be a valid pointer to a `struct lysc_ext_instance`. A null pointer would cause a crash when accessing `ext->substmts`.
+</requirement>
+<requirement>
+The `ext->substmts` field must be a valid sized array. The `LY_ARRAY_FOR` macro iterates through this array, and a null or invalid value would lead to a crash.
+</requirement>
+<requirement>
+For each element in the `ext->substmts` array, if the `stmt` value corresponds to a case that dereferences `storage_p`, then `storage_p` must be a valid pointer to a value of the correct type. Failure to do so will result in a null pointer dereference or type confusion.
+</requirement>
+<requirement>
+The `flag` argument must be a valid pointer to a `ly_bool`. This is because it is dereferenced and used to track the printer state within the function and its callees.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void lyplg_ext_print_info_extension_instance(struct lyspr_ctx *, const struct lysc_ext_instance *, ly_bool *)
+</function_signature>
+<project_name>
+libyang
+</project_name>
+
+	Fuzz target source:
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include "libyang.h"
+#include "/src/libyang/src/plugins_exts.h"
+#include "/src/libyang/src/printer_internal.h"
+
+/* forward declaration */
+void lyplg_ext_print_info_extension_instance(struct lyspr_ctx *, const struct lysc_ext_instance *, ly_bool *);
+
+/**
+ * @brief Recursively find and process extensions in a schema node and its descendants.
+ *
+ * @param[in] node The starting schema node.
+ * @param[in] pctx The printer context.
+ */
+static void
+process_node_extensions(const struct lysc_node *node, struct lyspr_ctx *pctx)
+{
+    const struct lysc_node *elem;
+
+    if (!node) {
+        return;
+    }
+
+    /* iterate over siblings */
+    for (elem = node; elem; elem = elem->next) {
+        /* process extensions on the node */
+        if (elem->exts) {
+            LY_ARRAY_COUNT_TYPE i;
+            ly_bool flag = 0;
+            LY_ARRAY_FOR(elem->exts, i) {
+                lyplg_ext_print_info_extension_instance(pctx, &elem->exts[i], &flag);
+            }
+        }
+
+        /* process children */
+        process_node_extensions(lysc_node_child(elem), pctx);
+    }
+}
+
+int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    struct ly_ctx *ctx = NULL;
+    struct lys_module *mod = NULL;
+    char *schema = NULL;
+    struct ly_out *out = NULL;
+    FILE *f = NULL;
+    static bool log = false;
+
+    if (!log) {
+        ly_log_options(0);
+        log = true;
+    }
+
+    if (ly_ctx_new(NULL, 0, &ctx) != LY_SUCCESS) {
+        return 0;
+    }
+
+    /* provide a module with an extension definition so the fuzzer can instantiate it */
+    const char *ext_mod_str = "module my-ext-def { namespace urn:ext; prefix e; extension my-ext; }";
+    if (lys_parse_mem(ctx, ext_mod_str, LYS_IN_YANG, NULL) != LY_SUCCESS) {
+        /* should not happen */
+        ly_ctx_destroy(ctx);
+        return 0;
+    }
+
+    schema = malloc(size + 1);
+    if (!schema) {
+        goto cleanup;
+    }
+    memcpy(schema, data, size);
+    schema[size] = '\0';
+
+    /* parse the fuzzed schema, which may or may not use the pre-loaded extension */
+    if (lys_parse_mem(ctx, schema, LYS_IN_YANG, &mod) != LY_SUCCESS) {
+        goto cleanup;
+    }
+
+    if (mod && mod->compiled) {
+        f = fopen("/dev/null", "w");
+        if (!f) {
+            goto cleanup;
+        }
+        if (ly_out_new_file(f, &out) != LY_SUCCESS) {
+            fclose(f);
+            goto cleanup;
+        }
+
+        struct lyspr_ctx pctx = {
+            .out = out,
+            .level = 0,
+            .flags = 0,
+            .options = 0,
+            .module = mod->compiled
+        };
+
+        /* process top-level extensions in the module */
+        if (mod->compiled->exts) {
+            LY_ARRAY_COUNT_TYPE i;
+            ly_bool flag = 0;
+            LY_ARRAY_FOR(mod->compiled->exts, i) {
+                lyplg_ext_print_info_extension_instance(&pctx, &mod->compiled->exts[i], &flag);
+            }
+        }
+
+        /* process extensions in the schema nodes */
+        process_node_extensions(lysc_node_child(mod->compiled), &pctx);
+
+        ly_out_free(out, NULL, 0);
+        fclose(f);
+    }
+
+cleanup:
+    free(schema);
+    ly_ctx_destroy(ctx);
+    return 0;
+}
+	

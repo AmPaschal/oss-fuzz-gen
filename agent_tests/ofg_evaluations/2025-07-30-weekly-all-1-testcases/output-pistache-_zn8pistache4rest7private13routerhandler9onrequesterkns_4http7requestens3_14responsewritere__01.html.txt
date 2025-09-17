@@ -1,0 +1,253 @@
+
+	
+<description>
+The `Pistache::Rest::Private::RouterHandler::onRequest` function is the main entry point for handling incoming HTTP requests. It receives a request and a response writer, and its primary responsibility is to delegate the request to the underlying router. The router then matches the request's method and resource path against its registered routes and invokes the corresponding handler.
+</description>
+<requirements>
+
+<requirement>
+A `Pistache::Rest::Router` object must be created and initialized with at least one route. This is because the `onRequest` function calls the `router->route()` method, which will fail to find a handler if no routes are registered.
+</requirement>
+<requirement>
+The `req` argument, which is a `const Pistache::Http::Request&`, must have its method and resource path set to match one of the routes registered in the `Router` object. This ensures that the routing logic can find and execute a handler, allowing for deeper code coverage.
+</requirement>
+<requirement>
+A `Pistache::Http::ResponseWriter` object must be provided. This object is moved to the `router->route` method and is used by the matched route handler to send a response to the client.
+</requirement>
+<requirement>
+A handler function of type `Pistache::Rest::Route::Handler` must be provided for each registered route. This handler is a `std::function` that will be invoked by the router when a request matches the route. A simple lambda that returns `Pistache::Rest::Route::Result::Ok` can be used for this purpose.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Rest::Private::RouterHandler::onRequest(const Request &, ResponseWriter)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <pistache/async.h>
+#include <pistache/http.h>
+#include <pistache/router.h>
+#include <pistache/timer_pool.h>
+
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <list>
+#include <memory>
+#include <sstream>
+
+using namespace Pistache;
+
+template <class F> void ignoreExceptions(const F &func) {
+  try {
+    func();
+  } catch (...) {
+  }
+}
+
+template <class T> void parseHttpHeader(const std::string &input) {
+  T header;
+  ignoreExceptions([&] { header.parse(input); });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+template <>
+void parseHttpHeader<Pistache::Http::Header::Authorization>(
+    const std::string &input) {
+  Pistache::Http::Header::Authorization header;
+  ignoreExceptions([&] { header.parse(input); });
+  ignoreExceptions([&] { header.getMethod(); });
+  ignoreExceptions([&] {
+    const auto user = header.getBasicUser();
+    const auto password = header.getBasicPassword();
+    header.setBasicUserPassword(user, password);
+  });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+void fuzz_headers(const std::string &input) {
+  parseHttpHeader<Pistache::Http::Header::Accept>(input);
+  parseHttpHeader<Pistache::Http::Header::CacheControl>(input);
+  parseHttpHeader<Pistache::Http::Header::Connection>(input);
+  parseHttpHeader<Pistache::Http::Header::AcceptEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentLength>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentType>(input);
+  parseHttpHeader<Pistache::Http::Header::Authorization>(input);
+  parseHttpHeader<Pistache::Http::Header::Date>(input);
+  parseHttpHeader<Pistache::Http::Header::Expect>(input);
+  parseHttpHeader<Pistache::Http::Header::Host>(input);
+  parseHttpHeader<Pistache::Http::Header::Server>(input);
+}
+
+void fuzz_cookies(const std::string &input) {
+  Pistache::Http::CookieJar cookie_jar;
+  ignoreExceptions([&] { Pistache::Http::Cookie::fromString(input); });
+  ignoreExceptions([&] { cookie_jar.addFromRaw(input.data(), input.size()); });
+}
+
+void fuzz_request_parser(const std::string &input) {
+  constexpr size_t maxDataSize = 4096;
+  Pistache::Http::RequestParser rparser(maxDataSize);
+
+  if (rparser.feed(input.data(), input.size())) {
+    auto state = Pistache::Http::Private::State::Done;
+    ignoreExceptions([&] { state = rparser.parse(); });
+
+    if (state == Pistache::Http::Private::State::Again)
+      ignoreExceptions([&] { rparser.parse(); });
+  }
+}
+
+void fuzz_router(const std::string &input) {
+  std::string path_input;
+  std::stringstream input_stream(input);
+  Pistache::Rest::SegmentTreeNode tree;
+
+  while (std::getline(input_stream, path_input, '\n')) {
+    if (path_input.size() < 2)
+      continue;
+
+    const int test_case = path_input.back();
+    path_input.pop_back();
+
+    const auto sanitized =
+        Pistache::Rest::SegmentTreeNode::sanitizeResource(path_input);
+    std::shared_ptr<char> ptr(new char[sanitized.length()],
+                              std::default_delete<char[]>());
+    memcpy(ptr.get(), sanitized.data(), sanitized.length());
+    const std::string_view path{ptr.get(), sanitized.length()};
+
+    switch (test_case) {
+    case 'A':
+      ignoreExceptions([&] {
+        Pistache::Rest::Route::Handler handler = [](auto...) {
+          return Pistache::Rest::Route::Result::Ok;
+        };
+        std::shared_ptr<char> ptr(new char[sanitized.length()],
+                                  std::default_delete<char[]>());
+        memcpy(ptr.get(), sanitized.data(), sanitized.length());
+        const std::string_view path{ptr.get(), sanitized.length()};
+        tree.addRoute(path, handler, ptr);
+      });
+      break;
+    case 'R':
+      ignoreExceptions([&] { tree.removeRoute(path); });
+      break;
+    case 'F':
+      ignoreExceptions([&] { tree.findRoute(path); });
+      break;
+    }
+  }
+}
+
+void fuzz_other(const std::string &input) {
+  // URI parsing
+  Http::Uri::Query query1;
+  query1.add(input, input);
+}
+
+void fuzz_router_handler(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  Rest::Router router;
+  std::list<std::shared_ptr<char>> path_storage;
+
+  int num_routes = provider.ConsumeIntegralInRange<int>(0, 5);
+  for (int i = 0; i < num_routes; ++i) {
+    std::string path_str = provider.ConsumeRandomLengthString(50);
+    if (path_str.empty() || path_str[0] != '/') {
+      path_str = "/" + path_str;
+    }
+
+    const auto sanitized = Rest::SegmentTreeNode::sanitizeResource(path_str);
+    if (sanitized.empty())
+      continue;
+
+    std::shared_ptr<char> ptr(new char[sanitized.length()],
+                              std::default_delete<char[]>());
+    memcpy(ptr.get(), sanitized.data(), sanitized.length());
+    path_storage.push_back(ptr);
+    const std::string_view path_view{ptr.get(), sanitized.length()};
+
+    auto handler = [](const Rest::Request &, Http::ResponseWriter response) {
+      response.send(Http::Code::Ok);
+      return Rest::Route::Result::Ok;
+    };
+
+    auto method = provider.PickValueInArray<Http::Method>({
+        Http::Method::Get,
+        Http::Method::Post,
+        Http::Method::Put,
+        Http::Method::Delete,
+    });
+    router.addRoute(method, std::string(path_view), handler);
+  }
+
+  std::shared_ptr<Http::Handler> handler = router.handler();
+
+  std::string method_str =
+      provider.PickValueInArray<std::string>({"GET", "POST", "PUT", "DELETE"});
+  std::string path_str = provider.ConsumeRandomLengthString(100);
+  if (path_str.empty() || path_str[0] != '/') {
+    path_str = "/" + path_str;
+  }
+  std::string request_body = provider.ConsumeRemainingBytesAsString();
+  std::string request_str = method_str + " " + path_str +
+                            " HTTP/1.1\r\nHost: fuzzer\r\n\r\n" + request_body;
+
+  constexpr size_t maxDataSize = 8192;
+  Http::RequestParser parser(maxDataSize);
+  parser.feed(request_str.data(), request_str.size());
+  ignoreExceptions([&] { parser.parse(); });
+
+  Http::Request request_obj(std::move(parser.request));
+  auto req_ptr = std::make_shared<Http::Request>(std::move(request_obj));
+
+  Http::ResponseWriter response(Http::Version::Http11, nullptr, nullptr,
+                                std::weak_ptr<Tcp::Peer>());
+
+  ignoreExceptions([&] { handler->onRequest(*req_ptr, std::move(response)); });
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1)
+    return 0;
+
+  const uint8_t type = data[0];
+  const std::string input_str(reinterpret_cast<const char *>(data + 1),
+                              size - 1);
+
+  switch (type % 6) {
+  case 0:
+    fuzz_headers(input_str);
+    break;
+  case 1:
+    fuzz_cookies(input_str);
+    break;
+  case 2:
+    fuzz_request_parser(input_str);
+    break;
+  case 3:
+    fuzz_router(input_str);
+    break;
+  case 4:
+    fuzz_other(input_str);
+    break;
+  case 5:
+    fuzz_router_handler(data + 1, size - 1);
+    break;
+  }
+
+  return 0;
+}
+	

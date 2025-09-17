@@ -1,0 +1,154 @@
+
+	
+<description>
+The X509_verify_cert function verifies a certificate. It takes a pointer to an X509_STORE_CTX structure which contains the certificate to be verified, as well as various options to control the verification process. The function builds and verifies a certificate chain, checks for revocation, and enforces name constraints and other policies. The result of the verification is returned as an integer, with 1 indicating success and 0 indicating failure. The details of any error are stored in the X509_STORE_CTX structure.
+</description>
+<requirements>
+
+<requirement>
+The `cert` member of the `X509_STORE_CTX` structure must not be NULL. This is because it is the certificate to be verified, and a NULL value will result in an X509_V_ERR_INVALID_CALL error.
+</requirement>
+<requirement>
+The `chain` member of the `X509_STORE_CTX` structure must be NULL when calling `X509_verify_cert`. This is because the function allocates and builds the certificate chain, and a non-NULL value indicates that the context has already been used.
+</requirement>
+<requirement>
+The `param->flags` member of the `X509_STORE_CTX` structure should not have the `X509_V_FLAG_EXTENDED_CRL_SUPPORT` or `X509_V_FLAG_USE_DELTAS` flags set. These flags correspond to unsupported CRL features and will cause the function to fail with an X509_V_ERR_INVALID_CALL error.
+</requirement>
+<requirement>
+The `untrusted` member of the `X509_STORE_CTX` structure can be a stack of untrusted certificates. These certificates are used to help build the certificate chain.
+</requirement>
+<requirement>
+The `trusted_stack` member of the `X509_STORE_CTX` can be used to provide a stack of trusted certificates. If this member is not NULL, it will be used instead of the X509_STORE for finding the issuer.
+</requirement>
+<requirement>
+The `crls` member of the `X509_STORE_CTX` can be a stack of CRLs. If the `X509_V_FLAG_CRL_CHECK` flag is set, these CRLs will be used to check if the certificate has been revoked.
+</requirement>
+<requirement>
+The `verify_cb` member of the `X509_STORE_CTX` is a callback function that can be used to customize the verification process. If not set, a default callback is used.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int X509_verify_cert(X509_STORE_CTX *)
+</function_signature>
+<project_name>
+boringssl
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/stack.h>
+#include <vector>
+
+#include "../crypto/internal.h"
+
+namespace {
+
+// A helper function to parse a stack of X509 certificates from fuzzed data.
+bssl::UniquePtr<STACK_OF(X509)> ParseX509Stack(FuzzedDataProvider *provider) {
+  bssl::UniquePtr<STACK_OF(X509)> stack(sk_X509_new_null());
+  if (!stack) {
+    return nullptr;
+  }
+
+  size_t num_certs = provider->ConsumeIntegralInRange<size_t>(0, 5);
+  for (size_t i = 0; i < num_certs; ++i) {
+    const std::vector<uint8_t> cert_der =
+        provider->ConsumeBytes<uint8_t>(provider->ConsumeIntegralInRange<size_t>(0, 2048));
+    if (cert_der.empty()) {
+      continue;
+    }
+    const uint8_t *ptr = cert_der.data();
+    bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &ptr, cert_der.size()));
+    if (cert && sk_X509_push(stack.get(), cert.get())) {
+      // The stack takes ownership.
+      (void)cert.release();
+    }
+  }
+  return stack;
+}
+
+// A helper function to parse a stack of X509 CRLs from fuzzed data.
+bssl::UniquePtr<STACK_OF(X509_CRL)> ParseCRLStack(FuzzedDataProvider *provider) {
+  bssl::UniquePtr<STACK_OF(X509_CRL)> stack(sk_X509_CRL_new_null());
+  if (!stack) {
+    return nullptr;
+  }
+  size_t num_crls = provider->ConsumeIntegralInRange<size_t>(0, 5);
+  for (size_t i = 0; i < num_crls; ++i) {
+    const std::vector<uint8_t> crl_der =
+        provider->ConsumeBytes<uint8_t>(provider->ConsumeIntegralInRange<size_t>(0, 2048));
+    if (crl_der.empty()) {
+      continue;
+    }
+    const uint8_t *ptr = crl_der.data();
+    bssl::UniquePtr<X509_CRL> crl(d2i_X509_CRL(nullptr, &ptr, crl_der.size()));
+    if (crl && sk_X509_CRL_push(stack.get(), crl.get())) {
+      // The stack takes ownership.
+      (void)crl.release();
+    }
+  }
+  return stack;
+}
+
+} // namespace
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Create the certificate to be verified. This is a required parameter.
+  const std::vector<uint8_t> cert_der =
+      provider.ConsumeBytes<uint8_t>(provider.ConsumeIntegralInRange<size_t>(1, 2048));
+  if (cert_der.empty()) {
+    return 0;
+  }
+  const uint8_t *cert_ptr = cert_der.data();
+  bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &cert_ptr, cert_der.size()));
+  if (!cert) {
+    return 0;
+  }
+
+  // Create stacks of untrusted certs, trusted certs, and CRLs.
+  bssl::UniquePtr<STACK_OF(X509)> untrusted = ParseX509Stack(&provider);
+  bssl::UniquePtr<STACK_OF(X509)> trusted_stack = ParseX509Stack(&provider);
+  bssl::UniquePtr<STACK_OF(X509_CRL)> crls = ParseCRLStack(&provider);
+
+  bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+  bssl::UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  if (!store || !ctx) {
+    return 0;
+  }
+
+  // Initialize the context. This sets the cert and untrusted certs.
+  // The `chain` member will be NULL, as required.
+  if (!X509_STORE_CTX_init(ctx.get(), store.get(), cert.get(), untrusted.get())) {
+    return 0;
+  }
+
+  // Set optional fields on the context.
+  if (trusted_stack) {
+    X509_STORE_CTX_set0_trusted_stack(ctx.get(), trusted_stack.release());
+  }
+  if (crls) {
+    X509_STORE_CTX_set0_crls(ctx.get(), crls.release());
+  }
+
+  // Fuzz verification parameters.
+  X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx.get());
+  unsigned long flags = provider.ConsumeIntegral<unsigned long>();
+  // These flags are not supported and cause instant failure.
+  flags &= ~X509_V_FLAG_EXTENDED_CRL_SUPPORT;
+  flags &= ~X509_V_FLAG_USE_DELTAS;
+  X509_VERIFY_PARAM_set_flags(param, flags);
+
+  X509_verify_cert(ctx.get());
+
+  return 0;
+}
+	

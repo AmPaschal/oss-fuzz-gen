@@ -1,0 +1,163 @@
+
+	
+<description>
+The function `Pistache::Tcp::Transport::onReady` is a central component of the Pistache network library's event loop. It's responsible for handling I/O events on a set of file descriptors. The function takes a reference to an `Aio::FdSet` object, which contains a collection of events that have occurred on file descriptors monitored by the reactor. For each event, `onReady` determines the type of event by examining its associated tag and whether the file descriptor is readable or writable. Based on this, it dispatches the event to the appropriate handler. These handlers manage different aspects of the transport layer, such as writing data to sockets, processing timers, handling peer connections, and responding to notifications.
+</description>
+<requirements>
+
+<requirement>
+The `fds` argument, an `Aio::FdSet` object, must be initialized with a `std::vector<Polling::Event>`. This is because the `FdSet` is a wrapper around this vector, and the function iterates through its elements to process I/O events.
+</requirement>
+<requirement>
+Each `Polling::Event` in the `fds` vector should be initialized with a `tag` and `flags`. The tag identifies the source of the event, and the flags indicate the type of I/O readiness (e.g., readable, writable).
+</requirement>
+<requirement>
+The `Transport` object must have its peer-related data structures initialized. The function calls `isPeerFd` and `getPeer`, which will lead to crashes if the peer cannot be found for a given tag.
+</requirement>
+<requirement>
+The `Transport` object must have its timer-related data structures initialized. The function calls `isTimerFd` and then attempts to find the timer in the `timers` map, which will cause a crash if the timer does not exist.
+</requirement>
+<requirement>
+The `writesQueue`, `timersQueue`, `peersQueue`, and `notifier` member variables of the `Transport` class should be initialized. The function accesses these queues based on the event tags, and they must be in a valid state to be used.
+</requirement>
+<requirement>
+If an event is marked as writable, the corresponding file descriptor should exist in the `toWrite` map. The function checks this map to determine if there is data to write, and an inconsistent state could lead to unexpected behavior.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Tcp::Transport::onReady(const FdSet &)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <pistache/http.h>
+#include <pistache/router.h>
+#include <fuzzer/FuzzedDataProvider.h>
+
+using namespace Pistache;
+
+template <class F> void ignoreExceptions(const F &func) {
+  try {
+    func();
+  } catch (...) {
+  }
+}
+
+template <class T> void parseHttpHeader(const std::string &input) {
+  T header;
+  ignoreExceptions([&] { header.parse(input); });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+template <> void parseHttpHeader<Pistache::Http::Header::Authorization>(const std::string &input) {
+  Pistache::Http::Header::Authorization header;
+  ignoreExceptions([&] { header.parse(input); });
+  ignoreExceptions([&] { header.getMethod(); });
+  ignoreExceptions([&] {
+    const auto user = header.getBasicUser();
+    const auto password = header.getBasicPassword();
+    header.setBasicUserPassword(user, password);
+  });
+
+  std::stringstream oss;
+  header.write(oss);
+}
+
+void fuzz_headers(const std::string &input) {
+  parseHttpHeader<Pistache::Http::Header::Accept>(input);
+  parseHttpHeader<Pistache::Http::Header::CacheControl>(input);
+  parseHttpHeader<Pistache::Http::Header::Connection>(input);
+  parseHttpHeader<Pistache::Http::Header::AcceptEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentEncoding>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentLength>(input);
+  parseHttpHeader<Pistache::Http::Header::ContentType>(input);
+  parseHttpHeader<Pistache::Http::Header::Authorization>(input);
+  parseHttpHeader<Pistache::Http::Header::Date>(input);
+  parseHttpHeader<Pistache::Http::Header::Expect>(input);
+  parseHttpHeader<Pistache::Http::Header::Host>(input);
+  parseHttpHeader<Pistache::Http::Header::Server>(input);
+}
+
+void fuzz_cookies(const std::string &input) {
+  Pistache::Http::CookieJar cookie_jar;
+  ignoreExceptions([&] { Pistache::Http::Cookie::fromString(input); });
+  ignoreExceptions([&] { cookie_jar.addFromRaw(input.data(), input.size()); });
+}
+
+void fuzz_request_parser(const std::string &input) {
+  constexpr size_t maxDataSize = 4096;
+  Pistache::Http::RequestParser rparser(maxDataSize);
+
+  if (rparser.feed(input.data(), input.size())) {
+    auto state = Pistache::Http::Private::State::Done;
+    ignoreExceptions([&] { state = rparser.parse(); });
+
+    if (state == Pistache::Http::Private::State::Again)
+      ignoreExceptions([&] { rparser.parse(); });
+  }
+}
+
+void fuzz_router(FuzzedDataProvider& stream) {
+    Pistache::Rest::SegmentTreeNode tree;
+    
+    // Add some routes to make removal more interesting
+    ignoreExceptions([&] {
+        Pistache::Rest::Route::Handler handler = [](auto...) { return Pistache::Rest::Route::Result::Ok; };
+        tree.addRoute("/a/b/c", handler, nullptr);
+        tree.addRoute("/a/b/:d", handler, nullptr);
+        tree.addRoute("/a/:e/f", handler, nullptr);
+    });
+
+    // Fuzz the removeRoute function
+    std::string path_to_remove = stream.ConsumeRemainingBytesAsString();
+    const std::string_view path_view(path_to_remove);
+    ignoreExceptions([&] { tree.removeRoute(path_view); });
+}
+
+void fuzz_other(const std::string &input) {
+  // URI parsing
+  Http::Uri::Query query1;
+  query1.add(input, input);
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (size < 1)
+    return -1;
+
+  FuzzedDataProvider stream(data, size);
+  const uint8_t type = stream.ConsumeIntegral<uint8_t>();
+  const std::string input = stream.ConsumeRemainingBytesAsString();
+  
+  // Re-initialize a stream for functions that need it
+  FuzzedDataProvider stream2(reinterpret_cast<const uint8_t*>(input.data()), input.size());
+
+  switch (type % 5) {
+  case 0:
+    fuzz_headers(input);
+    break;
+  case 1:
+    fuzz_cookies(input);
+    break;
+  case 2:
+    fuzz_request_parser(input);
+    break;
+  case 3:
+    // This case now specifically fuzzes removeRoute
+    fuzz_router(stream2);
+    break;
+  case 4:
+    fuzz_other(input);
+    break;
+  }
+
+  return 0;
+}
+	

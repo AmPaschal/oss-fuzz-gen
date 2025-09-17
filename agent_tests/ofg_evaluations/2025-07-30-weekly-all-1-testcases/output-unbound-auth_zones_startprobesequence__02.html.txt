@@ -1,0 +1,106 @@
+
+	
+<description>
+The function `auth_zones_startprobesequence` initiates a probe sequence for a given domain name within the authentication zones. It first finds the corresponding authentication transfer information (`auth_xfer`) using the domain name `nm`, its length `nmlen`, and the class `dclass`. If found, it locks the transfer structure and calls `xfr_process_notify` to start the process. The function is called from `do_auth_zone_transfer` which is a remote control command handler. The arguments `nm` and `nmlen` are parsed from a string argument to the command. The class is always `LDNS_RR_CLASS_IN`.
+</description>
+<requirements>
+
+<requirement>
+The `az` argument, a pointer to a `struct auth_zones`, must be properly initialized and contain at least one `auth_xfer` entry. The function `auth_zone_create` can be used to populate the `auth_zones` structure, which is necessary for `auth_xfer_find` to succeed and allow the target function to proceed.
+</requirement>
+<requirement>
+The `nm` argument must be a valid wire-format domain name. This is a precondition for the `dname_count_labels` function, which is called by `auth_xfer_find`.
+</requirement>
+<requirement>
+The `nmlen` argument must be the correct length of the `nm` domain name. An incorrect length could lead to out-of-bounds memory access within `auth_xfer_find` or its subroutines.
+</requirement>
+<requirement>
+The `dclass` argument should be set to `LDNS_RR_CLASS_IN`, which has a value of 1. This is the only value used by the function's sole caller, `do_auth_zone_transfer`.
+</requirement>
+<requirement>
+The `env` argument must be a valid pointer to a `struct module_env`. This structure is passed to `xfr_process_notify` and is likely to be dereferenced within that function.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int auth_zones_startprobesequence(struct auth_zones* az, struct module_env* env, uint8_t* nm, size_t nmlen, uint16_t dclass)
+</function_signature>
+<project_name>
+unbound
+</project_name>
+
+	Fuzz target source:
+#include "config.h"
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+#include "util/module.h"
+#include "util/config_file.h"
+#include "util/log.h"
+#include "util/locks.h"
+#include "/src/unbound/services/authzone.h"
+
+// Forward declaration for the function under test, as requested.
+int auth_zones_startprobesequence(struct auth_zones *, struct module_env *, uint8_t *, size_t, uint16_t);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    // We need at least 2 bytes for dclass and 1 for the name.
+    if (size < 3) {
+        return 0;
+    }
+
+    // Suppress logging to avoid filling up storage during fuzzing.
+    log_init("/dev/null", 0, NULL);
+
+    // Minimal initialization of module_env, based on other fuzzers.
+    struct module_env env;
+    memset(&env, 0, sizeof(struct module_env));
+    struct config_file cfg;
+    memset(&cfg, 0, sizeof(struct config_file));
+    env.cfg = &cfg;
+
+    // Create the auth_zones structure.
+    struct auth_zones* az = auth_zones_create();
+    if (!az) {
+        return 0;
+    }
+
+    // Extract parameters from the fuzzing input.
+    uint16_t dclass = 0;
+    memcpy(&dclass, data, sizeof(uint16_t));
+    uint8_t* nm = (uint8_t*)data + sizeof(uint16_t);
+    size_t nmlen = size - sizeof(uint16_t);
+
+    // The target function looks for an auth_xfer. We need to create one
+    // for the function to do anything interesting. This requires creating
+    // an auth_zone first. This setup must be done while holding a write
+    // lock on the auth_zones struct.
+    lock_rw_wrlock(&az->lock);
+    struct auth_zone* z = auth_zone_create(az, nm, nmlen, dclass);
+    if (z) {
+        // auth_zone_create returns a locked zone, unlock it.
+        lock_rw_unlock(&z->lock);
+        struct auth_xfer* xfr = auth_xfer_create(az, z);
+        if (xfr) {
+            // auth_xfer_create returns a locked xfer, unlock it so the
+            // target function can lock it.
+            lock_basic_unlock(&xfr->lock);
+        }
+    }
+    lock_rw_unlock(&az->lock);
+
+    // Call the function under test.
+    // It will find the zone/xfer if the creation was successful.
+    // If not, it will fail gracefully, which is also a valid test case.
+    auth_zones_startprobesequence(az, &env, nm, nmlen, dclass);
+
+    // Clean up allocated resources.
+    auth_zones_delete(az);
+
+    return 0;
+}
+	

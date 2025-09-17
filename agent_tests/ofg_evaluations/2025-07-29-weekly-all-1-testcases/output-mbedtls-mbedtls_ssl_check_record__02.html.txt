@@ -1,0 +1,161 @@
+
+	
+<description>
+The function `mbedtls_ssl_check_record` is used to check the validity of a DTLS record. It is intended for use in a DTLS context, and it will not work with TLS. The function takes as input a `mbedtls_ssl_context` structure, a buffer containing the DTLS record, and the length of the buffer.
+
+The `mbedtls_ssl_context` must be properly initialized and configured before calling this function. This includes setting up the transport type to DTLS, and potentially performing a handshake to establish a valid security context. Callers of this function, such as the one in `ssl_test_common_source.c`, typically obtain the DTLS record from the network. This function is called to validate the record before it is processed by the main SSL/TLS stack. The function `mbedtls_ssl_check_record` will decrypt the record in-place if it is encrypted, so a copy of the buffer should be made if the original content is needed later. The function returns 0 on success, or an error code if the record is invalid or an error occurred. The function is designed to not alter the state of the `mbedtls_ssl_context`, so it can be called multiple times on the same record without side effects.
+</description>
+<requirements>
+<requirement>
+The first argument, `mbedtls_ssl_context`, must be a valid and initialized SSL context. This is because the function uses the context to get information about the current TLS session, such as the transport type and the security parameters.
+</requirement>
+<requirement>
+The transport type in the `mbedtls_ssl_context` must be set to `MBEDTLS_SSL_TRANSPORT_DATAGRAM`. This is because the function is designed to work with DTLS records only, and will return `MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE` for TLS.
+</requirement>
+<requirement>
+The second argument, `buf`, must be a buffer containing a valid DTLS record. The function will attempt to parse and decrypt this record, and will fail if the record is malformed or invalid.
+</requirement>
+<requirement>
+The third argument, `buflen`, must be the correct length of the DTLS record in the buffer. An incorrect length may lead to out-of-bounds reads or other parsing errors.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mbedtls_ssl_check_record(const mbedtls_ssl_context *, unsigned char *, size_t)
+</function_signature>
+<project_name>
+mbedtls
+</project_name>
+
+	Fuzz target source:
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "common.h"
+#include "mbedtls/ssl.h"
+#if defined(MBEDTLS_SSL_PROTO_DTLS)
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/timing.h"
+#include "test/certs.h"
+
+#if defined(MBEDTLS_SSL_CLI_C) && \
+    defined(MBEDTLS_ENTROPY_C) && \
+    defined(MBEDTLS_CTR_DRBG_C) && \
+    defined(MBEDTLS_TIMING_C)
+static int initialized = 0;
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+static mbedtls_x509_crt cacert;
+#endif
+
+const char *pers = "fuzz_x509crl";
+#endif
+#endif /* MBEDTLS_SSL_PROTO_DTLS */
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+#if defined(MBEDTLS_SSL_PROTO_DTLS) && \
+    defined(MBEDTLS_SSL_CLI_C) && \
+    defined(MBEDTLS_ENTROPY_C) && \
+    defined(MBEDTLS_CTR_DRBG_C) && \
+    defined(MBEDTLS_TIMING_C)
+    int ret;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+    mbedtls_timing_delay_context timer;
+    fuzzBufferOffset_t biomemfuzz;
+
+    if (initialized == 0) {
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+        mbedtls_x509_crt_init(&cacert);
+        if (mbedtls_x509_crt_parse(&cacert, (const unsigned char *) mbedtls_test_cas_pem,
+                                   mbedtls_test_cas_pem_len) != 0) {
+            return 1;
+        }
+#endif
+        dummy_init();
+        initialized = 1;
+    }
+
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_entropy_init(&entropy);
+
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        goto exit;
+    }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+    if (mbedtls_ctr_drbg_seed(&ctr_drbg, dummy_entropy, &entropy,
+                              (const unsigned char *) pers, strlen(pers)) != 0) {
+        goto exit;
+    }
+
+    if (mbedtls_ssl_config_defaults(&conf,
+                                    MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_DATAGRAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+        goto exit;
+    }
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+    mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
+#endif
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+
+    if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+        goto exit;
+    }
+
+    mbedtls_ssl_set_timer_cb(&ssl, &timer, mbedtls_timing_set_delay,
+                             mbedtls_timing_get_delay);
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+    if (mbedtls_ssl_set_hostname(&ssl, "localhost") != 0) {
+        goto exit;
+    }
+#endif
+
+    biomemfuzz.Data = Data;
+    biomemfuzz.Size = Size;
+    biomemfuzz.Offset = 0;
+    mbedtls_ssl_set_bio(&ssl, &biomemfuzz, dummy_send, fuzz_recv, fuzz_recv_timeout);
+
+    ret = mbedtls_ssl_handshake(&ssl);
+
+    if (ret == 0) {
+        if (biomemfuzz.Offset < biomemfuzz.Size) {
+            size_t remaining_size = biomemfuzz.Size - biomemfuzz.Offset;
+            unsigned char *record_buf = malloc(remaining_size);
+            if (record_buf != NULL) {
+                memcpy(record_buf, Data + biomemfuzz.Offset, remaining_size);
+                mbedtls_ssl_check_record(&ssl, record_buf, remaining_size);
+                free(record_buf);
+            }
+        }
+    }
+
+exit:
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_ssl_config_free(&conf);
+    mbedtls_ssl_free(&ssl);
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+    mbedtls_psa_crypto_free();
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+#else
+    (void) Data;
+    (void) Size;
+#endif
+    return 0;
+}
+	

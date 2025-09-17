@@ -1,0 +1,150 @@
+
+	
+<description>
+The target function is a lambda expression within `httplib::Server::process_request`. This lambda captures the server instance (`this`), a `Stream` object (`strm`), a `Request` object (`req`), and a `Response` object (`res`). It takes a `ContentReceiver` function as an argument. The purpose of this lambda is to handle the reading of the request body for non-multipart requests. It does this by invoking `read_content_with_content_receiver`, passing along the captured objects and the provided `ContentReceiver`. The `read_content_with_content_receiver` function then calls `read_content_core` which reads the request body from the stream and passes the data to the `ContentReceiver`. The provided signature `bool httplib::Server::operator()(const void *, ContentReceiver)` is a conceptual representation of this lambda's operation, where `const void *` likely represents the captured `this` pointer. For fuzzing, the key is to correctly set up the captured variables (`strm`, `req`, `res`) and the `ContentReceiver` argument.
+</description>
+<requirements>
+
+<requirement>
+The request's "Content-Type" header must not start with "multipart/form-data". This is to ensure that `req.is_multipart_form_data()` returns `false`, preventing the code from trying to use the `nullptr` multipart handlers, which would cause a crash.
+</requirement>
+<requirement>
+The request must have a "Content-Length" header. This header is used to determine the size of the content to be read from the stream.
+</requirement>
+<requirement>
+The `strm` object must provide at least the number of bytes specified in the "Content-Length" header. If the stream provides fewer bytes, the read operation will fail.
+</requirement>
+<requirement>
+The `ContentReceiver` function provided to the lambda must be a valid function that can be called with a `const char*` and a `size_t`. A simple valid receiver can be a lambda that returns `true`.
+</requirement>
+<requirement>
+The data in the `strm` and the headers in `req` (especially "Content-Length") must be consistent. `process_request` normally ensures this by parsing the stream to create the request. When fuzzing, this consistency must be maintained manually if constructing `req` directly.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+bool httplib::Server::operator()(const void *, ContentReceiver)
+</function_signature>
+<project_name>
+cpp-httplib
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <httplib.h>
+#include <string>
+#include <vector>
+
+// Dummy include to satisfy the instruction.
+#include "/usr/local/include/c++/v1/__algorithm/comp.h"
+
+// FuzzedStream to feed fuzzer data to the server
+class FuzzedStream : public httplib::Stream {
+public:
+  FuzzedStream(const uint8_t *data, size_t size)
+      : data_(data), size_(size), read_pos_(0) {}
+
+  // Methods from httplib::Stream that must be implemented
+  bool is_readable() const override { return true; }
+  bool wait_readable() const override { return true; }
+  bool wait_writable() const override { return true; }
+  time_t duration() const override { return 0; }
+
+  ssize_t read(char *ptr, size_t size) override {
+    if (read_pos_ >= size_) {
+      return -1; // No more data
+    }
+    size_t remaining = size_ - read_pos_;
+    size_t to_read = size < remaining ? size : remaining;
+    memcpy(ptr, data_ + read_pos_, to_read);
+    read_pos_ += to_read;
+    return static_cast<ssize_t>(to_read);
+  }
+
+  ssize_t write(const char *ptr, size_t size) override {
+    (void)ptr; // Silences unused parameter warning
+    // We don't care about the response for this fuzz target
+    return static_cast<ssize_t>(size);
+  }
+
+  void get_remote_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 12345;
+  }
+
+  void get_local_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 8080;
+  }
+
+  socket_t socket() const override { return 0; }
+
+private:
+  const uint8_t *data_;
+  size_t size_;
+  size_t read_pos_;
+};
+
+// FuzzableServer to expose process_request
+class FuzzableServer : public httplib::Server {
+public:
+  void ProcessFuzzedRequest(FuzzedStream &stream) {
+    bool close_connection = false;
+    bool connection_closed = false;
+    process_request(stream, "127.0.0.1", 12345, "127.0.0.1", 8080,
+                    close_connection, connection_closed, nullptr);
+  }
+};
+
+static FuzzableServer g_server;
+
+extern "C" int LLVMFuzzerInitialize(int * /*argc*/, char *** /*argv*/) {
+  // Set up a handler that will receive the target ContentReader lambda
+  g_server.Post("/", [](const httplib::Request &req, httplib::Response &res,
+                        const httplib::ContentReader &content_reader) {
+    (void)req; // Silences unused parameter warning
+    // This is the point where the target lambda is available.
+    // We call it with a ContentReceiver to trigger the content reading logic.
+    content_reader([](const char *data, size_t data_length) {
+      // The actual content is processed here.
+      // For fuzzing, we just need to consume it and return true.
+      (void)data;
+      (void)data_length;
+      return true;
+    });
+    res.set_content("OK", "text/plain");
+  });
+  return 0;
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // The body of the request is the remaining fuzzer data
+  std::string body = provider.ConsumeRemainingBytesAsString();
+
+  // Construct a raw HTTP POST request.
+  // This ensures that the headers are set correctly to trigger the target code path.
+  std::string request_str = "POST / HTTP/1.1\r\n";
+  request_str += "Host: example.com\r\n";
+  // Requirement: Content-Type must not be multipart/form-data
+  request_str += "Content-Type: application/octet-stream\r\n";
+  // Requirement: Content-Length must be present
+  request_str += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+  request_str += "\r\n";
+  request_str += body;
+
+  // Create a stream with the fuzzed request
+  FuzzedStream stream(reinterpret_cast<const uint8_t *>(request_str.data()),
+                      request_str.size());
+
+  // Process the request. This will call the Post handler set up in
+  // LLVMFuzzerInitialize, which in turn calls the target lambda.
+  g_server.ProcessFuzzedRequest(stream);
+
+  return 0;
+}
+	

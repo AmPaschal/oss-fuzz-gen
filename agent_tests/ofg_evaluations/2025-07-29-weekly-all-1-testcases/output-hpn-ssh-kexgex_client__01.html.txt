@@ -1,0 +1,148 @@
+
+	
+<description>
+The `kexgex_client` function is responsible for initiating the Diffie-Hellman Group Exchange (DH-GEX) key exchange process from the client's side. It constructs and sends a `SSH2_MSG_KEX_DH_GEX_REQUEST` packet to the SSH server. This packet includes the client's desired range for the size of the Diffie-Hellman group (minimum, preferred, and maximum number of bits). After sending the request, the function sets up a dispatch handler (`input_kex_dh_gex_group`) to process the server's `SSH2_MSG_KEX_DH_GEX_GROUP` response, which will contain the server's chosen group parameters. The function's primary role is to communicate the client's DH-GEX preferences to the server and prepare for the next step in the key exchange.
+
+The function takes a pointer to a `struct ssh` as its only argument. This `ssh` struct is a large and complex data structure that holds the entire state of the SSH connection. The callers of `kexgex_client` do not call it directly, but instead assign it to a function pointer in the `ssh->kex->kex` array. The actual execution is triggered later during the key exchange process. Therefore, the `ssh` struct must be fully initialized and connected before `kexgex_client` is called. This initialization is typically handled by functions like `ssh_connect` and `ssh_login`.
+
+The function's behavior depends on several fields within the `ssh` and `kex` structs. It uses `ssh->kex->dh_need` to estimate the required number of bits for the DH group. It also checks the `ssh->compat` field for the `SSH_BUG_DHGEX_LARGE` flag, which, if set, limits the number of bits to 4096. The `kex->min` and `kex->max` fields are hardcoded to `DH_GRP_MIN` (2048) and `DH_GRP_MAX` (8192) respectively. The function relies on the `sshpkt_*` API to construct and send the packet, so the `ssh` struct must be in a state that allows for packet operations. Finally, it uses `ssh_dispatch_set` to register a handler for the server's response, which means the dispatch mechanism must be active.
+</description>
+<requirements>
+<requirement>
+The `ssh` argument must be a valid, fully initialized, and connected `ssh` struct. This is because the function accesses various members of the `ssh` and `ssh->kex` structs and uses the `sshpkt_*` API, which requires a connected session.
+</requirement>
+<requirement>
+The `ssh->kex` pointer must not be NULL. This is because the function dereferences `ssh->kex` in its first line without any prior null check.
+</requirement>
+<requirement>
+The `ssh->kex->dh_need` field must be initialized to a reasonable value. This value is used by the `dh_estimate` function to determine the preferred number of bits for the key exchange.
+</requirement>
+<requirement>
+The `ssh->compat` field should be fuzzed to include the `SSH_BUG_DHGEX_LARGE` flag. This will exercise the code path that limits the number of bits to 4096.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+kexgex_client(struct ssh *ssh)
+</function_signature>
+<project_name>
+hpn-ssh
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <cstdarg>
+#include <string.h>
+
+extern "C" {
+#include "includes.h"
+#include "kex.h"
+#include "packet.h"
+#include "compat.h"
+#include "ssherr.h"
+#include "ssh_api.h"
+#include "sshbuf.h"
+#include "myproposal.h"
+#include "log.h"
+#include "sshkey.h"
+#include "authfile.h"
+#include "fixed-keys.h"
+#include "xmalloc.h"
+}
+
+// Key preparation logic adapted from kex_fuzz.cc to be self-contained.
+static int prepare_key(struct sshkey **privkey_p, struct sshkey **pubkey_p) {
+    const char *privstr = PRIV_RSA;
+    const char *pubstr = PUB_RSA;
+    char *tmp, *cp;
+    struct sshbuf *b = NULL;
+    int r;
+
+    if ((b = sshbuf_from(privstr, strlen(privstr))) == NULL)
+        abort();
+    if ((r = sshkey_parse_private_fileblob(b, "", privkey_p, NULL)) != 0) {
+        sshbuf_free(b);
+        abort();
+    }
+    sshbuf_free(b);
+
+    tmp = cp = xstrdup(pubstr);
+    if ((*pubkey_p = sshkey_new(KEY_UNSPEC)) == NULL) {
+        free(tmp);
+        abort();
+    }
+    if ((r = sshkey_read(*pubkey_p, &cp)) != 0) {
+        free(tmp);
+        abort();
+    }
+    free(tmp);
+    return 0;
+}
+
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    static struct sshkey *client_privkey, *client_pubkey;
+    FuzzedDataProvider provider(data, size);
+
+    // One-time setup for logging and keys
+    if (client_pubkey == NULL) {
+        log_init("fuzz", SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_AUTH, 1);
+        if (prepare_key(&client_privkey, &client_pubkey) != 0)
+            abort();
+    }
+
+    struct ssh *client = NULL;
+    struct kex_params kex_params;
+    int r;
+
+    // Set up a valid proposal for kexgex using the KEX_CLIENT macro
+    const char *proposal_template[PROPOSAL_MAX] = { KEX_CLIENT };
+    char *proposal_copy[PROPOSAL_MAX];
+    for (size_t i = 0; i < PROPOSAL_MAX; i++) {
+        proposal_copy[i] = (proposal_template[i] == NULL) ? NULL : xstrdup(proposal_template[i]);
+    }
+
+    free(proposal_copy[PROPOSAL_KEX_ALGS]);
+    proposal_copy[PROPOSAL_KEX_ALGS] = xstrdup("diffie-hellman-group-exchange-sha256");
+    free(proposal_copy[PROPOSAL_SERVER_HOST_KEY_ALGS]);
+    proposal_copy[PROPOSAL_SERVER_HOST_KEY_ALGS] = xstrdup(sshkey_ssh_name(client_pubkey));
+
+    memcpy(kex_params.proposal, proposal_copy, sizeof(proposal_copy));
+
+    // Initialize the main ssh struct for a client
+    if ((r = ssh_init(&client, 0 /* is_server */, &kex_params)) != 0) {
+        goto cleanup;
+    }
+
+    // Add a hostkey, which is needed by kex setup.
+    if ((r = ssh_add_hostkey(client, client_pubkey)) != 0) {
+        goto cleanup;
+    }
+
+    // Ensure kex is not null before proceeding
+    if (client->kex == NULL) {
+        goto cleanup;
+    }
+
+    // Fuzz the required fields as per the analysis
+    client->kex->dh_need = provider.ConsumeIntegralInRange<u_int>(1024, 8192);
+
+    if (provider.ConsumeBool()) {
+        client->compat |= SSH_BUG_DHGEX_LARGE;
+    }
+    
+    // Call the function under test
+    kexgex_client(client);
+
+cleanup:
+    for (size_t i = 0; i < PROPOSAL_MAX; i++)
+        free(proposal_copy[i]);
+    if (client)
+        ssh_free(client);
+
+    return 0;
+}
+	

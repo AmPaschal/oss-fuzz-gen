@@ -1,0 +1,237 @@
+
+	
+<description>
+The mbedtls_ssl_check_record function is a public-facing helper function primarily intended for internal testing. It checks the validity of an SSL/TLS record without processing it. The function performs two main steps: parsing the record header and checking the record payload, which includes MAC verification if applicable. The caller is responsible for setting up the SSL context and providing the raw record data. To properly fuzz this function, it's essential to initialize the mbedtls_ssl_context with valid configuration and handshake state. The record buffer passed to the function should be fuzzed, but its length and content must adhere to certain constraints to avoid trivial rejections and achieve deeper code coverage. The record's version and length fields are particularly important, as they are checked against the context's configuration.
+</description>
+<requirements>
+<requirement>
+The `mbedtls_ssl_context` structure must be initialized. This can be done by calling `mbedtls_ssl_setup` and `mbedtls_ssl_handshake` to bring the context to a valid state before calling the target function.</requirement>
+<requirement>
+The second argument, `buf`, which is the record buffer, should be fuzzed. This allows for testing of the record parsing and validation logic.</requirement>
+<requirement>
+The third argument, `buflen`, should be at least `mbedtls_ssl_in_hdr_len(ssl)`. This is to ensure the buffer is large enough to hold the record header, preventing a `MBEDTLS_ERR_SSL_INVALID_RECORD` error.</requirement>
+<requirement>
+The record version within the `buf` must match the `tls_version` in the `mbedtls_ssl_context`. This is a strict requirement for the record to be considered valid.</requirement>
+<requirement>
+The record data length in `buf` must not exceed `mbedtls_ssl_get_max_in_record_payload(ssl)`. This prevents a `MBEDTLS_ERR_SSL_INVALID_RECORD` error during header parsing.</requirement>
+<requirement>
+The `buflen` must be greater than or equal to the record data length plus the header length. This ensures the buffer is large enough to hold the entire record, including its payload.</requirement>
+<requirement>
+If a MAC is used, the record data length in `buf` must be at least the length of the MAC. This is to prevent a `MBEDTLS_ERR_SSL_INVALID_RECORD` error when checking the payload.</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int mbedtls_ssl_check_record(const mbedtls_ssl_context *, unsigned char *, size_t)
+</function_signature>
+<project_name>
+mbedtls
+</project_name>
+
+	Fuzz target source:
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/ssl_ticket.h"
+#include "test/certs.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+// common.h is included by common.c, so including it here is redundant and causes redefinition errors.
+// #include "common.h"
+
+#if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+// This is the fix. Include the C file to resolve linker errors.
+#include "common.c"
+#endif
+
+#if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+const char *pers = "fuzz_server";
+static int initialized = 0;
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+static mbedtls_x509_crt srvcert;
+static mbedtls_pk_context pkey;
+#endif
+const char *alpn_list[3];
+
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+const unsigned char psk[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+const char psk_id[] = "Client_identity";
+#endif
+#endif // MBEDTLS_SSL_SRV_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C
+
+int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+#if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_ENTROPY_C) && defined(MBEDTLS_CTR_DRBG_C)
+  int ret;
+  size_t len;
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_context entropy;
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_TICKET_C)
+  mbedtls_ssl_ticket_context ticket_ctx;
+#endif
+  unsigned char buf[4096];
+  fuzzBufferOffset_t biomemfuzz;
+  uint8_t options;
+
+  // we take 1 byte as options input
+  if (Size < 1) {
+    return 0;
+  }
+  options = Data[Size - 1];
+
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  mbedtls_entropy_init(&entropy);
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+  mbedtls_x509_crt_init(&srvcert);
+  mbedtls_pk_init(&pkey);
+#endif
+  mbedtls_ssl_init(&ssl);
+  mbedtls_ssl_config_init(&conf);
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_TICKET_C)
+  mbedtls_ssl_ticket_init(&ticket_ctx);
+#endif
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) {
+    goto exit;
+  }
+#endif /* MBEDTLS_USE_PSA_CRYPTO */
+
+  if (mbedtls_ctr_drbg_seed(&ctr_drbg, dummy_entropy, &entropy, (const unsigned char *)pers, strlen(pers)) != 0) {
+    return 1;
+  }
+
+  if (initialized == 0) {
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+    if (mbedtls_x509_crt_parse(&srvcert, (const unsigned char *)mbedtls_test_srv_crt, mbedtls_test_srv_crt_len) != 0) {
+      return 1;
+    }
+    if (mbedtls_x509_crt_parse(&srvcert, (const unsigned char *)mbedtls_test_cas_pem, mbedtls_test_cas_pem_len) != 0) {
+      return 1;
+    }
+    if (mbedtls_pk_parse_key(&pkey, (const unsigned char *)mbedtls_test_srv_key, mbedtls_test_srv_key_len, NULL, 0, dummy_random, &ctr_drbg) != 0) {
+      return 1;
+    }
+#endif
+
+    alpn_list[0] = "HTTP";
+    alpn_list[1] = "fuzzalpn";
+    alpn_list[2] = NULL;
+
+    dummy_init();
+
+    initialized = 1;
+  }
+
+  if (mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+    goto exit;
+  }
+
+  srand(1);
+  mbedtls_ssl_conf_rng(&conf, dummy_random, &ctr_drbg);
+
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+  mbedtls_ssl_conf_ca_chain(&conf, srvcert.next, NULL);
+  if (mbedtls_ssl_conf_own_cert(&conf, &srvcert, &pkey) != 0) {
+    goto exit;
+  }
+#endif
+
+  mbedtls_ssl_conf_cert_req_ca_list(&conf, (options & 0x1) ? MBEDTLS_SSL_CERT_REQ_CA_LIST_ENABLED : MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
+#if defined(MBEDTLS_SSL_ALPN)
+  if (options & 0x2) {
+    mbedtls_ssl_conf_alpn_protocols(&conf, alpn_list);
+  }
+#endif
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_TICKET_C)
+  if (options & 0x4) {
+    if (mbedtls_ssl_ticket_setup(&ticket_ctx, dummy_random, &ctr_drbg, MBEDTLS_CIPHER_AES_256_GCM, 86400) != 0) {
+      goto exit;
+    }
+
+    mbedtls_ssl_conf_session_tickets_cb(&conf, mbedtls_ssl_ticket_write, mbedtls_ssl_ticket_parse, &ticket_ctx);
+  }
+#endif
+#if defined(MBEDTLS_SSL_EXTENDED_MASTER_SECRET)
+  mbedtls_ssl_conf_extended_master_secret(&conf, (options & 0x10) ? MBEDTLS_SSL_EXTENDED_MS_DISABLED : MBEDTLS_SSL_EXTENDED_MS_ENABLED);
+#endif
+#if defined(MBEDTLS_SSL_ENCRYPT_THEN_MAC)
+  mbedtls_ssl_conf_encrypt_then_mac(&conf, (options & 0x20) ? MBEDTLS_SSL_ETM_ENABLED : MBEDTLS_SSL_ETM_DISABLED);
+#endif
+#if defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+  if (options & 0x40) {
+    mbedtls_ssl_conf_psk(&conf, psk, sizeof(psk), (const unsigned char *)psk_id, sizeof(psk_id) - 1);
+  }
+#endif
+#if defined(MBEDTLS_SSL_RENEGOTIATION)
+  mbedtls_ssl_conf_renegotiation(&conf, (options & 0x80) ? MBEDTLS_SSL_RENEGOTIATION_ENABLED : MBEDTLS_SSL_RENEGOTIATION_DISABLED);
+#endif
+
+  if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+    goto exit;
+  }
+
+  biomemfuzz.Data = Data;
+  biomemfuzz.Size = Size - 1;
+  biomemfuzz.Offset = 0;
+  mbedtls_ssl_set_bio(&ssl, &biomemfuzz, dummy_send, fuzz_recv, NULL);
+
+  mbedtls_ssl_session_reset(&ssl);
+  ret = mbedtls_ssl_handshake(&ssl);
+
+  if (ret == 0) {
+    // After a successful handshake, the SSL context is ready.
+    // We can now use the remaining data from the input buffer to
+    // test mbedtls_ssl_check_record.
+
+    unsigned char *record_buf = (unsigned char *)(Data + biomemfuzz.Offset);
+    size_t record_len = (biomemfuzz.Offset < biomemfuzz.Size) ? (biomemfuzz.Size - biomemfuzz.Offset) : 0;
+
+    if (record_len > 0) {
+      // The function takes a non-const buffer, but it makes an internal
+      // copy, so casting away the const is safe here.
+      mbedtls_ssl_check_record(&ssl, record_buf, record_len);
+    }
+
+    // keep reading data from server until the end
+    do {
+      len = sizeof(buf) - 1;
+      ret = mbedtls_ssl_read(&ssl, buf, len);
+
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+        continue;
+      } else if (ret <= 0) {
+        // EOF or error
+        break;
+      }
+    } while (1);
+  }
+
+exit:
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_TICKET_C)
+  mbedtls_ssl_ticket_free(&ticket_ctx);
+#endif
+  mbedtls_entropy_free(&entropy);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_ssl_config_free(&conf);
+#if defined(MBEDTLS_X509_CRT_PARSE_C) && defined(MBEDTLS_PEM_PARSE_C)
+  mbedtls_x509_crt_free(&srvcert);
+  mbedtls_pk_free(&pkey);
+#endif
+  mbedtls_ssl_free(&ssl);
+#if defined(MBEDTLS_USE_PSA_CRYPTO)
+  mbedtls_psa_crypto_free();
+#endif
+#else
+  (void)Data;
+  (void)Size;
+#endif /* MBEDTLS_SSL_SRV_C && MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C */
+
+  return 0;
+}
+	

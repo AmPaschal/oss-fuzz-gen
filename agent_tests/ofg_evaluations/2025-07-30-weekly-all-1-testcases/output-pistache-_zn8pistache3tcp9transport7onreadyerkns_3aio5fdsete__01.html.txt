@@ -1,0 +1,112 @@
+
+	
+<description>
+The `Pistache::Tcp::Transport::onReady` function is a central part of the Pistache network library's event handling mechanism. It is responsible for processing I/O events that have been collected by a reactor. The function takes a single argument, `fds`, which is a constant reference to an `Aio::FdSet` object. This `FdSet` contains a collection of events, where each event represents a file descriptor that is ready for some I/O operation (e.g., reading or writing).
+
+The `onReady` function iterates through each event in the `FdSet`. For each event, it determines the type of event and dispatches it to the appropriate handler function. The function handles several types of events:
+
+- **Queue-based events:** It checks if the event's tag matches one of the internal queues: `writesQueue`, `timersQueue`, `peersQueue`, or `notifier`. If a match is found, it calls the corresponding handler function (`handleWriteQueue`, `handleTimerQueue`, `handlePeerQueue`, `handleNotify`). These queues are used for internal communication and signaling within the transport layer.
+
+- **Readable events:** If an event is marked as readable, the function checks if the associated file descriptor belongs to a peer or a timer.
+- If it's a peer's file descriptor, it retrieves the peer object and calls `handleIncoming` to process incoming data from that peer.
+- If it's a timer's file descriptor, it finds the corresponding timer, calls `handleTimer` to execute the timer's callback, and then removes the timer.
+
+- **Writable events:** If an event is marked as writable, it means that a previous write operation on a socket did not complete and can now be resumed. The function prepares to drain the pending write queue for that socket by calling `asyncWriteImpl`.
+
+In essence, `onReady` acts as a dispatcher, orchestrating the response to various I/O and internal events to drive the network communication and timer-based tasks within the Pistache framework. The correct functioning of this function is critical for the proper operation of any server or client built using Pistache.
+</description>
+<requirements>
+<requirement>
+The `Aio::FdSet` argument should be initialized with a `std::vector<Polling::Event>`. This is because the `FdSet` is a wrapper around a vector of events and is constructed from it.
+</requirement>
+<requirement>
+The `Polling::Event` objects in the `FdSet` should have their `tag` member initialized with values that the `onReady` function is designed to handle. These tags can be obtained from the `Transport`'s internal queues (`writesQueue.tag()`, `timersQueue.tag()`, `peersQueue.tag()`, `notifier.tag()`) or represent file descriptors for peers and timers.
+</requirement>
+<requirement>
+To test the handling of readable peer events, a peer must be added to the `Transport` before calling `onReady`. This ensures that when an event with a peer's file descriptor tag is processed, the `getPeer` function can find and return a valid peer object.
+</requirement>
+<requirement>
+To test the handling of timer events, a timer must be registered with the `Transport`. This is necessary so that when a timer event occurs, its tag can be found in the `timers` map, and the corresponding timer handler can be executed.
+</requirement>
+<requirement>
+When creating a writable event for a file descriptor, that file descriptor should be present in the `toWrite` map of the `Transport`. This is because the function expects to find the file descriptor in this map to drain the pending write buffer.
+</requirement>
+<requirement>
+The `Transport` object must be properly initialized before `onReady` is called. This initialization is crucial for setting up the internal queues and other state that the `onReady` function relies on.
+</requirement>
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+void Pistache::Tcp::Transport::onReady(const FdSet &)
+</function_signature>
+<project_name>
+pistache
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include "/src/pistache/include/pistache/transport.h"
+#include "/src/pistache/include/pistache/http.h"
+#include "/src/pistache/include/pistache/reactor.h"
+#include <vector>
+
+// A concrete implementation of Pistache::Http::Handler to allow instantiation.
+class MyHandler : public Pistache::Http::Handler {
+public:
+    // The HTTP_PROTOTYPE macro is required for handlers.
+    HTTP_PROTOTYPE(MyHandler)
+
+    // Provide a minimal implementation for the pure virtual onRequest method.
+    void onRequest(const Pistache::Http::Request& /*request*/, Pistache::Http::ResponseWriter response) override {
+        response.send(Pistache::Http::Code::Ok);
+    }
+};
+
+// Forward declaration of the function under test.
+void Pistache__Tcp__Transport__onReady(Pistache::Tcp::Transport* transport, const Pistache::Aio::FdSet& fds);
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    FuzzedDataProvider fdp(data, size);
+
+    // 1. Create the handler and transport objects.
+    auto handler = Pistache::Http::make_handler<MyHandler>();
+    if (!handler) {
+        return 0;
+    }
+    Pistache::Tcp::Transport transport(handler);
+
+    // 2. Create a vector of Polling::Event objects from fuzzer data.
+    std::vector<Pistache::Polling::Event> events;
+    while (fdp.remaining_bytes() > sizeof(uint64_t)) {
+        uint64_t tag_val = fdp.ConsumeIntegral<uint64_t>();
+        Pistache::Polling::Tag tag(tag_val);
+
+        Pistache::Polling::Event event(tag);
+        
+        // Construct flags by picking from available enum values.
+        auto flag_val = fdp.PickValueInArray<Pistache::Polling::NotifyOn>({
+            Pistache::Polling::NotifyOn::Read,
+            Pistache::Polling::NotifyOn::Write,
+            Pistache::Polling::NotifyOn::Hangup,
+            Pistache::Polling::NotifyOn::Shutdown
+        });
+        event.flags.setFlag(flag_val);
+        
+        events.push_back(event);
+    }
+
+    if (events.empty()) {
+        return 0;
+    }
+
+    // 3. Create the FdSet object required by the function-under-test.
+    Pistache::Aio::FdSet fdSet(std::move(events));
+
+    // 4. Call the function under test.
+    transport.onReady(fdSet);
+
+    return 0;
+}
+	

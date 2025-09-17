@@ -1,0 +1,134 @@
+
+	
+<description>
+The X509_verify_cert function performs a validation of a certificate chain. It takes a single argument, a pointer to an X509_STORE_CTX structure. This context contains all the necessary information for the verification, including the certificate to be verified, a stack of untrusted certificates that may be used to build the chain, and a trust store containing trusted root certificates. The function builds a certificate chain from the leaf certificate up to a trusted root, and then verifies the chain according to various criteria, such as signature verification, expiration checks, and certificate purposes. The verification process is highly customizable through the parameters in the X509_VERIFY_PARAM object within the X509_STORE_CTX.
+</description>
+<requirements>
+
+<requirement>
+The X509_STORE_CTX object must be initialized by calling X509_STORE_CTX_init. This is because this function sets up the necessary fields in the context, such as the certificate to verify, the untrusted certificates, and the trust store.
+</requirement>
+<requirement>
+The 'cert' member of the X509_STORE_CTX must be a valid X509 certificate. A NULL certificate will cause the function to return an error without performing any verification.
+</requirement>
+<requirement>
+The 'untrusted' member of the X509_STORE_CTX should be a valid stack of X509 certificates. This stack provides the intermediate certificates needed to build the chain to a trusted root.
+</requirement>
+<requirement>
+The X509_STORE_CTX must have a trust store configured, either through the 'ctx' member (an X509_STORE object) or the 'trusted_stack' member. Without a trust store, the function will be unable to find a trusted root and the verification will fail.
+</requirement>
+<requirement>
+The 'param->flags' member of the X509_STORE_CTX must not have the X509_V_FLAG_EXTENDED_CRL_SUPPORT or X509_V_FLAG_USE_DELTAS flags set. These flags correspond to unsupported features and will cause the function to return an error.
+</requirement>
+<requirement>
+The 'verify_cb' member of the X509_STORE_CTX can be set to a custom callback function for logging or custom verification logic. If not set, a default null callback will be used.
+</requirement>
+
+</requirements>
+<function_analysis_path>
+
+</function_analysis_path>
+<function_signature>
+int X509_verify_cert(X509_STORE_CTX *)
+</function_signature>
+<project_name>
+boringssl
+</project_name>
+
+	Fuzz target source:
+#include <fuzzer/FuzzedDataProvider.h>
+#include <openssl/err.h>
+#include <openssl/mem.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+
+#include <memory>
+#include <vector>
+
+// Deleter for STACK_OF(X509) to ensure contents are also freed.
+struct SkX509Free {
+  void operator()(STACK_OF(X509) *sk) { sk_X509_pop_free(sk, X509_free); }
+};
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  FuzzedDataProvider provider(data, size);
+
+  // Create a leaf certificate from the first part of the input.
+  std::vector<uint8_t> leaf_data = provider.ConsumeBytes<uint8_t>(
+      provider.ConsumeIntegralInRange<size_t>(0, 2048));
+  const uint8_t *p = leaf_data.data();
+  bssl::UniquePtr<X509> leaf(d2i_X509(nullptr, &p, leaf_data.size()));
+  if (!leaf) {
+    return 0;
+  }
+
+  // Create a stack of untrusted intermediate certificates.
+  std::unique_ptr<STACK_OF(X509), SkX509Free> intermediates(
+      sk_X509_new_null());
+  if (!intermediates) {
+    return 0;
+  }
+  while (provider.remaining_bytes() > provider.remaining_bytes() / 2) {
+    std::vector<uint8_t> intermediate_data = provider.ConsumeBytes<uint8_t>(
+        provider.ConsumeIntegralInRange<size_t>(0, 2048));
+    p = intermediate_data.data();
+    X509 *intermediate = d2i_X509(nullptr, &p, intermediate_data.size());
+    if (intermediate) {
+      if (!sk_X509_push(intermediates.get(), intermediate)) {
+        X509_free(intermediate);
+        return 0; // Out of memory
+      }
+    }
+  }
+
+  // Create a trust store of root certificates from the remaining data.
+  bssl::UniquePtr<X509_STORE> store(X509_STORE_new());
+  if (!store) {
+    return 0;
+  }
+  std::vector<uint8_t> roots_data = provider.ConsumeRemainingBytes<uint8_t>();
+  p = roots_data.data();
+  const uint8_t *end_p = roots_data.data() + roots_data.size();
+  while (p < end_p) {
+    X509 *root = d2i_X509(nullptr, &p, end_p - p);
+    if (!root) {
+      break;
+    }
+    X509_STORE_add_cert(store.get(), root);
+    X509_free(root);
+  }
+
+  // Initialize the verification context.
+  bssl::UniquePtr<X509_STORE_CTX> ctx(X509_STORE_CTX_new());
+  if (!ctx) {
+    return 0;
+  }
+  if (!X509_STORE_CTX_init(ctx.get(), store.get(), leaf.get(),
+                           intermediates.get())) {
+    return 0;
+  }
+
+  // Fuzz various verification parameters.
+  X509_VERIFY_PARAM *param = X509_STORE_CTX_get0_param(ctx.get());
+  X509_VERIFY_PARAM_set_flags(param, provider.ConsumeIntegral<unsigned long>());
+  X509_STORE_CTX_set_time(ctx.get(), 0, provider.ConsumeIntegral<time_t>());
+
+  const int purpose = provider.PickValueInArray({
+      X509_PURPOSE_SSL_CLIENT,
+      X509_PURPOSE_SSL_SERVER,
+      X509_PURPOSE_NS_SSL_SERVER,
+      X509_PURPOSE_SMIME_SIGN,
+      X509_PURPOSE_SMIME_ENCRYPT,
+      X509_PURPOSE_CRL_SIGN,
+      X509_PURPOSE_ANY,
+  });
+  X509_STORE_CTX_set_purpose(ctx.get(), purpose);
+
+  X509_verify_cert(ctx.get());
+
+  // The |bssl::UniquePtr| and |std::unique_ptr| objects automatically handle
+  // cleanup.
+  ERR_clear_error();
+  return 0;
+}
+	
