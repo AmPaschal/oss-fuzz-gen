@@ -209,6 +209,21 @@ def json_set_converter(obj):
       f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 
+def check_and_set_env(llm: models.LLM) -> None:
+  # If the model is not a Vertex AI model, return early.
+  if not isinstance(llm, models.VertexAIModel):
+    return
+
+  # Ensure required environment variables are set with defaults if missing.
+  defaults = {
+      'GOOGLE_GENAI_USE_VERTEXAI': 'TRUE',
+      'GOOGLE_CLOUD_PROJECT': 'oss-fuzz',
+      'GOOGLE_CLOUD_LOCATION': 'global',
+  }
+  for key, default in defaults.items():
+    if not os.environ.get(key):
+      os.environ[key] = default
+      
 def write_result(args: argparse.Namespace, trial: int,
                  result: List[Result]) -> None:
   """Writes the result to a file in the work directory."""
@@ -231,6 +246,8 @@ if __name__ == '__main__':
       ai_binary='',
       name=args.model,
   )
+
+  check_and_set_env()
 
   introspector.set_introspector_endpoints(args.introspector_endpoint)
 
