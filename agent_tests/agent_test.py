@@ -247,7 +247,7 @@ if __name__ == '__main__':
       name=args.model,
   )
 
-  check_and_set_env()
+  check_and_set_env(model)
 
   introspector.set_introspector_endpoints(args.introspector_endpoint)
 

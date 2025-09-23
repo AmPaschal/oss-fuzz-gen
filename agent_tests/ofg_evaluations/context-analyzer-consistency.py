@@ -100,9 +100,11 @@ def main():
   parser.add_argument("-j",
                       "--jobs",
                       type=int,
-                      default=2,
+                      default=5,
                       help="Number of parallel jobs")
   args = parser.parse_args()
+
+  print("Starting experiments...")
 
   # If no output dir provided, create one with timestamp
   if args.output:
@@ -127,3 +129,6 @@ def main():
       future.result()
 
     print(f"All test cases completed.")
+
+if __name__ == '__main__':
+  main()

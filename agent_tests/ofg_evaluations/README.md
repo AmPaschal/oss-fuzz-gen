@@ -31,13 +31,28 @@ python3 -m agent_tests.ofg_evaluations.function-analyzer-influence --input-dir a
 The results of both commands will be written to files specified with the -o or --output flags, and located in the OSS-Fuzz-Gen's directory
 
 ### Context Analyzer Consistency
+
+There are three input files
+agent_tests/ofg_evaluations/context-analyzer-input-part1.json
+agent_tests/ofg_evaluations/context-analyzer-input-part2.json
+agent_tests/ofg_evaluations/context-analyzer-input-part3.json
+
+Please, run with the first file, and if it succeeds and we have time, we can run the remaining two.
 ```bash
-python -m agent_tests.ofg_evaluations.context-analyzer-consistency agent_tests/ofg_evaluations/context-analyzer-input.json -l [model]
+python -m agent_tests.ofg_evaluations.context-analyzer-consistency agent_tests/ofg_evaluations/context-analyzer-input-part1.json -l [model]
 ```
 The output logs and result file will be written to a default directory ```results-ca-consistency-{timestamp}```
 
 ### Context Analyzer Prompt Influence
+
+We will also reuse the same input files.
+agent_tests/ofg_evaluations/context-analyzer-input-part1.json
+agent_tests/ofg_evaluations/context-analyzer-input-part2.json
+agent_tests/ofg_evaluations/context-analyzer-input-part3.json
+
+Please, also run with the first file, and if it succeeds and we have time, we can run the remaining two.
+
 ```bash
-python -m agent_tests.ofg_evaluations.context-analyzer-prompt-influence agent_tests/ofg_evaluations/context-analyzer-input.json -l [model]
+python -m agent_tests.ofg_evaluations.context-analyzer-prompt-influence agent_tests/ofg_evaluations/context-analyzer-input-part1.json -l [model]
 ```
 The output logs and result file will be written to a default directory ```results-ca-prompt-influence-{timestamp}```
