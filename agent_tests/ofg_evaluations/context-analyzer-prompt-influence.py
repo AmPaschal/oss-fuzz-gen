@@ -9,6 +9,8 @@ from pathlib import Path
 
 import tiktoken
 
+RESULTS_DIR = f'./results-{datetime.now().strftime("%Y-%m-%d-%H-%M")}'
+
 # Regex to extract feasibility blocks
 CHAT_BLOCK_RE = re.compile(
     r"<CHAT RESPONSE:ROUND \d+>.*?<feasible>\s*(True|False)\s*</feasible>.*?</CHAT RESPONSE:ROUND \d+>",
@@ -47,7 +49,9 @@ def run_command(yaml_path, func, prompt_file, model, output_dir):
         "-l",
         model,
         "-tr",
-        str(random_int + i)
+        str(random_int + i),
+        "-wd",
+        RESULTS_DIR
     ]
     with open(out_file, "w") as f:
       subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
