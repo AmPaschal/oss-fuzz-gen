@@ -137,9 +137,10 @@ def parse_args() -> argparse.Namespace:
                       help='Add context to function under test.')
   parser.add_argument('-to', '--run-timeout', type=int, default=RUN_TIMEOUT)
   parser.add_argument(
+    '-tr',
     '--trial',
       type=int,
-      default=1,
+      required=True,
       help='Trial number for the experiment.'
   )
   parser.add_argument(
@@ -202,7 +203,7 @@ def get_result_list_for_agent(
     raise TypeError(
         f"{agent_test_class.__name__} is not a subclass of BaseAgentTest")
 
-  agent_test_instance = agent_test_class(args, trial=1)
+  agent_test_instance = agent_test_class(args, trial=args.trial)
   return agent_test_instance.setup_initial_result_list(benchmark, args.prompt)
 
 

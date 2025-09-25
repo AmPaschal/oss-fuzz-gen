@@ -46,8 +46,8 @@ def run_command(yaml_path, func, prompt_file, model, output_dir):
         prompt_dir,
         "-l",
         model,
-        "--trial",
-        str(random_int + i)  
+        "-tr",
+        str(random_int + i)
     ]
     with open(out_file, "w") as f:
       subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
