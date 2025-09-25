@@ -274,7 +274,7 @@ if __name__ == '__main__':
 
   # Initialize the working directory
   args.work_dirs = workdir.WorkDirs(
-      os.path.join(args.work_dir, f'output-{benchmark.id}'))
+      os.path.join(args.work_dir, f'output-{benchmark.id}'), keep=True)
 
   pipeline = get_test_pipeline(args.pipeline)
 
