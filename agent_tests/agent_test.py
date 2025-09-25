@@ -136,7 +136,12 @@ def parse_args() -> argparse.Namespace:
                       default=False,
                       help='Add context to function under test.')
   parser.add_argument('-to', '--run-timeout', type=int, default=RUN_TIMEOUT)
-
+  parser.add_argument(
+    '--trial',
+      type=int,
+      default=1,
+      help='Trial number for the experiment.'
+  )
   parser.add_argument(
       '-of',
       '--oss-fuzz-dir',
@@ -271,8 +276,6 @@ if __name__ == '__main__':
       os.path.join(args.work_dir, f'output-{benchmark.id}'))
 
   pipeline = get_test_pipeline(args.pipeline)
-
-  args.trial = 1
 
   result_list = get_result_list_for_agent(args, pipeline[0], benchmark)
 

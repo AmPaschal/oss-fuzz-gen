@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import re
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -25,6 +26,8 @@ def run_command(yaml_path, func, prompt_file, model, output_dir):
       "prompts/agent_context_analyzer_type4"
   ]
 
+  random_int = random.randint(1, 90)
+
   for i, prompt_dir in enumerate(prompt_dirs):
     out_file = Path(output_dir) / f"run_v{i+1}.log"
     cmd = [
@@ -43,6 +46,8 @@ def run_command(yaml_path, func, prompt_file, model, output_dir):
         prompt_dir,
         "-l",
         model,
+        "--trial",
+        str(random_int + i)  
     ]
     with open(out_file, "w") as f:
       subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)

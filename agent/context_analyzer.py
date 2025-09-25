@@ -133,7 +133,7 @@ class ContextAnalyzer(base_agent.ADKBaseAgent):
 
     # Initialize the prompt builder
     builder = prompt_builder.ContextAnalyzerTemplateBuilder(
-        self.llm, self.benchmark)
+        self.llm, self.benchmark, self.args.template_directory)
 
     if isinstance(last_result,
                   resultslib.AnalysisResult) and last_result.crash_result:
