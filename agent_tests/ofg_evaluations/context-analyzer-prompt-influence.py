@@ -50,7 +50,7 @@ def run_command(yaml_path, func, prompt_file, model, output_dir):
         model,
         "-tr",
         str(random_int + i),
-        "-wd",
+        "-w",
         RESULTS_DIR
     ]
     with open(out_file, "w") as f:
